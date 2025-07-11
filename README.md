@@ -1,11 +1,25 @@
 # price-calculator
 
+## Running with Docker
+
+Build the Docker image:
+
+```bash
+docker build -t price-engine .
+```
+
+Run the Docker container:
+
+```bash
+docker run -p 5000:5000 price-engine
+```
+
 ## Example API Call
 
 You can test the API using the following `curl` command:
 
 ```bash
-curl --location '0.0.0.0:8000/process/' \
+curl --location '0.0.0.0:5000/process' \
 --header 'Content-Type: application/json' \
 --data '{
     "Category": "Audio",
@@ -18,3 +32,4 @@ curl --location '0.0.0.0:8000/process/' \
     "Best_Online_Price": 4500
 }'
 ```
+
