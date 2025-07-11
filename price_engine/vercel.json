@@ -2,14 +2,12 @@
   "version": 2,
   "builds": [
     {
-      "src": "Dockerfile",
-      "use": "@vercel/docker"
+      "src": "app.py",
+      "use": "@vercel/python"
     }
   ],
   "routes": [
-    {
-      "src": "/(.*)",
-      "dest": "/"
-    }
+    { "src": "/process", "methods": ["POST"], "dest": "app.py" },
+    { "src": "/process-db", "methods": ["GET"], "dest": "app.py" }
   ]
 }
