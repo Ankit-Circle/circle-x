@@ -1,12 +1,8 @@
 {
   "builds": [
-    {
-      "src": "manage.py",
-      "use": "@vercel/python",
-      "config": { "maxLambdaSize": "50mb" }
-    }
+    { "src": "Dockerfile", "use": "@vercel/docker" }
   ],
   "routes": [
-    { "src": "/(.*)", "dest": "manage.py" }
+    { "src": "/(.*)", "dest": "/" }
   ]
 }
