@@ -1,21 +1,15 @@
-FROM python:3.11-slim
-
-ENV PYTHONDONTWRITEBYTECODE 1
-ENV PYTHONUNBUFFERED 1
+FROM python:3.11-bullseye
 
 WORKDIR /app
 
-RUN apt-get update && apt-get install -y \
-    build-essential \
-    libpq-dev \
-    gcc \
-    && rm -rf /var/lib/apt/lists/*
+# Pin pip version (fix known issues with latest pip)
+RUN pip install --upgrade pip
 
+# Install all requirements
 COPY requirements.txt .
-RUN pip install --upgrade pip && \
-    pip install --no-cache-dir -r requirements.txt
+RUN pip install -r requirements.txt
+
 
 COPY . .
 
 CMD ["gunicorn", "price_engine_backend.wsgi:application", "--bind", "0.0.0.0:8000"]
-
