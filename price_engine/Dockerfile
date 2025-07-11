@@ -1,15 +1,25 @@
+# Use official Python base image
 FROM python:3.11-bullseye
 
+# Set environment variables
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    FLASK_APP=app.py
+
+# Set working directory
 WORKDIR /app
 
-# Pin pip version (fix known issues with latest pip)
 RUN pip install --upgrade pip
 
-# Install all requirements
+# Install dependencies
 COPY requirements.txt .
-RUN pip install -r requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt
 
-
+# Copy application files
 COPY . .
 
-CMD ["gunicorn", "price_engine_backend.wsgi:application", "--bind", "0.0.0.0:8000"]
+# Expose port (Flask default is 5000)
+EXPOSE 5000
+
+# Run the app with gunicorn (production WSGI server)
+CMD ["gunicorn", "--bind", "0.0.0.0:5000", "app:app"]
