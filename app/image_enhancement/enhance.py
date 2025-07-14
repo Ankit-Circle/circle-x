@@ -125,14 +125,7 @@ def enhance():
         })
     except Exception as e:
         return jsonify({"error": f"Internal server error: {str(e)}"}), 500
-@app.route("/api/health", methods=["GET"])
-def health():
-    """Health check endpoint"""
-    return jsonify({"status": "healthy", "service": "ecommerce-enhancer-api"})
-# This is the key part for Vercel - the handler function
-def handler(request):
-    """Vercel serverless function handler"""
-    return app(request)
+
 # Main entry point for local testing
 if __name__ == "__main__":
     app.run(debug=True)
