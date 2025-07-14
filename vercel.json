@@ -4,10 +4,15 @@
     {
       "src": "app/pricing/pricing.py",
       "use": "@vercel/python"
+    },
+    {
+      "src": "app/image_enhancement/enhance.py",
+      "use": "@vercel/python"
     }
   ],
   "routes": [
     { "src": "/api/pricing", "methods": ["POST"], "dest": "app/pricing/pricing.py" },
-    { "src": "/api/pricing-db", "methods": ["GET"], "dest": "app/pricing/pricing.py" }
+    { "src": "/api/pricing-db", "methods": ["GET"], "dest": "app/pricing/pricing.py" },
+    { "src": "/api/enhance", "methods": ["POST"], "dest": "app/image_enhancement/enhance.py" }
   ]
 }
