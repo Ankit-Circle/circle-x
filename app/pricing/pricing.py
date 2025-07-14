@@ -42,7 +42,7 @@ def fetch_best_online_price(brand, model):
     except Exception as e:
         raise ValueError(f"Failed to fetch price from GPT: {e}")
 
-@app.route('/pricing', methods=['POST'])
+@app.route('/api/pricing', methods=['POST'])
 def process_files():
     if request.method != 'POST':
         return jsonify({'error': 'POST method required'}), 405
@@ -129,7 +129,7 @@ def process_files():
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
-@app.route('/pricing-db', methods=['GET'])
+@app.route('/api/pricing-db', methods=['GET'])
 def process_files_db():
     try:
         db_path = os.path.join(BASE_DIR, 'db1.csv')
