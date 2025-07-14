@@ -1,10 +1,12 @@
 from flask import Flask, request, jsonify
+from flask_cors import CORS
 import pandas as pd
 import numpy as np
 import os
 import openai
 
 app = Flask(__name__)
+CORS(app)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # Set your OpenAI API key
@@ -28,13 +30,15 @@ def fetch_best_online_price(brand, model):
             temperature=0.2
         )
         answer = response.choices[0].message.content.strip()
+        print(f"GPT response: '{answer}'")
+
         import re
         match = re.search(r"[\d,]+(?:\.\d+)?", answer)
         if match:
             price_str = match.group().replace(',', '')
             return float(price_str)
         else:
-            raise ValueError("No valid price found in GPT response.")
+            raise ValueError(f"No valid price found in GPT response: '{answer}'")
     except Exception as e:
         raise ValueError(f"Failed to fetch price from GPT: {e}")
 
