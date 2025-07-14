@@ -1,0 +1,13 @@
+{
+  "version": 2,
+  "builds": [
+    {
+      "src": "app/pricing/pricing.py",
+      "use": "@vercel/python"
+    }
+  ],
+  "routes": [
+    { "src": "/pricing", "methods": ["POST"], "dest": "app/pricing/pricing.py" },
+    { "src": "/pricing-db", "methods": ["GET"], "dest": "app/pricing/pricing.py" }
+  ]
+}

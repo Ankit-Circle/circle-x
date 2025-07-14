@@ -19,7 +19,7 @@ docker run -p 5000:5000 price-engine
 You can test the API using the following `curl` command:
 
 ```bash
-curl --location '0.0.0.0:5000/process' \
+curl --location '0.0.0.0:5000/pricing' \
 --header 'Content-Type: application/json' \
 --data '{
     "Category": "Audio",
