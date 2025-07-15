@@ -32,6 +32,7 @@ Focus strictly on:
 - saturation (0.8–1.2)
 - sharpness (0.8–1.5)
 - shadow (0.8–1.2)
+Apply only what is required 
 Only return JSON if a value needs adjustment. Do not apply over-processing. Prioritize visibility, realism, and balance.
 Return a valid strict JSON object with only the needed keys.
 """
