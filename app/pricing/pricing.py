@@ -76,13 +76,14 @@ def process_files():
         if match.empty:
             match = config[
                 (config['category'] == category) &
+                (config['sub-category'] == 'ALL') &
                 (config['Year'] == age)
             ]
 
         if match.empty:
             match = config[
                 (config['category'] == 'Generic') &
-                (config['sub-category'] == 'Generic') &
+                (config['sub-category'] == 'ALL') &
                 (config['Year'] == age)
             ]
 
