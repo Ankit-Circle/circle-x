@@ -2,14 +2,15 @@
 import os
 import json
 import requests
-from flask import Flask, request, jsonify
+from flask import Blueprint, request, jsonify
 from PIL import Image, ImageEnhance, ImageFilter
 from io import BytesIO
 import base64
 import openai
 from rembg import remove
 
-app = Flask(__name__)
+image_enhancement_bp = Blueprint("image_enhancement", __name__)
+
 openai.api_key = os.environ.get("OPENAI_API_KEY")
 
 def enhance_image_pillow(img, factors):
@@ -73,7 +74,7 @@ Do not over-saturate or distort the image. Return only a JSON object, no explana
             "fallback": True
         }
 
-@app.route("/api/enhance", methods=["POST"])
+@image_enhancement_bp.route("/", methods=["POST"])
 def enhance():
     """Enhance an image using AI-suggested parameters"""
     try:
