@@ -9,7 +9,7 @@ from datetime import datetime
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 pricing_bp = Blueprint("pricing", __name__)
-pricing_db_bp = Blueprint("pricing_db", __name__)
+pricing_db_bp = Blueprint("pricing_db_bp", __name__)
 
 # Set your Perplexity API key
 PERPLEXITY_API_KEY = os.environ.get("PERPLEXITY_API_KEY")
