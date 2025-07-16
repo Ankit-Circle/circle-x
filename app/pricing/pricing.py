@@ -3,34 +3,63 @@ from flask_cors import CORS
 import pandas as pd
 import numpy as np
 import os
-import openai
+import requests
+import time
+from datetime import datetime
 
 app = Flask(__name__)
 CORS(app)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# Set your OpenAI API key
-openai.api_key = os.getenv("OPENAI_API_KEY")
+# Set your Perplexity API key
+PERPLEXITY_API_KEY = os.environ.get("PERPLEXITY_API_KEY")
+
+if not PERPLEXITY_API_KEY:
+    raise ValueError("PERPLEXITY_API_KEY environment variable is not set")
 
 def fetch_best_online_price(brand, model):
     try:
         prompt = (
-            f"As of today, please provide the closest and most accurate current market price in Indian Rupees (INR) "
-            f"for a brand new {brand} {model}. "
-            f"Respond only with the price as a number without any currency symbols or additional text."
-            f"\nIf you don't know the exact price, provide your best estimate based on recent trends."
+            f"Please check Amazon.in, Flipkart, Croma, Reliance Digital, and Vijay Sales for the price of a brand new {brand} {model} in INR. "
+            f"Return only the numeric price value without any currency symbols or extra text. "
+            f"If you cannot find a price from these sources, then provide the closest and most accurate current market price in Indian Rupees (INR) "
+            f"for a brand new {brand} {model}. Respond only with the price as a number without any currency symbols or additional text. "
+            f"If you don't know the exact price, provide your best estimate based on recent trends."
         )
-        response = openai.chat.completions.create(
-            model="gpt-4",
-            messages=[
+
+        headers = {
+            "Authorization": f"Bearer {PERPLEXITY_API_KEY}",
+            "Content-Type": "application/json"
+        }
+
+        payload = {
+            "model": "sonar",  # or "pplx-70b-chat" depending on what’s available
+            "messages": [
                 {"role": "system", "content": "You are a helpful assistant estimating product prices in India."},
                 {"role": "user", "content": prompt}
             ],
-            max_tokens=20,
-            temperature=0.2
+            "temperature": 0.2,
+            "top_p": 1,
+            "max_tokens": 80
+        }
+
+        print(f"[{datetime.now()}] Starting Perplexity API call for: {brand} {model}")
+        start_time = time.time()
+
+        response = requests.post(
+            "https://api.perplexity.ai/chat/completions",
+            headers=headers,
+            json=payload
         )
-        answer = response.choices[0].message.content.strip()
-        print(f"GPT response: '{answer}'")
+
+        duration = time.time() - start_time
+        print(f"[{datetime.now()}] Perplexity API call completed in {duration:.2f} seconds")
+
+        if response.status_code != 200:
+            raise ValueError(f"Perplexity API error: {response.status_code} - {response.text}")
+
+        answer = response.json()["choices"][0]["message"]["content"].strip()
+        print(f"Perplexity response: '{answer}'")
 
         import re
         match = re.search(r"[\d,]+(?:\.\d+)?", answer)
@@ -38,14 +67,18 @@ def fetch_best_online_price(brand, model):
             price_str = match.group().replace(',', '')
             return float(price_str)
         else:
-            raise ValueError(f"No valid price found in GPT response: '{answer}'")
+            raise ValueError(f"No valid price found in Perplexity response: '{answer}'")
+
     except Exception as e:
-        raise ValueError(f"Failed to fetch price from GPT: {e}")
+        raise ValueError(f"Failed to fetch price from Perplexity API: {e}")
 
 @app.route('/api/pricing', methods=['POST'])
 def process_files():
     if request.method != 'POST':
         return jsonify({'error': 'POST method required'}), 405
+
+    start_time = time.time()
+    print(f"[{datetime.now()}] /api/pricing called")
 
     try:
         data = request.get_json()
@@ -56,6 +89,9 @@ def process_files():
         condition = str(data.get('Condition_Tier', '')).strip()
         brand = str(data.get('brand', '')).strip()
         model = str(data.get('model', '')).strip()
+
+        # Log input
+        print(f"Processing pricing for: {brand} {model} | Category: {category} / {sub_category} | Age: {age} | Condition: {condition}")
 
         # Get Best Online Price using GPT
         best_online_price = fetch_best_online_price(brand, model)
@@ -111,6 +147,9 @@ def process_files():
         # Add recommended price range
         min_price = round(min(price_new, price_excellent, price_verygood), 2)
         max_price = round(max(price_new, price_excellent, price_verygood), 2)
+
+        total_time = time.time() - start_time
+        print(f"[{datetime.now()}] Total pricing time: {total_time:.2f} seconds")
 
         return jsonify({
             'price_final': round(price_final, 2) if price_final is not None else None,
