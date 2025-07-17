@@ -10,7 +10,9 @@ import openai
 from rembg import remove, new_session
 
 # 🔁 Global session loaded once
-session = new_session(model_name="u2netp")  # u2netp is much lighter and faster
+print("🔁 Loading U2NetP model...")
+session = new_session(model_name="u2netp") # u2netp is much lighter and faster
+print("✅ U2NetP model loaded successfully.")
 
 image_enhancement_bp = Blueprint("image_enhancement", __name__)
 
