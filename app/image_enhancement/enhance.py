@@ -8,7 +8,7 @@ from io import BytesIO
 import base64
 import openai
 
-image_enhancement_bp = Blueprint("image_enhancement", __name__)
+image_enhancement_bp = Blueprint("image_enhancement", __name__, strict_slashes=False)
 
 openai.api_key = os.environ.get("OPENAI_API_KEY")
 
@@ -85,7 +85,7 @@ Return a valid strict JSON object with only the needed keys.
             "fallback": True
         }
 
-@image_enhancement_bp.route("/", methods=["POST"])
+@image_enhancement_bp.route("/", methods=["POST"], strict_slashes=False)
 def enhance():
     """Enhance an image using AI-suggested parameters"""
     try:

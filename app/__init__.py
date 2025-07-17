@@ -9,8 +9,8 @@ def create_app():
     from app.pricing import pricing_db_bp
 
     # Register with `/api/` prefix
-    app.register_blueprint(image_enhancement_bp, url_prefix="/api/enhance", strict_slashes=False)
-    app.register_blueprint(pricing_bp, url_prefix="/api/pricing", strict_slashes=False)
-    app.register_blueprint(pricing_db_bp, url_prefix="/api/pricing-db", strict_slashes=False)
+    app.register_blueprint(image_enhancement_bp, url_prefix="/api/enhance")
+    app.register_blueprint(pricing_bp, url_prefix="/api/pricing")
+    app.register_blueprint(pricing_db_bp, url_prefix="/api/pricing-db")
 
     return app

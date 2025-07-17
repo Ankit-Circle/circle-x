@@ -8,8 +8,8 @@ from datetime import datetime
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-pricing_bp = Blueprint("pricing", __name__)
-pricing_db_bp = Blueprint("pricing_db_bp", __name__)
+pricing_bp = Blueprint("pricing", __name__, strict_slashes=False)
+pricing_db_bp = Blueprint("pricing_db_bp", __name__, strict_slashes=False)
 
 # Set your Perplexity API key
 PERPLEXITY_API_KEY = os.environ.get("PERPLEXITY_API_KEY")
@@ -72,7 +72,7 @@ def fetch_best_online_price(brand, model):
     except Exception as e:
         raise ValueError(f"Failed to fetch price from Perplexity API: {e}")
 
-@pricing_bp.route("/", methods=["POST"])
+@pricing_bp.route("/", methods=["POST"], strict_slashes=False)
 def process_files():
     if request.method != 'POST':
         return jsonify({'error': 'POST method required'}), 405
@@ -169,7 +169,7 @@ def process_files():
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
-@pricing_db_bp.route("/", methods=["GET"])
+@pricing_db_bp.route("/", methods=["GET"], strict_slashes=False)
 def process_files_db():
     try:
         db_path = os.path.join(BASE_DIR, 'db1.csv')
