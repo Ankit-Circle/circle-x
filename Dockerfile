@@ -12,14 +12,13 @@ RUN pip install --upgrade pip
 
 # Install dependencies
 COPY requirements.txt .
-# RUN pip install -r requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy application files
 COPY . .
 
-# Expose port (Flask default is 5000)
-EXPOSE 5000
+# Expose port 8080 as required by Digital Ocean App Platform
+EXPOSE 8080
 
-# Run the app with gunicorn (production WSGI server)
-CMD ["gunicorn", "--bind", "0.0.0.0:5000", "main:app"]
+# Run the app with gunicorn on port 8080
+CMD ["gunicorn", "--bind", "0.0.0.0:8080", "main:app"]
