@@ -20,6 +20,10 @@ RUN apt-get update && apt-get install -y \
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
+# Pre-download u2net.onnx model for rembg
+RUN mkdir -p /root/.u2net && \
+    curl -L -o /root/.u2net/u2net.onnx https://github.com/danielgatis/rembg/releases/download/v0.0.0/u2net.onnx
+
 # Copy application files
 COPY . .
 
