@@ -7,7 +7,10 @@ from PIL import Image, ImageEnhance, ImageFilter
 from io import BytesIO
 import base64
 import openai
-from rembg import remove
+from rembg import remove, new_session
+
+# 🔁 Global session loaded once
+session = new_session(model_name="u2netp")  # u2netp is much lighter and faster
 
 image_enhancement_bp = Blueprint("image_enhancement", __name__)
 
@@ -102,7 +105,7 @@ def enhance():
         enhanced = enhance_image_pillow(img, factors)
 
         # Remove background
-        removed_bg = remove(enhanced)
+        removed_bg = remove(enhanced, session=session)
         alpha_mask = removed_bg.getchannel("A")  # Transparent mask
 
         # Blur background
