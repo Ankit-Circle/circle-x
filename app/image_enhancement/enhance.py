@@ -8,7 +8,7 @@ from io import BytesIO
 import base64
 import openai
 
-image_enhancement_bp = Blueprint("image_enhancement", __name__, strict_slashes=False)
+image_enhancement_bp = Blueprint("image_enhancement", __name__)
 
 openai.api_key = os.environ.get("OPENAI_API_KEY")
 
