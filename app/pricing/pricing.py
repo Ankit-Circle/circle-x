@@ -1,5 +1,4 @@
-from flask import Flask, request, jsonify
-from flask_cors import CORS
+from flask import Blueprint, request, jsonify
 import pandas as pd
 import numpy as np
 import os
@@ -7,9 +6,10 @@ import requests
 import time
 from datetime import datetime
 
-app = Flask(__name__)
-CORS(app)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+pricing_bp = Blueprint("pricing", __name__)
+pricing_db_bp = Blueprint("pricing_db_bp", __name__)
 
 # Set your Perplexity API key
 PERPLEXITY_API_KEY = os.environ.get("PERPLEXITY_API_KEY")
@@ -72,7 +72,7 @@ def fetch_best_online_price(brand, model):
     except Exception as e:
         raise ValueError(f"Failed to fetch price from Perplexity API: {e}")
 
-@app.route('/api/pricing', methods=['POST'])
+@pricing_bp.route("/", methods=["POST"], strict_slashes=False)
 def process_files():
     if request.method != 'POST':
         return jsonify({'error': 'POST method required'}), 405
@@ -169,7 +169,7 @@ def process_files():
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
-@app.route('/api/pricing-db', methods=['GET'])
+@pricing_db_bp.route("/", methods=["GET"], strict_slashes=False)
 def process_files_db():
     try:
         db_path = os.path.join(BASE_DIR, 'db1.csv')

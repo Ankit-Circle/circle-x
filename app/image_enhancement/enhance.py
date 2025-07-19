@@ -1,24 +1,20 @@
 import os
 import json
 import requests
-from flask import Flask, request, jsonify
+from flask import Blueprint, request, jsonify
 from PIL import Image, ImageEnhance, ImageFilter
 from io import BytesIO
 import base64
 import openai
 import replicate
-from dotenv import load_dotenv
 
-# Load environment variables from .env file
-load_dotenv()
+image_enhancement_bp = Blueprint("image_enhancement", __name__)
 
-app = Flask(__name__)
 openai.api_key = os.environ.get("OPENAI_API_KEY")
 replicate_api_token = os.environ.get("REPLICATE_API_TOKEN")
-if replicate_api_token:
-    os.environ["REPLICATE_API_TOKEN"] = replicate_api_token
 
 def enhance_image_pillow(img, factors):
+    """Enhance image using PIL with the given factors"""
     try:
         img = ImageEnhance.Color(img).enhance(factors.get("saturation", 1.0))
         img = ImageEnhance.Brightness(img).enhance(factors.get("brightness", 1.0))
@@ -27,14 +23,8 @@ def enhance_image_pillow(img, factors):
         return img
     except Exception as e:
         raise Exception(f"Error enhancing image: {str(e)}")
-
-def blur_background_with_mask(image, mask_image):
-    mask = mask_image.convert("L").resize(image.size)
-    blurred = image.filter(ImageFilter.GaussianBlur(radius=5))
-    result = Image.composite(image, blurred, mask)
-    return result
-
 def get_ai_suggestions(image_url):
+    """Get AI suggestions for image enhancement factors"""
     try:
         prompt = """
 You are an expert ecommerce product photo enhancer. 
@@ -62,20 +52,36 @@ Do not over-saturate or distort the image. Return only a JSON object, no explana
             temperature=0.3
         )
         content = response.choices[0].message.content.strip()
+        # Clean up any markdown formatting
         clean_content = content.replace("```json", "").replace("```", "").strip()
+        # Parse JSON safely
         factors = json.loads(clean_content)
+        # Ensure all expected keys exist with defaults
         return {
             "brightness": factors.get("brightness", 1.0),
             "contrast": factors.get("contrast", 1.0),
             "saturation": factors.get("saturation", 1.0),
-            "sharpness": factors.get("sharpness", 1.0)
+            "sharpness": factors.get("sharpness", 1.0),
+            "shadow": factors.get("shadow", 1.0)
         }
-    except:
+    except json.JSONDecodeError as e:
+        # Return fallback values if JSON parsing fails
         return {
             "brightness": 1.0,
             "contrast": 1.0,
             "saturation": 1.0,
             "sharpness": 1.0,
+            "shadow": 1.0,
+            "fallback": True
+        }
+    except Exception as e:
+        # Return fallback values if any error occurs
+        return {
+            "brightness": 1.0,
+            "contrast": 1.0,
+            "saturation": 1.0,
+            "sharpness": 1.0,
+            "shadow": 1.0,
             "fallback": True
         }
 
@@ -130,13 +136,17 @@ def remove_background_via_replicate(image: Image.Image) -> Image.Image:
         return image
 
 @app.route("/api/enhance", methods=["POST"])
+@image_enhancement_bp.route("/", methods=["POST"], strict_slashes=False)
 def enhance():
     try:
         if not request.is_json:
             return jsonify({"error": "Content-Type must be application/json"}), 400
         data = request.json
         image_url = data.get("image_url")
-        if not image_url or not image_url.startswith(('http://', 'https://')):
+        if not image_url:
+            return jsonify({"error": "No image_url provided"}), 400
+        # Validate URL
+        if not image_url.startswith(('http://', 'https://')):
             return jsonify({"error": "Invalid image URL"}), 400
 
         # Download and open image
@@ -168,7 +178,7 @@ def enhance():
 
         # Convert final image to base64
         buf = BytesIO()
-        final_image.save(buf, format="JPEG", quality=90)
+        enhanced.save(buf, format="JPEG", quality=90)
         base64_img = base64.b64encode(buf.getvalue()).decode("utf-8")
 
         return jsonify({
@@ -176,7 +186,7 @@ def enhance():
             "enhancement_factors": factors,
             "image_base64": base64_img,
             "original_size": img.size,
-            "enhanced_size": final_image.size
+            "enhanced_size": enhanced.size
         })
     except Exception as e:
         return jsonify({"error": f"Internal server error: {str(e)}"}), 500
