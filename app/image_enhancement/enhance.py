@@ -135,7 +135,6 @@ def remove_background_via_replicate(image: Image.Image) -> Image.Image:
         # Return original image if background removal fails
         return image
 
-@app.route("/api/enhance", methods=["POST"])
 @image_enhancement_bp.route("/", methods=["POST"], strict_slashes=False)
 def enhance():
     try:
