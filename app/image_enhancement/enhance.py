@@ -23,6 +23,13 @@ def enhance_image_pillow(img, factors):
         return img
     except Exception as e:
         raise Exception(f"Error enhancing image: {str(e)}")
+
+def blur_background_with_mask(image, mask_image):
+    mask = mask_image.convert("L").resize(image.size)
+    blurred = image.filter(ImageFilter.GaussianBlur(radius=5))
+    result = Image.composite(image, blurred, mask)
+    return result
+
 def get_ai_suggestions(image_url):
     """Get AI suggestions for image enhancement factors"""
     try:
