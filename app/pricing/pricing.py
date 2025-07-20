@@ -1,14 +1,17 @@
-from flask import Flask, request, jsonify
-from flask_cors import CORS
+from flask import Blueprint, request, jsonify
 import pandas as pd
 import numpy as np
 import os
 import requests
 import time
 from datetime import datetime
+import sys
 
-app = Flask(__name__)
-CORS(app)
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding='utf-8')
+
+pricing_bp = Blueprint("pricing", __name__)
+pricing_db_bp = Blueprint("pricing_db_bp", __name__)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # Set your Perplexity API key
@@ -17,14 +20,16 @@ PERPLEXITY_API_KEY = os.environ.get("PERPLEXITY_API_KEY")
 if not PERPLEXITY_API_KEY:
     raise ValueError("PERPLEXITY_API_KEY environment variable is not set")
 
-def fetch_best_online_price(brand, model):
+def fetch_price_details(brand, model):
     try:
         prompt = (
-            f"Please check Amazon.in, Flipkart, Croma, Reliance Digital, and Vijay Sales for the price of a brand new {brand} {model} in INR. "
-            f"Return only the numeric price value without any currency symbols or extra text. "
-            f"If you cannot find a price from these sources, then provide the closest and most accurate current market price in Indian Rupees (INR) "
-            f"for a brand new {brand} {model}. Respond only with the price as a number without any currency symbols or additional text. "
-            f"If you don't know the exact price, provide your best estimate based on recent trends."
+            f"Please search **Amazon.in, Flipkart, Croma, Reliance Digital, Vijay Sales** for a **brand new {brand} {model}**. "
+            f"Return both the **original MRP** and the **current best online price** (lowest price across all platforms) as two separate numeric values. "
+            f"Also, mention the **source/platform name** where each price was found (MRP and best online price). "
+            f"Format the response exactly like this:\n"
+            f"MRP: <amount> INR (Source: <source>)\n"
+            f"Best Price: <amount> INR (Source: <source>)\n"
+            f"If you can't find the exact MRP or best price, provide your best estimate based on recent listings in India. But only return INR values."
         )
 
         headers = {
@@ -33,14 +38,14 @@ def fetch_best_online_price(brand, model):
         }
 
         payload = {
-            "model": "sonar",  # or "pplx-70b-chat" depending on what’s available
+            "model": "sonar",
             "messages": [
-                {"role": "system", "content": "You are a helpful assistant estimating product prices in India."},
+                {"role": "system", "content": "You are a helpful assistant estimating product prices in India in INR."},
                 {"role": "user", "content": prompt}
             ],
             "temperature": 0.2,
             "top_p": 1,
-            "max_tokens": 80
+            "max_tokens": 150
         }
 
         print(f"[{datetime.now()}] Starting Perplexity API call for: {brand} {model}")
@@ -58,21 +63,42 @@ def fetch_best_online_price(brand, model):
         if response.status_code != 200:
             raise ValueError(f"Perplexity API error: {response.status_code} - {response.text}")
 
-        answer = response.json()["choices"][0]["message"]["content"].strip()
+        answer = response.json()["choices"][0]["message"]["content"]
         print(f"Perplexity response: '{answer}'")
 
         import re
-        match = re.search(r"[\d,]+(?:\.\d+)?", answer)
-        if match:
-            price_str = match.group().replace(',', '')
-            return float(price_str)
-        else:
-            raise ValueError(f"No valid price found in Perplexity response: '{answer}'")
+
+        # Extract MRP with description in brackets
+        mrp_match = re.search(r"MRP\s*[:\-]?\s*₹?\s*([\d,]+)\s*INR?\s*\(([^)]+)\)", answer, re.IGNORECASE)
+        best_price_match = re.search(r"Best Price\s*[:\-]?\s*.*?([\d,]+)\s*INR?\s*\(([^)]+)\)", answer, re.IGNORECASE)
+
+        if not mrp_match or not best_price_match:
+            raise ValueError("Failed to extract prices and sources from Perplexity response.")
+
+        mrp = float(mrp_match.group(1).replace(",", ""))
+        mrp_source = mrp_match.group(2).strip()
+
+        best_price = float(best_price_match.group(1).replace(",", ""))
+        best_price_source = best_price_match.group(2).strip()
+
+        return {
+            "mrp": mrp,
+            "mrp_source": mrp_source,
+            "best_online_price": best_price,
+            "online_price_source": best_price_source
+        }
 
     except Exception as e:
         raise ValueError(f"Failed to fetch price from Perplexity API: {e}")
 
-@app.route('/api/pricing', methods=['POST'])
+def round_to_nearest_25(value):
+    remainder = value % 25
+    if remainder <= 12:
+        return int(value - remainder)
+    else:
+        return int(value + (25 - remainder))
+
+@pricing_bp.route("/", methods=["POST"], strict_slashes=False)
 def process_files():
     if request.method != 'POST':
         return jsonify({'error': 'POST method required'}), 405
@@ -94,7 +120,12 @@ def process_files():
         print(f"Processing pricing for: {brand} {model} | Category: {category} / {sub_category} | Age: {age} | Condition: {condition}")
 
         # Get Best Online Price using GPT
-        best_online_price = fetch_best_online_price(brand, model)
+        price_details = fetch_price_details(brand, model)
+
+        best_online_price = price_details['best_online_price']
+        mrp = price_details['mrp']
+        mrp_source = price_details['mrp_source']
+        online_price_source = price_details['online_price_source']
 
         config_path = os.path.join(BASE_DIR, 'config1.csv')
         config = pd.read_csv(config_path)
@@ -131,9 +162,9 @@ def process_files():
         tier_2 = float(row['tier_2_depreciation'])
         tier_3 = float(row['tier_3_depreciation'])
 
-        price_new = best_online_price * sale_val
-        price_excellent = best_online_price * (sale_val - tier_2)
-        price_verygood = best_online_price * (sale_val - tier_3)
+        price_new = round_to_nearest_25(best_online_price * sale_val)
+        price_excellent = round_to_nearest_25(best_online_price * (sale_val - tier_2))
+        price_verygood = round_to_nearest_25(best_online_price * (sale_val - tier_3))
 
         if condition in ['Mint', 'Like New']:
             price_final = price_new
@@ -145,19 +176,22 @@ def process_files():
             price_final = None
 
         # Add recommended price range
-        min_price = round(min(price_new, price_excellent, price_verygood), 2)
-        max_price = round(max(price_new, price_excellent, price_verygood), 2)
+        min_price = min(price_new, price_excellent, price_verygood)
+        max_price = max(price_new, price_excellent, price_verygood)
 
         total_time = time.time() - start_time
         print(f"[{datetime.now()}] Total pricing time: {total_time:.2f} seconds")
 
         return jsonify({
-            'price_final': round(price_final, 2) if price_final is not None else None,
+            'price_final': price_final if price_final is not None else None,
             'recommended_price_range': {
                 'min_price': min_price,
                 'max_price': max_price
             },
-            'estimated_best_online_price': round(best_online_price, 2),
+            'estimated_best_online_price': best_online_price,
+            'best_price_source': online_price_source,
+            'mrp': mrp,
+            'mrp_source': mrp_source,
             'category': category,
             'sub-category': sub_category,
             'Product_Age_Years1': age,
@@ -169,7 +203,7 @@ def process_files():
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
-@app.route('/api/pricing-db', methods=['GET'])
+@pricing_db_bp.route("/", methods=["GET"], strict_slashes=False)
 def process_files_db():
     try:
         db_path = os.path.join(BASE_DIR, 'db1.csv')
@@ -224,6 +258,3 @@ def process_files_db():
 
     except Exception as e:
         return jsonify({'error': str(e)}), 500
-
-if __name__ == '__main__':
-    app.run(debug=True)
