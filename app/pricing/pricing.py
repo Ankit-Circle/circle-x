@@ -10,9 +10,10 @@ import sys
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding='utf-8')
 
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
 pricing_bp = Blueprint("pricing", __name__)
 pricing_db_bp = Blueprint("pricing_db_bp", __name__)
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # Set your Perplexity API key
 PERPLEXITY_API_KEY = os.environ.get("PERPLEXITY_API_KEY")
