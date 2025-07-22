@@ -4,14 +4,22 @@ import requests
 from flask import Blueprint, request, jsonify
 from PIL import Image, ImageEnhance, ImageFilter
 from io import BytesIO
-import base64
 import openai
 import replicate
+import cloudinary
+import cloudinary.uploader
 
 image_enhancement_bp = Blueprint("image_enhancement", __name__)
 
 openai.api_key = os.environ.get("OPENAI_API_KEY")
-replicate_api_token = os.environ.get("REPLICATE_API_TOKEN")
+replicate.api_token = os.environ.get("REPLICATE_API_TOKEN")
+
+# Configure Cloudinary
+cloudinary.config(
+    cloud_name=os.environ.get("CLOUDINARY_CLOUD_NAME"),
+    api_key=os.environ.get("CLOUDINARY_API_KEY"),
+    api_secret=os.environ.get("CLOUDINARY_API_SECRET")
+)
 
 def enhance_image_pillow(img, factors):
     """Enhance image using PIL with the given factors"""
@@ -24,8 +32,10 @@ def enhance_image_pillow(img, factors):
     except Exception as e:
         raise Exception(f"Error enhancing image: {str(e)}")
 
-def blur_background_with_mask(image, mask_image):
-    mask = mask_image.convert("L").resize(image.size)
+def blur_background_with_mask(image, alpha_channel):
+    """Blur background using alpha channel as mask"""
+    # Convert alpha channel to grayscale mask
+    mask = alpha_channel.convert("L").resize(image.size)
     blurred = image.filter(ImageFilter.GaussianBlur(radius=5))
     result = Image.composite(image, blurred, mask)
     return result
@@ -101,7 +111,7 @@ def remove_background_via_replicate(image: Image.Image) -> Image.Image:
 
         print("Sending image to Replicate for background removal...")
         
-        # Upload image to a temporary file host if needed, or encode base64 and use Replicate blob
+        # Send image to Replicate for background removal
         response = replicate.run(
             "cjwbw/rembg:fb8af171cfa1616ddcf1242c093f9c46bcada5ad4cf6f2fbe8b81b330ec5c003",
             input={"image": buffered}
@@ -182,17 +192,31 @@ def enhance():
             # If background removal failed, just use the enhanced image
             final_image = enhanced
 
-        # Convert final image to base64
+        # Save final image to bytes for Cloudinary upload
         buf = BytesIO()
-        enhanced.save(buf, format="JPEG", quality=90)
-        base64_img = base64.b64encode(buf.getvalue()).decode("utf-8")
+        final_image.save(buf, format="JPEG", quality=90)
+        buf.seek(0)
+
+        # Upload to Cloudinary
+        try:
+            upload_result = cloudinary.uploader.upload(
+                buf,
+                folder="mediaenrichment/enhanced",
+                resource_type="image",
+                format="jpg"
+            )
+            cloudinary_url = upload_result.get("secure_url")
+            if not cloudinary_url:
+                raise Exception("Failed to get Cloudinary URL")
+        except Exception as e:
+            return jsonify({"error": f"Failed to upload to Cloudinary: {str(e)}"}), 500
 
         return jsonify({
             "success": True,
             "enhancement_factors": factors,
-            "image_base64": base64_img,
+            "enhanced_image_url": cloudinary_url,
             "original_size": img.size,
-            "enhanced_size": enhanced.size
+            "enhanced_size": final_image.size
         })
     except Exception as e:
         return jsonify({"error": f"Internal server error: {str(e)}"}), 500
