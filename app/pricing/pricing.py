@@ -112,10 +112,14 @@ def process_files():
 
         category = str(data.get('Category', '')).strip()
         sub_category = str(data.get('Sub_Category', '')).strip()
-        age = int(data.get('Product_Age_Years1'))
+        age_years = int(data.get('Product_Age_Years', 0))
+        age_months = int(data.get('Product_Age_Months', 0))
         condition = str(data.get('Condition_Tier', '')).strip()
         brand = str(data.get('brand', '')).strip()
         model = str(data.get('model', '')).strip()
+
+        # Compute total age in years (float), if your config uses years as a float
+        age = age_years + age_months / 12.0
 
         # Log input
         print(f"Processing pricing for: {brand} {model} | Category: {category} / {sub_category} | Age: {age} | Condition: {condition}")
