@@ -121,6 +121,9 @@ def process_files():
         # Compute total age in years (float), if your config uses years as a float
         age = age_years + age_months / 12.0
 
+        # For configs that only use integer years:
+        age_int = int(round(age))  # Round to nearest year
+
         # Log input
         print(f"Processing pricing for: {brand} {model} | Category: {category} / {sub_category} | Age: {age} | Condition: {condition}")
 
@@ -142,21 +145,21 @@ def process_files():
         match = config[
             (config['category'] == category) &
             (config['sub-category'] == sub_category) &
-            (config['Year'] == age)
+            (config['Year'] == age_int)
         ]
 
         if match.empty:
             match = config[
                 (config['category'] == category) &
                 (config['sub-category'] == 'ALL') &
-                (config['Year'] == age)
+                (config['Year'] == age_int)
             ]
 
         if match.empty:
             match = config[
                 (config['category'] == 'Generic') &
                 (config['sub-category'] == 'ALL') &
-                (config['Year'] == age)
+                (config['Year'] == age_int)
             ]
 
         if match.empty:
@@ -199,7 +202,7 @@ def process_files():
             'mrp_source': mrp_source,
             'category': category,
             'sub-category': sub_category,
-            'Product_Age_Years1': age,
+            'Product_Age': age,
             'Condition_Tier': condition,
             'brand': brand,
             'model': model
