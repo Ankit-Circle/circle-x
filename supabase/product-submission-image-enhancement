@@ -1,27 +1,26 @@
+// @ts-nocheck
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.49.9";
 const url = Deno.env.get("SUPABASE_URL");
 const key = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
 const supabase = createClient(url, key);
-const CLOUDINARY_CLOUD_NAME = Deno.env.get("CLOUDINARY_CLOUD_NAME");
-const CLOUDINARY_UPLOAD_PRESET = "unsigned_default";
 const CIRCLE_X_BASE_URL = Deno.env.get("CIRCLE_X_BASE_URL");
 const ENHANCE_API_URL = `${CIRCLE_X_BASE_URL}/api/enhance`;
 const corsHeaders = {
-  "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type"
+  'Access-Control-Allow-Origin': '*',
+  'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type'
 };
-function errorResponse(message, status = 400) {
+const errorResponse = (message, status = 400)=>{
   return new Response(JSON.stringify({
     error: message
   }), {
     status,
     headers: {
       ...corsHeaders,
-      "Content-Type": "application/json"
+      'Content-Type': 'application/json'
     }
   });
-}
+};
 function getPublicIdFromUrl(url) {
   try {
     const u = new URL(url);
@@ -57,10 +56,8 @@ async function enhanceProductImage(productSubmissionId, imageUrl) {
     if (!enhancementData.enhanced_image_url) {
       throw new Error("No enhanced image URL received from enhancement API");
     }
-    
     // Use the Cloudinary URL directly from enhancement response
     const enhancedImageUrl = enhancementData.enhanced_image_url;
-    
     const { error: dbError } = await supabase.from("product_submission_image_enhancements").insert({
       original_image_url: imageUrl,
       enhanced_image_url: enhancedImageUrl,
@@ -74,22 +71,24 @@ async function enhanceProductImage(productSubmissionId, imageUrl) {
       original_url: imageUrl,
       enhanced_url: enhancedImageUrl
     };
-  } catch (err) {
+  } catch (error) {
+    console.error("Enhancement error:", error);
     return {
       success: false,
       submission_id: productSubmissionId,
       original_url: imageUrl,
-      error: err.message
+      error: error.message
     };
   }
 }
 async function batchEnhanceImages(images, productSubmissionId) {
-  const results = [];
-  for(let i = 0; i < images.length; i++){
-    const result = await enhanceProductImage(productSubmissionId, images[i]);
-    results.push(result);
-    await new Promise((r)=>setTimeout(r, 1000));
-  }
+  // Process all images in parallel
+  const promises = images.map(imageUrl => 
+    enhanceProductImage(productSubmissionId, imageUrl)
+  );
+  
+  const results = await Promise.all(promises);
+  
   return {
     success: true,
     results,
@@ -97,12 +96,12 @@ async function batchEnhanceImages(images, productSubmissionId) {
   };
 }
 Deno.serve(async (req)=>{
-  if (req.method === "OPTIONS") {
-    return new Response("ok", {
+  if (req.method === 'OPTIONS') {
+    return new Response('ok', {
       headers: corsHeaders
     });
   }
-  if (req.method === "POST") {
+  if (req.method === 'POST') {
     try {
       const { media, id } = await req.json();
       if (!media?.images?.length) return errorResponse("No images found in request");
@@ -110,19 +109,19 @@ Deno.serve(async (req)=>{
       return new Response(JSON.stringify(result), {
         headers: {
           ...corsHeaders,
-          "Content-Type": "application/json"
+          'Content-Type': 'application/json'
         },
         status: 200
       });
-    } catch (err) {
-      return errorResponse("Server Error: " + err.message, 500);
+    } catch (error) {
+      return errorResponse(error.message, 500);
     }
   }
-  return new Response("Method Not Allowed", {
-    status: 405,
+  return new Response('Method Not Allowed', {
     headers: {
       ...corsHeaders,
-      "Content-Type": "application/json"
-    }
+      'Content-Type': 'application/json'
+    },
+    status: 405
   });
 });
