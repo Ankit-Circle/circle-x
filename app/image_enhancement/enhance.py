@@ -468,7 +468,7 @@ def process_multiple_images_parallel(image_urls, request_id):
             }
     
     # Use ThreadPoolExecutor for parallel processing
-    with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(image_urls), 5)) as executor:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(image_urls), 3)) as executor:
         future_to_url = {executor.submit(process_single_image, url): url for url in image_urls}
         
         for future in concurrent.futures.as_completed(future_to_url):
