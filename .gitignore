@@ -5,3 +5,6 @@
 __pycache__/
 
 app/venv/
+
+image_enhancement.log
+/supabase/
