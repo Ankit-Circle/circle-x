@@ -174,6 +174,7 @@ def analyze_image_characteristics(img):
             "saturation": saturation_factor,
             "sharpness": 1.2,
             "shadow": 1.0,
+            "apply_blur": False,  # Default to false for fallback
             "analyzed": True
         }
     except Exception as e:
@@ -184,6 +185,7 @@ def analyze_image_characteristics(img):
             "saturation": 1.1,
             "sharpness": 1.2,
             "shadow": 1.0,
+            "apply_blur": False,  # Default to false for fallback
             "fallback": True
         }
 
@@ -207,6 +209,7 @@ def get_ai_suggestions_parallel(image_url, img):
                 "saturation": 1.1,
                 "sharpness": 1.2,
                 "shadow": 1.0,
+                "apply_blur": False,  # Default to false for fallback
                 "fallback": True
             }
             logger.info(f"Using default fallback factors (no API key): {fallback_factors}")
@@ -225,14 +228,22 @@ First, assess the image characteristics(this is just reference, you can use it o
 5. If the image is blurry: increase sharpness (1.3-1.5)
 6. If the image is sharp: keep sharpness normal (1.1-1.2)
 
+IMPORTANT: Analyze the background carefully to determine if Gaussian blur effect would improve the image(the radius of guassian blur is set to be 5 so answer accordingly):
+- Look for distracting elements in the background (clutter, busy patterns, competing objects)then blur effect can be useful
+- Check if the background is already clean/simple (solid colors, minimal distractions)then their might not be the need of blur effect
+- Consider if blur would help focus attention on the main subject
+- Only recommend blur if it would genuinely improve the image quality and focus
+-if image already has blur effect, then their might not be the need of blur effect
+
 Return only a JSON object with these exact values:
 - brightness: 0.9-1.15
 - contrast: 1.0-1.3
 - saturation: 1.0-1.2
 - sharpness: 1.0-1.5
 - shadow: 1.0
+- apply_blur: true/false (ONLY true if blur would significantly improve the image by reducing distracting background elements)
 
-Base your values on the actual image analysis, not generic defaults.
+Base your values on the actual image analysis, not generic defaults. Be strict about blur recommendation - only suggest true if the background has distracting elements that blur would help eliminate.
 """
         logger.debug("Sending request to OpenAI API...")
         
@@ -266,14 +277,15 @@ Base your values on the actual image analysis, not generic defaults.
             "contrast": factors.get("contrast", 1.0),
             "saturation": factors.get("saturation", 1.0),
             "sharpness": factors.get("sharpness", 1.0),
-            "shadow": factors.get("shadow", 1.0)
+            "shadow": factors.get("shadow", 1.0),
+            "apply_blur": factors.get("apply_blur", False)
         }
         
         # Check if AI response seems generic (common default values)
         generic_responses = [
-            {"brightness": 1.05, "contrast": 1.2, "saturation": 1.1, "sharpness": 1.3, "shadow": 1.0},
-            {"brightness": 1.05, "contrast": 1.15, "saturation": 1.1, "sharpness": 1.2, "shadow": 1.0},
-            {"brightness": 1.0, "contrast": 1.1, "saturation": 1.0, "sharpness": 1.1, "shadow": 1.0}
+            {"brightness": 1.05, "contrast": 1.2, "saturation": 1.1, "sharpness": 1.3, "shadow": 1.0, "apply_blur": False},
+            {"brightness": 1.05, "contrast": 1.15, "saturation": 1.1, "sharpness": 1.2, "shadow": 1.0, "apply_blur": False},
+            {"brightness": 1.0, "contrast": 1.1, "saturation": 1.0, "sharpness": 1.1, "shadow": 1.0, "apply_blur": False}
         ]
         
         is_generic = any(
@@ -434,19 +446,28 @@ def process_multiple_images_parallel(image_urls, request_id):
             # Enhance image
             enhanced = enhance_image_pillow(img, factors)
             
-            # Background removal
-            removed_bg = remove_background_via_replicate_optimized(enhanced, session)
-            
-            # Background blur
-            if removed_bg.mode == "RGBA" and "A" in removed_bg.getbands():
-                alpha_mask = removed_bg.getchannel("A")
-                final_image = blur_background_with_mask(enhanced, alpha_mask)
+            # Background removal - only if AI recommends blur
+            if factors.get("apply_blur", False):
+                logger.info(f"[{request_id}] AI recommended blur effect, performing background removal...")
+                removed_bg = remove_background_via_replicate_optimized(enhanced, session)
+                
+                # Background blur
+                if removed_bg.mode == "RGBA" and "A" in removed_bg.getbands():
+                    logger.info(f"[{request_id}] Background removal successful, applying blur...")
+                    alpha_mask = removed_bg.getchannel("A")
+                    final_image = blur_background_with_mask(enhanced, alpha_mask)
+                    used_fallback = False
+                    fallback_reason = None
+                else:
+                    logger.info(f"[{request_id}] Background removal failed, using enhanced image")
+                    final_image = enhanced
+                    used_fallback = True
+                    fallback_reason = "background_removal_no_alpha"
+            else:
+                logger.info(f"[{request_id}] AI did not recommend blur effect, skipping background removal")
+                final_image = enhanced
                 used_fallback = False
                 fallback_reason = None
-            else:
-                final_image = enhanced
-                used_fallback = True
-                fallback_reason = "background_removal_no_alpha"
             
             return {
                 "image_url": image_url,
@@ -623,40 +644,46 @@ def process_image_parallel(img, image_url, request_id):
         enhance_time = time.time() - enhance_start
         logger.info(f"[{request_id}] Image enhancement completed in {enhance_time:.2f} seconds")
         
-        # Step 3: Background removal with optimized session
-        logger.info(f"[{request_id}] Starting background removal...")
-        bg_start = time.time()
-        removed_bg = remove_background_via_replicate_optimized(enhanced, session)
-        bg_time = time.time() - bg_start
-        logger.info(f"[{request_id}] Background removal completed in {bg_time:.2f} seconds")
-        
-        # Step 4: Background blur (if applicable)
-        logger.info(f"[{request_id}] Processing background blur...")
-        blur_start = time.time()
-        
+        # Step 3: Background removal - only if AI recommends blur
         used_fallback = False
         fallback_reason = None
         
-        if removed_bg.mode == "RGBA" and "A" in removed_bg.getbands():
-            logger.info(f"[{request_id}] Background removal successful, proceeding with blur")
-            try:
-                alpha_mask = removed_bg.getchannel("A")
-                final_image = blur_background_with_mask(enhanced, alpha_mask)
-                blur_time = time.time() - blur_start
-                logger.info(f"[{request_id}] Background blur completed in {blur_time:.2f} seconds")
-            except Exception as blur_error:
-                blur_time = time.time() - blur_start
-                error_msg = f"Background blur failed after {blur_time:.2f} seconds: {str(blur_error)}"
-                logger.warning(f"[{request_id}] WARNING: {error_msg}")
-                logger.info(f"[{request_id}] Using enhanced image as fallback for blur failure")
+        if factors.get("apply_blur", False):
+            logger.info(f"[{request_id}] AI recommended blur effect, starting background removal...")
+            bg_start = time.time()
+            removed_bg = remove_background_via_replicate_optimized(enhanced, session)
+            bg_time = time.time() - bg_start
+            logger.info(f"[{request_id}] Background removal completed in {bg_time:.2f} seconds")
+            
+            # Step 4: Background blur
+            logger.info(f"[{request_id}] Processing background blur...")
+            blur_start = time.time()
+            
+            if removed_bg.mode == "RGBA" and "A" in removed_bg.getbands():
+                logger.info(f"[{request_id}] Background removal successful, applying blur...")
+                try:
+                    alpha_mask = removed_bg.getchannel("A")
+                    final_image = blur_background_with_mask(enhanced, alpha_mask)
+                    blur_time = time.time() - blur_start
+                    logger.info(f"[{request_id}] Background blur completed in {blur_time:.2f} seconds")
+                except Exception as blur_error:
+                    blur_time = time.time() - blur_start
+                    error_msg = f"Background blur failed after {blur_time:.2f} seconds: {str(blur_error)}"
+                    logger.warning(f"[{request_id}] WARNING: {error_msg}")
+                    logger.info(f"[{request_id}] Using enhanced image as fallback for blur failure")
+                    final_image = enhanced
+                    used_fallback = True
+                    fallback_reason = "background_blur_failed"
+            else:
+                logger.info(f"[{request_id}] Background removal failed, using enhanced image")
                 final_image = enhanced
                 used_fallback = True
-                fallback_reason = "background_blur_failed"
+                fallback_reason = "background_removal_no_alpha"
         else:
-            logger.warning(f"[{request_id}] Background removal returned image without alpha channel, using enhanced image as fallback")
+            logger.info(f"[{request_id}] AI did not recommend blur effect, skipping background removal")
             final_image = enhanced
-            used_fallback = True
-            fallback_reason = "background_removal_no_alpha"
+            used_fallback = False
+            fallback_reason = None
         
         total_time = time.time() - start_time
         logger.info(f"[{request_id}] Parallel processing completed in {total_time:.2f} seconds")
@@ -813,17 +840,26 @@ def enhance():
                 # Enhance image
                 enhanced = enhance_image_pillow(img, factors)
                 
-                # Background removal
-                removed_bg = remove_background_via_replicate(enhanced)
-                
-                # Background blur
-                if removed_bg.mode == "RGBA" and "A" in removed_bg.getbands():
-                    alpha_mask = removed_bg.getchannel("A")
-                    final_image = blur_background_with_mask(enhanced, alpha_mask)
+                # Background removal - only if AI recommends blur
+                if factors.get("apply_blur", False):
+                    logger.info(f"[{request_id}] AI recommended blur effect, performing background removal...")
+                    removed_bg = remove_background_via_replicate(enhanced)
+                    
+                    # Background blur
+                    if removed_bg.mode == "RGBA" and "A" in removed_bg.getbands():
+                        logger.info(f"[{request_id}] Background removal successful, applying blur...")
+                        alpha_mask = removed_bg.getchannel("A")
+                        final_image = blur_background_with_mask(enhanced, alpha_mask)
+                    else:
+                        logger.info(f"[{request_id}] Background removal failed, using enhanced image")
+                        final_image = enhanced
+                        used_fallback = True
+                        fallback_reason = "background_removal_fallback"
                 else:
+                    logger.info(f"[{request_id}] AI did not recommend blur effect, skipping background removal")
                     final_image = enhanced
-                    used_fallback = True
-                    fallback_reason = "background_removal_fallback"
+                    used_fallback = False
+                    fallback_reason = None
                     
             except Exception as fallback_error:
                 logger.error(f"[{request_id}] Fallback processing also failed: {str(fallback_error)}")
@@ -835,6 +871,7 @@ def enhance():
                     "saturation": 1.0,
                     "sharpness": 1.0,
                     "shadow": 1.0,
+                    "apply_blur": False,  # Default to false for fallback
                     "fallback": True
                 }
                 used_fallback = True
@@ -904,7 +941,8 @@ def enhance():
             "processing_time": total_time,
             "request_id": request_id,
             "used_fallback": used_fallback,
-            "fallback_reason": fallback_reason
+            "fallback_reason": fallback_reason,
+            "blur_recommended": factors.get("apply_blur", False)
         }
         
         logger.info(f"[{request_id}] Request completed successfully!")
@@ -1017,7 +1055,8 @@ def enhance_batch():
                         "enhanced_image_url": cloudinary_url,
                         "enhancement_factors": result["factors"],
                         "used_fallback": result["used_fallback"],
-                        "fallback_reason": result["fallback_reason"]
+                        "fallback_reason": result["fallback_reason"],
+                        "blur_recommended": result["factors"].get("apply_blur", False)
                     })
                     
                 except Exception as e:
