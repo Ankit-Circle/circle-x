@@ -233,12 +233,31 @@ Return only a JSON object with these exact values:
 - shadow: 1.0
 
 Base your values on the actual image analysis, not generic defaults.
+Analyze this specific product image and provide optimal enhancement values.
+
+First, assess the image characteristics(this is just reference, you can use it or not):
+1. If the image is dark or underexposed: increase brightness (1.05-1.15) and contrast (1.2-1.3)
+2. If the image is bright or overexposed: decrease brightness (0.9-1.0) and increase contrast (1.1-1.2)
+3. If the image has muted colors: increase saturation (1.1-1.2)
+4. If the image has vibrant colors: keep saturation normal (1.0-1.05)
+5. If the image is blurry: increase sharpness (1.3-1.5)
+6. If the image is sharp: keep sharpness normal (1.1-1.2)
+
+Return only a JSON object with these exact values:
+- brightness: 0.9-1.15
+- contrast: 1.0-1.3
+- saturation: 1.0-1.2
+- sharpness: 1.0-1.5
+- shadow: 1.0
+
+Base your values on the actual image analysis, not generic defaults.
 """
         logger.debug("Sending request to OpenAI API...")
         
         response = openai.chat.completions.create(
             model="gpt-4o",
             messages=[
+                {"role": "system", "content": "You are an expert image enhancement specialist. Your task is to analyze each product image individually and provide specific enhancement values based on the actual image characteristics. Be precise and avoid generic responses. Always base your recommendations on the visual analysis of the provided image."},
                 {"role": "system", "content": "You are an expert image enhancement specialist. Your task is to analyze each product image individually and provide specific enhancement values based on the actual image characteristics. Be precise and avoid generic responses. Always base your recommendations on the visual analysis of the provided image."},
                 {
                     "role": "user",
@@ -256,8 +275,10 @@ Base your values on the actual image analysis, not generic defaults.
         
         content = response.choices[0].message.content.strip()
         logger.info(f"OpenAI raw response: {content}")
+        logger.info(f"OpenAI raw response: {content}")
         
         clean_content = content.replace("```json", "").replace("```", "").strip()
+        logger.info(f"Cleaned content: {clean_content}")
         logger.info(f"Cleaned content: {clean_content}")
         factors = json.loads(clean_content)
         
@@ -268,6 +289,32 @@ Base your values on the actual image analysis, not generic defaults.
             "sharpness": factors.get("sharpness", 1.0),
             "shadow": factors.get("shadow", 1.0)
         }
+        
+        # Check if AI response seems generic (common default values)
+        generic_responses = [
+            {"brightness": 1.05, "contrast": 1.2, "saturation": 1.1, "sharpness": 1.3, "shadow": 1.0},
+            {"brightness": 1.05, "contrast": 1.15, "saturation": 1.1, "sharpness": 1.2, "shadow": 1.0},
+            {"brightness": 1.0, "contrast": 1.1, "saturation": 1.0, "sharpness": 1.1, "shadow": 1.0}
+        ]
+        
+        is_generic = any(
+            all(abs(result_factors.get(key, 0) - generic.get(key, 0)) < 0.01 for key in ["brightness", "contrast", "saturation", "sharpness", "shadow"])
+            for generic in generic_responses
+        )
+        
+        if is_generic:
+            logger.warning("AI response appears to be generic, using image analysis fallback")
+            try:
+                img_resp = requests.get(image_url, timeout=10)
+                img_resp.raise_for_status()
+                img = Image.open(BytesIO(img_resp.content))
+                img = ImageOps.exif_transpose(img).convert("RGB")
+                analyzed_factors = analyze_image_characteristics(img)
+                logger.info(f"Using analyzed factors instead of generic AI response: {analyzed_factors}")
+                return analyzed_factors
+            except Exception as analysis_error:
+                logger.error(f"Failed to analyze image for fallback: {str(analysis_error)}")
+                logger.info(f"Keeping AI response despite being generic: {result_factors}")
         
         # Check if AI response seems generic (common default values)
         generic_responses = [
@@ -327,12 +374,52 @@ Base your values on the actual image analysis, not generic defaults.
             }
             logger.info(f"Using default fallback factors due to JSON error: {fallback_factors}")
         
+        # Try to analyze the image for fallback values
+        try:
+            img_resp = requests.get(image_url, timeout=10)
+            img_resp.raise_for_status()
+            img = Image.open(BytesIO(img_resp.content))
+            img = ImageOps.exif_transpose(img).convert("RGB")
+            fallback_factors = analyze_image_characteristics(img)
+            logger.info(f"Using analyzed fallback factors due to JSON error: {fallback_factors}")
+        except Exception as analysis_error:
+            logger.error(f"Failed to analyze image for fallback: {str(analysis_error)}")
+            fallback_factors = {
+                "brightness": 1.05,
+                "contrast": 1.15,
+                "saturation": 1.1,
+                "sharpness": 1.2,
+                "shadow": 1.0,
+                "fallback": True
+            }
+            logger.info(f"Using default fallback factors due to JSON error: {fallback_factors}")
+        
         return fallback_factors
         
     except openai.AuthenticationError as e:
         total_time = time.time() - start_time
         error_msg = f"OpenAI authentication error after {total_time:.2f} seconds: {str(e)}"
         logger.error(error_msg)
+        
+        # Try to analyze the image for fallback values
+        try:
+            img_resp = requests.get(image_url, timeout=10)
+            img_resp.raise_for_status()
+            img = Image.open(BytesIO(img_resp.content))
+            img = ImageOps.exif_transpose(img).convert("RGB")
+            fallback_factors = analyze_image_characteristics(img)
+            logger.info(f"Using analyzed fallback factors due to authentication error: {fallback_factors}")
+        except Exception as analysis_error:
+            logger.error(f"Failed to analyze image for fallback: {str(analysis_error)}")
+            fallback_factors = {
+                "brightness": 1.05,
+                "contrast": 1.15,
+                "saturation": 1.1,
+                "sharpness": 1.2,
+                "shadow": 1.0,
+                "fallback": True
+            }
+            logger.info(f"Using default fallback factors due to authentication error: {fallback_factors}")
         
         # Try to analyze the image for fallback values
         try:
@@ -381,12 +468,52 @@ Base your values on the actual image analysis, not generic defaults.
             }
             logger.info(f"Using default fallback factors due to rate limit: {fallback_factors}")
         
+        # Try to analyze the image for fallback values
+        try:
+            img_resp = requests.get(image_url, timeout=10)
+            img_resp.raise_for_status()
+            img = Image.open(BytesIO(img_resp.content))
+            img = ImageOps.exif_transpose(img).convert("RGB")
+            fallback_factors = analyze_image_characteristics(img)
+            logger.info(f"Using analyzed fallback factors due to rate limit: {fallback_factors}")
+        except Exception as analysis_error:
+            logger.error(f"Failed to analyze image for fallback: {str(analysis_error)}")
+            fallback_factors = {
+                "brightness": 1.05,
+                "contrast": 1.15,
+                "saturation": 1.1,
+                "sharpness": 1.2,
+                "shadow": 1.0,
+                "fallback": True
+            }
+            logger.info(f"Using default fallback factors due to rate limit: {fallback_factors}")
+        
         return fallback_factors
         
     except Exception as e:
         total_time = time.time() - start_time
         error_msg = f"Unexpected error in AI suggestions after {total_time:.2f} seconds: {str(e)}"
         logger.error(error_msg)
+        
+        # Try to analyze the image for fallback values
+        try:
+            img_resp = requests.get(image_url, timeout=10)
+            img_resp.raise_for_status()
+            img = Image.open(BytesIO(img_resp.content))
+            img = ImageOps.exif_transpose(img).convert("RGB")
+            fallback_factors = analyze_image_characteristics(img)
+            logger.info(f"Using analyzed fallback factors due to unexpected error: {fallback_factors}")
+        except Exception as analysis_error:
+            logger.error(f"Failed to analyze image for fallback: {str(analysis_error)}")
+            fallback_factors = {
+                "brightness": 1.05,
+                "contrast": 1.15,
+                "saturation": 1.1,
+                "sharpness": 1.2,
+                "shadow": 1.0,
+                "fallback": True
+            }
+            logger.info(f"Using default fallback factors due to unexpected error: {fallback_factors}")
         
         # Try to analyze the image for fallback values
         try:
