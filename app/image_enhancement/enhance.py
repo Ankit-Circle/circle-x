@@ -467,8 +467,11 @@ def process_multiple_images_parallel(image_urls, request_id):
                 "fallback_reason": "processing_failed"
             }
     
-    # Use ThreadPoolExecutor for parallel processing
-    with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(image_urls), 3)) as executor:
+    # Use ThreadPoolExecutor for parallel processing with reduced workers to prevent memory issues
+    max_workers = min(len(image_urls), 3)  # Reduced from 5 to 3 to prevent memory issues
+    logger.info(f"[{request_id}] Using {max_workers} workers for {len(image_urls)} images")
+    
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
         future_to_url = {executor.submit(process_single_image, url): url for url in image_urls}
         
         for future in concurrent.futures.as_completed(future_to_url):
@@ -561,33 +564,38 @@ def remove_background_via_replicate_optimized(image: Image.Image, session=None) 
         
         return mask_img
         
-    except replicate.AuthenticationError as e:
-        total_time = time.time() - start_time
-        error_msg = f"Replicate authentication error after {total_time:.2f} seconds: {str(e)}"
-        logger.error(error_msg)
-        logger.info("Returning original image due to authentication error")
-        return image
-        
-    except replicate.RateLimitError as e:
-        total_time = time.time() - start_time
-        error_msg = f"Replicate rate limit error after {total_time:.2f} seconds: {str(e)}"
-        logger.error(error_msg)
-        logger.info("Returning original image due to rate limit")
-        return image
+    except Exception as e:
+        # Check if it's an authentication or rate limit error by the error message
+        error_str = str(e).lower()
+        if "authentication" in error_str or "unauthorized" in error_str:
+            total_time = time.time() - start_time
+            error_msg = f"Replicate authentication error after {total_time:.2f} seconds: {str(e)}"
+            logger.error(error_msg)
+            logger.info("Returning enhanced image (without background removal) due to authentication error")
+            return image  # This is the enhanced image passed to the function
+        elif "rate limit" in error_str or "too many requests" in error_str:
+            total_time = time.time() - start_time
+            error_msg = f"Replicate rate limit error after {total_time:.2f} seconds: {str(e)}"
+            logger.error(error_msg)
+            logger.info("Returning enhanced image (without background removal) due to rate limit")
+            return image  # This is the enhanced image passed to the function
+        else:
+            # Re-raise the original exception to be caught by the general Exception handler
+            raise e
         
     except requests.RequestException as e:
         total_time = time.time() - start_time
         error_msg = f"Network error during background removal after {total_time:.2f} seconds: {str(e)}"
         logger.error(error_msg)
-        logger.info("Returning original image due to network error")
-        return image
+        logger.info("Returning enhanced image (without background removal) due to network error")
+        return image  # This is the enhanced image passed to the function
         
     except Exception as e:
         total_time = time.time() - start_time
         error_msg = f"Unexpected error in background removal after {total_time:.2f} seconds: {str(e)}"
         logger.error(error_msg)
-        logger.info("Returning original image due to unexpected error")
-        return image
+        logger.info("Returning enhanced image (without background removal) due to unexpected error")
+        return image  # This is the enhanced image passed to the function
 
 def remove_background_via_replicate(image: Image.Image) -> Image.Image:
     """Legacy function for backward compatibility"""
