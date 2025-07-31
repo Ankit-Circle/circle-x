@@ -69,6 +69,12 @@ def get_global_session():
         _global_session.mount('https://', adapter)
     return _global_session
 
+def cleanup_memory():
+    """Force garbage collection to free memory"""
+    import gc
+    gc.collect()
+    logger.debug("Memory cleanup performed")
+
 def enhance_image_pillow(img, factors):
     """Enhance image using PIL with the given factors"""
     start_time = time.time()
@@ -449,20 +455,27 @@ def process_multiple_images_parallel(image_urls, request_id):
             # Background removal - only if AI recommends blur
             if factors.get("apply_blur", False):
                 logger.info(f"[{request_id}] AI recommended blur effect, performing background removal...")
-                removed_bg = remove_background_via_replicate_optimized(enhanced, session)
-                
-                # Background blur
-                if removed_bg.mode == "RGBA" and "A" in removed_bg.getbands():
-                    logger.info(f"[{request_id}] Background removal successful, applying blur...")
-                    alpha_mask = removed_bg.getchannel("A")
-                    final_image = blur_background_with_mask(enhanced, alpha_mask)
-                    used_fallback = False
-                    fallback_reason = None
-                else:
-                    logger.info(f"[{request_id}] Background removal failed, using enhanced image")
+                try:
+                    removed_bg = remove_background_via_replicate_optimized(enhanced, session)
+                    
+                    # Background blur
+                    if removed_bg.mode == "RGBA" and "A" in removed_bg.getbands():
+                        logger.info(f"[{request_id}] Background removal successful, applying blur...")
+                        alpha_mask = removed_bg.getchannel("A")
+                        final_image = blur_background_with_mask(enhanced, alpha_mask)
+                        used_fallback = False
+                        fallback_reason = None
+                    else:
+                        logger.info(f"[{request_id}] Background removal failed, using enhanced image")
+                        final_image = enhanced
+                        used_fallback = True
+                        fallback_reason = "background_removal_no_alpha"
+                except Exception as bg_error:
+                    logger.error(f"[{request_id}] Background removal failed: {str(bg_error)}")
+                    logger.info(f"[{request_id}] Using enhanced image as fallback")
                     final_image = enhanced
                     used_fallback = True
-                    fallback_reason = "background_removal_no_alpha"
+                    fallback_reason = "background_removal_error"
             else:
                 logger.info(f"[{request_id}] AI did not recommend blur effect, skipping background removal")
                 final_image = enhanced
@@ -489,15 +502,39 @@ def process_multiple_images_parallel(image_urls, request_id):
             }
     
     # Use ThreadPoolExecutor for parallel processing with reduced workers to prevent memory issues
-    max_workers = min(len(image_urls), 3)  # Reduced from 5 to 3 to prevent memory issues
-    logger.info(f"[{request_id}] Using {max_workers} workers for {len(image_urls)} images")
+    # Further reduce workers when processing many images to prevent memory overload
+    if len(image_urls) >= 5:
+        max_workers = 2  # Very conservative for large batches
+        logger.info(f"[{request_id}] Large batch detected ({len(image_urls)} images), using {max_workers} workers")
+    else:
+        max_workers = min(len(image_urls), 3)  # Normal processing
+        logger.info(f"[{request_id}] Using {max_workers} workers for {len(image_urls)} images")
     
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
         future_to_url = {executor.submit(process_single_image, url): url for url in image_urls}
         
         for future in concurrent.futures.as_completed(future_to_url):
-            result = future.result()
-            results.append(result)
+            try:
+                result = future.result()
+                results.append(result)
+                
+                # Clean up memory after each image (especially important for large batches)
+                if len(image_urls) >= 5:
+                    cleanup_memory()
+                    
+            except Exception as e:
+                logger.error(f"[{request_id}] Worker failed: {str(e)}")
+                # Add a failed result to maintain order
+                results.append({
+                    "image_url": "unknown",
+                    "success": False,
+                    "error": str(e),
+                    "used_fallback": True,
+                    "fallback_reason": "worker_failed"
+                })
+    
+    # Final memory cleanup
+    cleanup_memory()
     
     total_time = time.time() - start_time
     logger.info(f"[{request_id}] Parallel processing of {len(image_urls)} images completed in {total_time:.2f} seconds")
@@ -521,7 +558,13 @@ def remove_background_via_replicate_optimized(image: Image.Image, session=None) 
         buffered = BytesIO()
         image.save(buffered, format="PNG")
         buffered.seek(0)
-        logger.debug(f"Image prepared - Size: {len(buffered.getvalue())} bytes")
+        image_size = len(buffered.getvalue())
+        logger.debug(f"Image prepared - Size: {image_size} bytes")
+        
+        # Check if image is too large (over 10MB)
+        if image_size > 10 * 1024 * 1024:  # 10MB
+            logger.warning(f"Image too large ({image_size/1024/1024:.2f}MB), skipping background removal")
+            return image
 
         logger.info("Sending image to Replicate for background removal...")
         api_start = time.time()
@@ -561,7 +604,14 @@ def remove_background_via_replicate_optimized(image: Image.Image, session=None) 
             mask_resp = session.get(mask_url, timeout=60)
         else:
             mask_resp = requests.get(mask_url, timeout=60)
-        mask_resp.raise_for_status()
+        
+        # Check for HTTP errors with detailed logging
+        if mask_resp.status_code != 200:
+            error_msg = f"HTTP error: ({mask_resp.status_code}, '{mask_resp.reason}')"
+            logger.error(f"ERROR: {error_msg}")
+            logger.error(f"Response headers: {dict(mask_resp.headers)}")
+            logger.error(f"Response content: {mask_resp.text[:500]}...")  # First 500 chars
+            raise Exception(error_msg)
         
         download_time = time.time() - download_start
         logger.info(f"Downloaded processed image in {download_time:.2f} seconds")
@@ -586,7 +636,7 @@ def remove_background_via_replicate_optimized(image: Image.Image, session=None) 
         return mask_img
         
     except Exception as e:
-        # Check if it's an authentication or rate limit error by the error message
+        # Check if it's an authentication, rate limit, or HTTP error by the error message
         error_str = str(e).lower()
         if "authentication" in error_str or "unauthorized" in error_str:
             total_time = time.time() - start_time
@@ -599,6 +649,12 @@ def remove_background_via_replicate_optimized(image: Image.Image, session=None) 
             error_msg = f"Replicate rate limit error after {total_time:.2f} seconds: {str(e)}"
             logger.error(error_msg)
             logger.info("Returning enhanced image (without background removal) due to rate limit")
+            return image  # This is the enhanced image passed to the function
+        elif "http error" in error_str or "502" in error_str or "503" in error_str or "504" in error_str:
+            total_time = time.time() - start_time
+            error_msg = f"Replicate service error after {total_time:.2f} seconds: {str(e)}"
+            logger.error(error_msg)
+            logger.info("Returning enhanced image (without background removal) due to service error")
             return image  # This is the enhanced image passed to the function
         else:
             # Re-raise the original exception to be caught by the general Exception handler
