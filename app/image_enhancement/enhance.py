@@ -502,13 +502,9 @@ def process_multiple_images_parallel(image_urls, request_id):
             }
     
     # Use ThreadPoolExecutor for parallel processing with reduced workers to prevent memory issues
-    # Further reduce workers when processing many images to prevent memory overload
-    if len(image_urls) >= 5:
-        max_workers = 2  # Very conservative for large batches
-        logger.info(f"[{request_id}] Large batch detected ({len(image_urls)} images), using {max_workers} workers")
-    else:
-        max_workers = min(len(image_urls), 3)  # Normal processing
-        logger.info(f"[{request_id}] Using {max_workers} workers for {len(image_urls)} images")
+    # Conservative worker allocation for all batch sizes to ensure stability
+    max_workers = 2  # Conservative for all batch sizes
+    logger.info(f"[{request_id}] Using {max_workers} workers for {len(image_urls)} images")
     
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
         future_to_url = {executor.submit(process_single_image, url): url for url in image_urls}
@@ -518,9 +514,8 @@ def process_multiple_images_parallel(image_urls, request_id):
                 result = future.result()
                 results.append(result)
                 
-                # Clean up memory after each image (especially important for large batches)
-                if len(image_urls) >= 5:
-                    cleanup_memory()
+                # Clean up memory after each image for all batch sizes
+                cleanup_memory()
                     
             except Exception as e:
                 logger.error(f"[{request_id}] Worker failed: {str(e)}")
