@@ -121,7 +121,7 @@ def blur_background_with_mask(image, alpha_channel):
         
         # Apply Gaussian blur to the image
         logger.debug("Applying Gaussian blur to image...")
-        blurred = image.filter(ImageFilter.GaussianBlur(radius=5))
+        blurred = image.filter(ImageFilter.GaussianBlur(radius=3.5))
         
         # Composite the original image with blurred background
         logger.debug("Compositing image with blurred background...")
