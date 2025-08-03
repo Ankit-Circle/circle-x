@@ -121,7 +121,7 @@ def blur_background_with_mask(image, alpha_channel):
         
         # Apply Gaussian blur to the image
         logger.debug("Applying Gaussian blur to image...")
-        blurred = image.filter(ImageFilter.GaussianBlur(radius=5))
+        blurred = image.filter(ImageFilter.GaussianBlur(radius=3.5))
         
         # Composite the original image with blurred background
         logger.debug("Compositing image with blurred background...")
@@ -428,116 +428,139 @@ Base your values on the actual image analysis, not generic defaults. Be strict a
         
         return fallback_factors
 
-def process_multiple_images_parallel(image_urls, request_id):
-    """Process multiple images in parallel using ThreadPoolExecutor"""
-    start_time = time.time()
-    logger.info(f"[{request_id}] Starting parallel processing of {len(image_urls)} images")
-    
-    results = []
-    
-    def process_single_image(image_url):
-        try:
-            # Download image
-            session = get_global_session()
-            img_resp = session.get(image_url, timeout=30)
-            img_resp.raise_for_status()
-            
-            # Process image
-            img = Image.open(BytesIO(img_resp.content))
-            img = ImageOps.exif_transpose(img).convert("RGB")
-            
-            # Get AI suggestions
-            factors = get_ai_suggestions_parallel(image_url, img)
-            
-            # Enhance image
-            enhanced = enhance_image_pillow(img, factors)
-            
-            # Background removal - only if AI recommends blur
-            if factors.get("apply_blur", False):
-                logger.info(f"[{request_id}] AI recommended blur effect, performing background removal...")
-                try:
-                    removed_bg = remove_background_via_replicate_optimized(enhanced, session)
-                    
-                    # Background blur
-                    if removed_bg.mode == "RGBA" and "A" in removed_bg.getbands():
-                        logger.info(f"[{request_id}] Background removal successful, applying blur...")
-                        alpha_mask = removed_bg.getchannel("A")
-                        final_image = blur_background_with_mask(enhanced, alpha_mask)
-                        used_fallback = False
-                        fallback_reason = None
-                    else:
-                        logger.info(f"[{request_id}] Background removal failed, using enhanced image")
-                        final_image = enhanced
-                        used_fallback = True
-                        fallback_reason = "background_removal_no_alpha"
-                except Exception as bg_error:
-                    logger.error(f"[{request_id}] Background removal failed: {str(bg_error)}")
-                    logger.info(f"[{request_id}] Using enhanced image as fallback")
+def process_single_image(image_url):
+    """Process a single image with all enhancement steps"""
+    try:
+        # Download image
+        session = get_global_session()
+        img_resp = session.get(image_url, timeout=30)
+        img_resp.raise_for_status()
+        
+        # Process image
+        img = Image.open(BytesIO(img_resp.content))
+        img = ImageOps.exif_transpose(img).convert("RGB")
+        
+        # Resize large images to prevent memory issues
+        img = resize_image_if_large(img, max_size=2048)
+        
+        # Get AI suggestions
+        factors = get_ai_suggestions_parallel(image_url, img)
+        
+        # Enhance image
+        enhanced = enhance_image_pillow(img, factors)
+        
+        # Background removal - only if AI recommends blur
+        if factors.get("apply_blur", False):
+            logger.info(f"AI recommended blur effect, performing background removal...")
+            try:
+                removed_bg = remove_background_via_replicate_optimized(enhanced, session)
+                
+                # Background blur
+                if removed_bg.mode == "RGBA" and "A" in removed_bg.getbands():
+                    logger.info(f"Background removal successful, applying blur...")
+                    alpha_mask = removed_bg.getchannel("A")
+                    final_image = blur_background_with_mask(enhanced, alpha_mask)
+                    used_fallback = False
+                    fallback_reason = None
+                else:
+                    logger.info(f"Background removal failed, using enhanced image")
                     final_image = enhanced
                     used_fallback = True
-                    fallback_reason = "background_removal_error"
-            else:
-                logger.info(f"[{request_id}] AI did not recommend blur effect, skipping background removal")
+                    fallback_reason = "background_removal_no_alpha"
+            except Exception as bg_error:
+                logger.error(f"Background removal failed: {str(bg_error)}")
+                logger.info(f"Using enhanced image as fallback")
                 final_image = enhanced
-                used_fallback = False
-                fallback_reason = None
-            
-            return {
-                "image_url": image_url,
-                "success": True,
-                "final_image": final_image,
-                "factors": factors,
-                "used_fallback": used_fallback,
-                "fallback_reason": fallback_reason
-            }
-            
-        except Exception as e:
-            logger.error(f"[{request_id}] Error processing {image_url}: {str(e)}")
-            return {
-                "image_url": image_url,
-                "success": False,
-                "error": str(e),
-                "used_fallback": True,
-                "fallback_reason": "processing_failed"
-            }
-    
-    # Use ThreadPoolExecutor for parallel processing with reduced workers to prevent memory issues
-    # Further reduce workers when processing many images to prevent memory overload
-    if len(image_urls) >= 5:
-        max_workers = 2  # Very conservative for large batches
-        logger.info(f"[{request_id}] Large batch detected ({len(image_urls)} images), using {max_workers} workers")
-    else:
-        max_workers = min(len(image_urls), 3)  # Normal processing
-        logger.info(f"[{request_id}] Using {max_workers} workers for {len(image_urls)} images")
-    
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-        future_to_url = {executor.submit(process_single_image, url): url for url in image_urls}
+                used_fallback = True
+                fallback_reason = "background_removal_error"
+        else:
+            logger.info(f"AI did not recommend blur effect, skipping background removal")
+            final_image = enhanced
+            used_fallback = False
+            fallback_reason = None
         
-        for future in concurrent.futures.as_completed(future_to_url):
-            try:
-                result = future.result()
-                results.append(result)
-                
-                # Clean up memory after each image (especially important for large batches)
-                if len(image_urls) >= 5:
-                    cleanup_memory()
-                    
-            except Exception as e:
-                logger.error(f"[{request_id}] Worker failed: {str(e)}")
-                # Add a failed result to maintain order
-                results.append({
-                    "image_url": "unknown",
-                    "success": False,
-                    "error": str(e),
-                    "used_fallback": True,
-                    "fallback_reason": "worker_failed"
-                })
+        return {
+            "image_url": image_url,
+            "success": True,
+            "final_image": final_image,
+            "factors": factors,
+            "used_fallback": used_fallback,
+            "fallback_reason": fallback_reason
+        }
+        
+    except Exception as e:
+        logger.error(f"Error processing {image_url}: {str(e)}")
+        return {
+            "image_url": image_url,
+            "success": False,
+            "error": str(e),
+            "used_fallback": True,
+            "fallback_reason": "processing_failed"
+        }
+
+def process_multiple_images_parallel(image_urls, request_id):
+    """Process multiple images with smart parallel/sequential processing based on image sizes"""
+    start_time = time.time()
+    logger.info(f"[{request_id}] Starting smart processing of {len(image_urls)} images")
+    
+    # Categorize images by size
+    session = get_global_session()
+    large_images, small_images = categorize_images_by_size(image_urls, session)
+    
+    if large_images and small_images:
+        # Mixed batch - use optimal processing
+        logger.info(f"[{request_id}] Mixed batch detected: {len(large_images)} large, {len(small_images)} small images")
+        results = process_mixed_batch(large_images, small_images, request_id)
+    elif large_images:
+        # All large images - sequential processing
+        logger.info(f"[{request_id}] All images are large, using sequential processing")
+        results = []
+        for i, (image_url, size) in enumerate(large_images):
+            logger.info(f"[{request_id}] Processing large image {i+1}/{len(large_images)}: {image_url} ({size/1024/1024:.2f}MB)")
+            result = process_single_image(image_url)
+            results.append(result)
+            cleanup_memory_aggressive()
+    else:
+        # All small images - parallel processing
+        logger.info(f"[{request_id}] All images are small, using parallel processing")
+        max_workers = min(3, len(small_images))
+        logger.info(f"[{request_id}] Using {max_workers} workers for {len(small_images)} small images")
+        
+        results = []
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_url = {executor.submit(process_single_image, url): url for url in image_urls}
+            
+            for future in concurrent.futures.as_completed(future_to_url):
+                try:
+                    result = future.result(timeout=300)
+                    results.append(result)
+                    cleanup_memory_aggressive()
+                except concurrent.futures.TimeoutError:
+                    logger.error(f"[{request_id}] Worker timed out")
+                    results.append({
+                        "image_url": "unknown",
+                        "success": False,
+                        "error": "Processing timeout",
+                        "used_fallback": True,
+                        "fallback_reason": "timeout"
+                    })
+                    cleanup_memory_aggressive()
+                except Exception as e:
+                    logger.error(f"[{request_id}] Worker failed: {str(e)}")
+                    results.append({
+                        "image_url": "unknown",
+                        "success": False,
+                        "error": str(e),
+                        "used_fallback": True,
+                        "fallback_reason": "worker_failed"
+                    })
+                    cleanup_memory_aggressive()
     
     # Final memory cleanup
-    cleanup_memory()
+    cleanup_memory_aggressive()
     
     total_time = time.time() - start_time
-    logger.info(f"[{request_id}] Parallel processing of {len(image_urls)} images completed in {total_time:.2f} seconds")
+    logger.info(f"[{request_id}] Smart processing of {len(image_urls)} images completed in {total_time:.2f} seconds")
     
     return results
 
@@ -758,6 +781,139 @@ def process_image_parallel(img, image_url, request_id):
         error_msg = f"Error in parallel processing after {total_time:.2f} seconds: {str(e)}"
         logger.error(f"[{request_id}] ERROR: {error_msg}")
         raise Exception(error_msg)
+
+def get_image_size_from_url(image_url, session=None):
+    """Get image size from URL without downloading the full image"""
+    try:
+        if session:
+            response = session.head(image_url, timeout=10)
+        else:
+            response = requests.head(image_url, timeout=10)
+        
+        response.raise_for_status()
+        content_length = response.headers.get('content-length')
+        
+        if content_length:
+            return int(content_length)
+        else:
+            # If content-length not available, download a small chunk to estimate
+            if session:
+                response = session.get(image_url, stream=True, timeout=10)
+            else:
+                response = requests.get(image_url, stream=True, timeout=10)
+            
+            response.raise_for_status()
+            # Read first chunk to estimate size
+            chunk = response.raw.read(1024)
+            response.close()
+            
+            # Estimate based on first chunk (rough approximation)
+            return len(chunk) * 100  # Rough estimate
+            
+    except Exception as e:
+        logger.warning(f"Could not determine size for {image_url}: {str(e)}")
+        return None
+
+def should_process_sequentially(image_urls, session=None, size_threshold=5*1024*1024):
+    """Check if any images are large enough to warrant sequential processing"""
+    large_images = []
+    
+    for url in image_urls:
+        size = get_image_size_from_url(url, session)
+        if size and size > size_threshold:
+            large_images.append((url, size))
+    
+    if large_images:
+        logger.info(f"Found {len(large_images)} large images (>5MB), will use sequential processing")
+        for url, size in large_images:
+            logger.info(f"Large image: {url} ({size/1024/1024:.2f}MB)")
+        return True
+    
+    logger.info("All images are under size threshold, using parallel processing")
+    return False
+
+def resize_image_if_large(img: Image.Image, max_size: int) -> Image.Image:
+    """Resizes an image if its dimensions exceed max_size."""
+    if img.width > max_size or img.height > max_size:
+        logger.info(f"Resizing image from {img.size} to {max_size}x{max_size} to prevent memory issues.")
+        # Determine the new size to maintain aspect ratio
+        width, height = img.size
+        if width > height:
+            new_width = max_size
+            new_height = int(height * (max_size / width))
+        else:
+            new_height = max_size
+            new_width = int(width * (max_size / height))
+        
+        img = img.resize((new_width, new_height), Image.Resampling.LANCZOS)
+        logger.info(f"Image resized to {img.size}")
+    return img
+
+def cleanup_memory_aggressive():
+    """Force garbage collection and clear session to free memory"""
+    global _global_session
+    import gc
+    gc.collect()
+    logger.debug("Aggressive memory cleanup performed")
+    if _global_session:
+        _global_session.close()
+        _global_session = None
+
+def categorize_images_by_size(image_urls, session=None, size_threshold=5*1024*1024):
+    """Categorize images into large and small based on file size"""
+    large_images = []
+    small_images = []
+    
+    for url in image_urls:
+        size = get_image_size_from_url(url, session)
+        if size and size > size_threshold:
+            large_images.append((url, size))
+        else:
+            small_images.append((url, size))
+    
+    return large_images, small_images
+
+def process_mixed_batch(large_images, small_images, request_id):
+    """Process a mixed batch of large and small images optimally"""
+    results = []
+    
+    # Process large images sequentially first
+    if large_images:
+        logger.info(f"[{request_id}] Processing {len(large_images)} large images sequentially")
+        for i, (image_url, size) in enumerate(large_images):
+            logger.info(f"[{request_id}] Processing large image {i+1}/{len(large_images)}: {image_url} ({size/1024/1024:.2f}MB)")
+            result = process_single_image(image_url)
+            results.append(result)
+            cleanup_memory_aggressive()
+    
+    # Process small images in parallel
+    if small_images:
+        logger.info(f"[{request_id}] Processing {len(small_images)} small images in parallel")
+        small_urls = [url for url, _ in small_images]
+        
+        max_workers = min(3, len(small_urls))
+        logger.info(f"[{request_id}] Using {max_workers} workers for {len(small_urls)} small images")
+        
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_url = {executor.submit(process_single_image, url): url for url in small_urls}
+            
+            for future in concurrent.futures.as_completed(future_to_url):
+                try:
+                    result = future.result(timeout=300)
+                    results.append(result)
+                    cleanup_memory_aggressive()
+                except Exception as e:
+                    logger.error(f"[{request_id}] Worker failed: {str(e)}")
+                    results.append({
+                        "image_url": "unknown",
+                        "success": False,
+                        "error": str(e),
+                        "used_fallback": True,
+                        "fallback_reason": "worker_failed"
+                    })
+                    cleanup_memory_aggressive()
+    
+    return results
 
 @image_enhancement_bp.route("/", methods=["POST"], strict_slashes=False)
 def enhance():
@@ -1074,11 +1230,16 @@ def enhance_batch():
                 "request_id": request_id
             }), 200
 
-        logger.info(f"[{request_id}] Processing {len(valid_urls)} images in parallel")
+        # Categorize images by size
+        large_images, small_images = categorize_images_by_size(valid_urls)
         
-        # Process images in parallel
-        results = process_multiple_images_parallel(valid_urls, request_id)
-        
+        if large_images:
+            logger.info(f"[{request_id}] Found {len(large_images)} large images (>5MB), will use mixed processing.")
+            results = process_mixed_batch(large_images, small_images, request_id)
+        else:
+            logger.info(f"[{request_id}] All images are under size threshold, using parallel processing for smaller images.")
+            results = process_multiple_images_parallel(valid_urls, request_id)
+
         # Upload results to Cloudinary
         uploaded_results = []
         for result in results:
