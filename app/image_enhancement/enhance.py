@@ -851,6 +851,7 @@ def resize_image_if_large(img: Image.Image, max_size: int) -> Image.Image:
 
 def cleanup_memory_aggressive():
     """Force garbage collection and clear session to free memory"""
+    global _global_session
     import gc
     gc.collect()
     logger.debug("Aggressive memory cleanup performed")
