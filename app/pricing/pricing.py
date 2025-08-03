@@ -1,5 +1,6 @@
 from flask import Flask, Blueprint, request, jsonify
 from supabase import create_client, Client
+from flask_cors import CORS
 import pandas as pd
 import numpy as np
 import os
@@ -136,7 +137,8 @@ def process_files():
         print(f"Processing pricing for: {brand} {model} | Category: {category} / {sub_category} | Age: {age} | Condition: {condition}")
 
         # Step 1: Match category and subcategory in Supabase
-        category_resp = supabase.table("categories").select("*").eq("category", category).eq("sub_category", sub_category).execute()
+        category_resp = supabase.table("categories").select("*").eq("value", category).eq("subcategory", sub_category).execute()
+        print("Category query response:", category_resp.data)
 
         if not category_resp.data:
             print("No matching category/sub-category. Falling back to default category_id=54")
@@ -209,6 +211,7 @@ def process_files():
         return jsonify({'error': str(e)}), 500
 
 app = Flask(__name__)
+CORS(app)
 app.register_blueprint(pricing_bp, url_prefix="/api/pricing")
 
 if __name__ == "__main__":
