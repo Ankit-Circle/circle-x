@@ -1,11 +1,17 @@
-from flask import Blueprint, request, jsonify
+from flask import Flask, Blueprint, request, jsonify
+from supabase import create_client, Client
 import pandas as pd
 import numpy as np
 import os
 import requests
 import time
 from datetime import datetime
+from dotenv import load_dotenv
 import sys
+import re
+
+# Load environment variables from .env file
+load_dotenv()
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding='utf-8')
@@ -15,11 +21,15 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 pricing_bp = Blueprint("pricing", __name__)
 pricing_db_bp = Blueprint("pricing_db_bp", __name__)
 
-# Set your Perplexity API key
+# Environment variables
+SUPABASE_URL = os.environ.get("SUPABASE_URL")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 PERPLEXITY_API_KEY = os.environ.get("PERPLEXITY_API_KEY")
 
-if not PERPLEXITY_API_KEY:
-    raise ValueError("PERPLEXITY_API_KEY environment variable is not set")
+if not all([SUPABASE_URL, SUPABASE_KEY, PERPLEXITY_API_KEY]):
+    raise ValueError("Missing one or more required environment variables: SUPABASE_URL, SUPABASE_KEY, PERPLEXITY_API_KEY")
+
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 def fetch_price_details(brand, model):
     try:
@@ -66,8 +76,6 @@ def fetch_price_details(brand, model):
 
         answer = response.json()["choices"][0]["message"]["content"]
         print(f"Perplexity response: '{answer}'")
-
-        import re
 
         # Extract MRP with description in brackets
         mrp_match = re.search(r"MRP\s*[:\-]?\s*₹?\s*([\d,]+)\s*INR?\s*\(([^)]+)\)", answer, re.IGNORECASE)
@@ -127,7 +135,29 @@ def process_files():
         # Log input
         print(f"Processing pricing for: {brand} {model} | Category: {category} / {sub_category} | Age: {age} | Condition: {condition}")
 
-        # Get Best Online Price using GPT
+        # Step 1: Match category and subcategory in Supabase
+        category_resp = supabase.table("categories").select("*").eq("category", category).eq("sub_category", sub_category).execute()
+
+        if not category_resp.data:
+            print("No matching category/sub-category. Falling back to default category_id=54")
+            category_id = 54
+        else:
+            category_row = category_resp.data[0]
+            if not category_row.get("is_active", False):
+                return jsonify({'error': f"The category '{category}' is currently inactive."}), 400
+            category_id = category_row["id"]
+
+        # Step 2: Fetch config for the given year and category_id
+        pricing_resp = supabase.table("pricing_master").select("sale_val, tier_2_depreciation, tier_3_depreciation").eq("category_id", category_id).eq("year", age_int).execute()
+        if not pricing_resp.data:
+            return jsonify({'error': f"No pricing config found for category '{category}' and year {age_int}."}), 404
+
+        pricing = pricing_resp.data[0]
+        sale_val = float(pricing["sale_val"])
+        tier_2 = float(pricing["tier_2_depreciation"] or 0)
+        tier_3 = float(pricing["tier_3_depreciation"] or 0)
+
+        # Step 3: Get Best Online Price
         price_details = fetch_price_details(brand, model)
 
         best_online_price = price_details['best_online_price']
@@ -135,41 +165,7 @@ def process_files():
         mrp_source = price_details['mrp_source']
         online_price_source = price_details['online_price_source']
 
-        config_path = os.path.join(BASE_DIR, 'config1.csv')
-        config = pd.read_csv(config_path)
-
-        config['category'] = config['category'].astype(str).str.strip()
-        config['sub-category'] = config['sub-category'].astype(str).str.strip()
-        config['Year'] = pd.to_numeric(config['Year'], errors='coerce')
-
-        match = config[
-            (config['category'] == category) &
-            (config['sub-category'] == sub_category) &
-            (config['Year'] == age_int)
-        ]
-
-        if match.empty:
-            match = config[
-                (config['category'] == category) &
-                (config['sub-category'] == 'ALL') &
-                (config['Year'] == age_int)
-            ]
-
-        if match.empty:
-            match = config[
-                (config['category'] == 'Generic') &
-                (config['sub-category'] == 'ALL') &
-                (config['Year'] == age_int)
-            ]
-
-        if match.empty:
-            return jsonify({'error': 'No matching config found, even with Generic fallback'}), 404
-
-        row = match.iloc[0]
-        sale_val = float(row['sale_val'])
-        tier_2 = float(row['tier_2_depreciation'])
-        tier_3 = float(row['tier_3_depreciation'])
-
+        # Step 4: Apply pricing logic
         price_new = round_to_nearest_25(best_online_price * sale_val)
         price_excellent = round_to_nearest_25(best_online_price * (sale_val - tier_2))
         price_verygood = round_to_nearest_25(best_online_price * (sale_val - tier_3))
@@ -202,7 +198,8 @@ def process_files():
             'mrp_source': mrp_source,
             'category': category,
             'sub-category': sub_category,
-            'Product_Age': age,
+            'Product_Age_Years': age_years,
+            'Product_Age_Months': age_months,
             'Condition_Tier': condition,
             'brand': brand,
             'model': model
@@ -211,58 +208,8 @@ def process_files():
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
-@pricing_db_bp.route("/", methods=["GET"], strict_slashes=False)
-def process_files_db():
-    try:
-        db_path = os.path.join(BASE_DIR, 'db1.csv')
-        config_path = os.path.join(BASE_DIR, 'config1.csv')
+app = Flask(__name__)
+app.register_blueprint(pricing_bp, url_prefix="/api/pricing")
 
-        df = pd.read_csv(db_path)
-        config = pd.read_csv(config_path)
-
-        df["Best_Online_Price"] = pd.to_numeric(df["Best_Online_Price"], errors='coerce')
-        config["sale_val"] = pd.to_numeric(config["sale_val"], errors='coerce')
-
-        config_unique = config[['category', 'sub-category']].drop_duplicates()
-        config_dict = pd.Series(config_unique['sub-category'].values, index=config_unique['category']).to_dict()
-
-        df['category_new'] = np.where(df['Category'].isin(config_unique['category']), df['Category'], 'Generic')
-        df['sub-category_new'] = df['category_new'].apply(lambda x: config_dict.get(x, 'Generic'))
-
-        cols = [
-            'Listing_ID', 'Category', 'Sub_Category', 'Best_Online_Price',
-            'Condition_Tier', 'Product_Age_Years1', 'brand_tier',
-            'warranty_period', 'Functional_Status', 'Final_Listed_Price',
-            'category_new', 'sub-category_new'
-        ]
-
-        df_comb = pd.merge(
-            df[cols], config,
-            how='left',
-            left_on=['Product_Age_Years1', 'category_new', 'sub-category_new'],
-            right_on=['Year', 'category', 'sub-category']
-        )
-
-        df_comb['price_new'] = df_comb['Best_Online_Price'] * df_comb['sale_val']
-        df_comb['price_excellent'] = df_comb['Best_Online_Price'] * (df_comb['sale_val'] - df_comb['tier_2_depreciation'])
-        df_comb['price_verygood'] = df_comb['Best_Online_Price'] * (df_comb['sale_val'] - df_comb['tier_3_depreciation'])
-
-        df_comb['price_final'] = np.where(
-            df_comb['Condition_Tier'].isin(['Mint', 'Like New']),
-            df_comb['price_new'],
-            np.where(
-                df_comb['Condition_Tier'].isin(['Excellent']),
-                df_comb['price_excellent'],
-                np.where(
-                    df_comb['Condition_Tier'].isin(['Good', 'Very Good']),
-                    df_comb['price_verygood'],
-                    np.nan
-                )
-            )
-        )
-
-        output_data = df_comb[['Listing_ID', 'price_final']].to_dict(orient='records')
-        return jsonify({'result': output_data})
-
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
+if __name__ == "__main__":
+    app.run(debug=True, port=5000)
