@@ -150,7 +150,7 @@ def process_files():
             category_id = category_row["id"]
 
         # Step 2: Fetch config for the given year and category_id
-        pricing_resp = supabase.table("pricing_master").select("sale_val, tier_2_depreciation, tier_3_depreciation").eq("category_id", category_id).eq("year", age_int).execute()
+        pricing_resp = supabase.table("category_pricing_rules").select("sale_val, tier_2_depreciation, tier_3_depreciation").eq("category_id", category_id).eq("year", age_int).execute()
         if not pricing_resp.data:
             return jsonify({'error': f"No pricing config found for category '{category}' and year {age_int}."}), 404
 
