@@ -471,7 +471,16 @@ def process_single_image(image_url):
         
         # Process image with smart memory management
         try:
-            img = Image.open(BytesIO(img_resp.content))
+            # Detect and convert image format if necessary
+            logger.info(f"Detecting image format for {image_url}")
+            converted_bytes, detected_format = detect_and_convert_image_format(img_resp.content, image_url)
+            
+            if converted_bytes != img_resp.content:
+                logger.info(f"Image converted from {detected_format} to JPEG format")
+                img = Image.open(BytesIO(converted_bytes))
+            else:
+                img = Image.open(BytesIO(img_resp.content))
+            
             img = ImageOps.exif_transpose(img).convert("RGB")
             
             original_size = img.size
@@ -1046,6 +1055,95 @@ def process_image_smartly(img: Image.Image, original_size: tuple) -> tuple[Image
             "pixel_reduction": 0
         }
 
+def convert_avif_to_jpeg(image_bytes):
+    """Convert AVIF image bytes to JPEG format"""
+    try:
+        import pillow_avif  # Try to import AVIF support
+        logger.info("AVIF support detected, converting AVIF to JPEG")
+        
+        # Open AVIF image
+        img = Image.open(BytesIO(image_bytes))
+        img = img.convert('RGB')
+        
+        # Convert to JPEG bytes
+        output_buffer = BytesIO()
+        img.save(output_buffer, format='JPEG', quality=95)
+        output_buffer.seek(0)
+        
+        logger.info(f"AVIF converted to JPEG: {img.size}")
+        return output_buffer.getvalue()
+        
+    except ImportError:
+        logger.warning("AVIF support not available, attempting alternative conversion")
+        try:
+            # Try using pillow-avif if available
+            import pillow_avif
+            img = Image.open(BytesIO(image_bytes))
+            img = img.convert('RGB')
+            
+            output_buffer = BytesIO()
+            img.save(output_buffer, format='JPEG', quality=95)
+            output_buffer.seek(0)
+            
+            logger.info(f"AVIF converted to JPEG using pillow-avif: {img.size}")
+            return output_buffer.getvalue()
+            
+        except ImportError:
+            logger.error("No AVIF support available. Please install: pip install pillow-avif")
+            return None
+    except Exception as e:
+        logger.error(f"Error converting AVIF: {str(e)}")
+        return None
+
+def detect_and_convert_image_format(image_bytes, image_url):
+    """Detect image format and convert if necessary"""
+    try:
+        # Try to open with PIL first
+        img = Image.open(BytesIO(image_bytes))
+        logger.info(f"Image format detected: {img.format}, size: {img.size}")
+        return image_bytes, img.format
+        
+    except Exception as e:
+        error_msg = str(e).lower()
+        
+        # Check if it's an AVIF format error
+        if 'cannot identify image file' in error_msg or 'avif' in error_msg:
+            logger.warning(f"AVIF format detected from error: {error_msg}")
+            
+            # Try to convert AVIF to JPEG
+            converted_bytes = convert_avif_to_jpeg(image_bytes)
+            if converted_bytes:
+                logger.info("AVIF successfully converted to JPEG")
+                return converted_bytes, 'JPEG'
+            else:
+                logger.error("Failed to convert AVIF image")
+                raise Exception("AVIF format not supported. Please convert to JPEG/PNG first.")
+        
+        # Check for other unsupported formats
+        elif 'webp' in error_msg:
+            logger.warning("WebP format detected, attempting conversion")
+            try:
+                img = Image.open(BytesIO(image_bytes))
+                img = img.convert('RGB')
+                
+                output_buffer = BytesIO()
+                img.save(output_buffer, format='JPEG', quality=95)
+                output_buffer.seek(0)
+                
+                logger.info("WebP successfully converted to JPEG")
+                return output_buffer.getvalue(), 'JPEG'
+                
+            except Exception as webp_error:
+                logger.error(f"WebP conversion failed: {str(webp_error)}")
+                raise Exception("WebP format not supported. Please convert to JPEG/PNG first.")
+        
+        else:
+            # Unknown format error
+            logger.error(f"Unknown image format error: {error_msg}")
+            raise Exception(f"Unsupported image format. Error: {error_msg}")
+    
+    return image_bytes, 'UNKNOWN'
+
 @image_enhancement_bp.route("/", methods=["POST"], strict_slashes=False)
 def enhance():
     """Enhanced image processing endpoint with comprehensive error handling"""
@@ -1131,8 +1229,17 @@ def enhance():
         process_start = time.time()
         
         try:
+            # Detect and convert image format if necessary
+            logger.info(f"[{request_id}] Detecting image format...")
+            converted_bytes, detected_format = detect_and_convert_image_format(img_resp.content, image_url)
+            
+            if converted_bytes != img_resp.content:
+                logger.info(f"[{request_id}] Image converted from {detected_format} to JPEG format")
+                img = Image.open(BytesIO(converted_bytes))
+            else:
+                img = Image.open(BytesIO(img_resp.content))
+            
             # Apply EXIF orientation correction safely
-            img = Image.open(BytesIO(img_resp.content))
             img = ImageOps.exif_transpose(img).convert("RGB")
             
             process_time = time.time() - process_start
