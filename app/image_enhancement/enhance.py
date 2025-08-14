@@ -25,13 +25,22 @@ except ImportError:
     logger.warning("⚠️  python-dotenv not installed, using system environment variables")
 
 # Configuration constants for memory management
-MAX_IMAGE_DIMENSION = 4096  # Maximum width/height in pixels
-MAX_IMAGE_PIXELS = 16 * 1024 * 1024  # Maximum total pixels (16MP)
-MAX_FILE_SIZE = 50 * 1024 * 1024  # Maximum file size (50MB)
-RESIZE_THRESHOLD = 2048  # Threshold for resizing large images
-EXTREME_RESIZE_THRESHOLD = 1024  # Threshold for extremely large images
+MAX_IMAGE_DIMENSION = 8192  # Maximum width/height in pixels (8K)
+MAX_IMAGE_PIXELS = 100 * 1024 * 1024  # Maximum total pixels (100MP)
+MAX_FILE_SIZE = 150 * 1024 * 1024  # Maximum file size (150MB)
+RESIZE_THRESHOLD = 4096  # Threshold for resizing large images (4K)
+EXTREME_RESIZE_THRESHOLD = 2048  # Threshold for extremely large images (2K)
+
+# Smart processing thresholds
+SMART_PROCESSING_THRESHOLDS = {
+    100 * 1024 * 1024: 2048,    # > 100MP → 2K (very aggressive)
+    50 * 1024 * 1024: 4096,     # > 50MP → 4K (aggressive)
+    25 * 1024 * 1024: 6144,     # > 25MP → 6K (moderate)
+    16 * 1024 * 1024: 8192,     # > 16MP → 8K (light)
+}
 
 logger.info(f"Memory management config: MAX_DIM={MAX_IMAGE_DIMENSION}, MAX_PIXELS={MAX_IMAGE_PIXELS/1024/1024:.1f}MP, MAX_SIZE={MAX_FILE_SIZE/1024/1024:.1f}MB")
+logger.info(f"Smart processing thresholds: {SMART_PROCESSING_THRESHOLDS}")
 
 # Configure logging
 logging.basicConfig(
@@ -439,7 +448,7 @@ def validate_image_dimensions(img: Image.Image) -> tuple[bool, str]:
         return False, f"Validation error: {str(e)}"
 
 def process_single_image(image_url):
-    """Process a single image with all enhancement steps and improved memory management"""
+    """Process a single image with all enhancement steps and smart memory management"""
     try:
         # Download image
         session = get_global_session()
@@ -455,45 +464,31 @@ def process_single_image(image_url):
                 "success": False,
                 "error": f"File too large ({file_size/1024/1024:.1f}MB > {MAX_FILE_SIZE/1024/1024:.1f}MB)",
                 "used_fallback": True,
-                "fallback_reason": "file_too_large"
+                "fallback_reason": "file_too_large",
+                "suggestion": f"Please resize your image to under {MAX_FILE_SIZE/1024/1024:.0f}MB or use our smart processing by reducing the file size",
+                "max_file_size_mb": MAX_FILE_SIZE / (1024 * 1024)
             }
         
-        # Process image with memory management
+        # Process image with smart memory management
         try:
             img = Image.open(BytesIO(img_resp.content))
             img = ImageOps.exif_transpose(img).convert("RGB")
             
-            # Validate image dimensions
-            is_valid, validation_msg = validate_image_dimensions(img)
-            if not is_valid:
-                logger.warning(f"Image validation failed: {validation_msg}")
-                # Try to resize to acceptable dimensions
-                img = resize_image_if_large(img, max_size=RESIZE_THRESHOLD)
-                
-                # Re-validate after resize
-                is_valid, validation_msg = validate_image_dimensions(img)
-                if not is_valid:
-                    logger.error(f"Image still invalid after resize: {validation_msg}")
-                    return {
-                        "image_url": image_url,
-                        "success": False,
-                        "error": f"Image dimensions invalid: {validation_msg}",
-                        "used_fallback": True,
-                        "fallback_reason": "invalid_dimensions"
-                    }
-            
-            # Check if image is extremely large and handle accordingly
             original_size = img.size
             total_pixels = img.width * img.height
             
-            # If image is extremely large (>10MP), use more aggressive resizing
-            if total_pixels > 10 * 1024 * 1024:  # 10MP threshold
-                logger.warning(f"Extremely large image detected: {original_size} ({total_pixels/1024/1024:.1f}MP)")
-                # Use a smaller max size for extremely large images
-                img = resize_image_if_large(img, max_size=EXTREME_RESIZE_THRESHOLD)
-            else:
-                # Normal resizing for large images
-                img = resize_image_if_large(img, max_size=RESIZE_THRESHOLD)
+            # Use smart processing instead of rejection
+            logger.info(f"Processing image: {original_size} ({total_pixels/1024/1024:.1f}MP)")
+            
+            # Smart processing with intelligent resizing
+            processed_img, processing_info = process_image_smartly(img, original_size)
+            
+            # Clear original image from memory if it was resized
+            if processing_info["resized"]:
+                img.close()
+                del img
+                gc.collect()
+                img = processed_img  # Use the processed image for further processing
             
             # Get AI suggestions
             factors = get_ai_suggestions_parallel(image_url, img)
@@ -506,10 +501,10 @@ def process_single_image(image_url):
             del img
             gc.collect()
             
-            # No background removal - just return enhanced image
+            # Prepare response with processing information
             final_image = enhanced
-            used_fallback = False
-            fallback_reason = None
+            used_fallback = processing_info["resized"]
+            fallback_reason = processing_info["resize_reason"] if processing_info["resized"] else None
             
             return {
                 "image_url": image_url,
@@ -517,7 +512,8 @@ def process_single_image(image_url):
                 "final_image": final_image,
                 "factors": factors,
                 "used_fallback": used_fallback,
-                "fallback_reason": fallback_reason
+                "fallback_reason": fallback_reason,
+                "processing_info": processing_info
             }
             
         except MemoryError as me:
@@ -552,7 +548,14 @@ def process_single_image(image_url):
                     "final_image": enhanced,
                     "factors": factors,
                     "used_fallback": True,
-                    "fallback_reason": "memory_error_fallback"
+                    "fallback_reason": "memory_error_fallback",
+                    "processing_info": {
+                        "resized": True,
+                        "resize_reason": "memory_error_fallback",
+                        "original_size": original_size,
+                        "final_size": (512, 512),
+                        "pixel_reduction": 99.0
+                    }
                 }
                 
             except Exception as fallback_error:
@@ -970,6 +973,79 @@ def process_mixed_batch(large_images, small_images, request_id):
     
     return results
 
+def get_smart_resize_strategy(total_pixels):
+    """Determine the best resize strategy based on image size"""
+    try:
+        # Find the appropriate threshold for this image size
+        for threshold_pixels, target_size in sorted(SMART_PROCESSING_THRESHOLDS.items(), reverse=True):
+            if total_pixels > threshold_pixels:
+                return target_size, f"resized_for_memory_efficiency_{target_size}p"
+        
+        # If image is under all thresholds, no resize needed
+        return None, None
+        
+    except Exception as e:
+        logger.warning(f"Error determining resize strategy: {str(e)}")
+        return EXTREME_RESIZE_THRESHOLD, "fallback_resize"
+
+def process_image_smartly(img: Image.Image, original_size: tuple) -> tuple[Image.Image, dict]:
+    """Process image with smart sizing strategy instead of rejection"""
+    try:
+        original_width, original_height = original_size
+        total_pixels = original_width * original_height
+        
+        # Get smart resize strategy
+        target_size, resize_reason = get_smart_resize_strategy(total_pixels)
+        
+        if target_size is None:
+            # No resize needed
+            return img, {
+                "resized": False,
+                "resize_reason": None,
+                "original_size": original_size,
+                "final_size": original_size,
+                "pixel_reduction": 0
+            }
+        
+        # Calculate new dimensions maintaining aspect ratio
+        if original_width > original_height:
+            new_width = target_size
+            new_height = int(original_height * (target_size / original_width))
+        else:
+            new_height = target_size
+            new_width = int(original_width * (target_size / original_height))
+        
+        new_size = (new_width, new_height)
+        new_pixels = new_width * new_height
+        
+        # Calculate pixel reduction percentage
+        pixel_reduction = ((total_pixels - new_pixels) / total_pixels) * 100
+        
+        logger.info(f"Smart processing: {original_size} ({total_pixels/1024/1024:.1f}MP) → {new_size} ({new_pixels/1024/1024:.1f}MP) - {pixel_reduction:.1f}% reduction")
+        
+        # Resize image
+        resized_img = resize_image_if_large(img, max_size=target_size)
+        
+        return resized_img, {
+            "resized": True,
+            "resize_reason": resize_reason,
+            "original_size": original_size,
+            "final_size": resized_img.size,
+            "pixel_reduction": pixel_reduction,
+            "target_size": target_size
+        }
+        
+    except Exception as e:
+        logger.error(f"Error in smart processing: {str(e)}")
+        # Return original image if smart processing fails
+        return img, {
+            "resized": False,
+            "resize_reason": "smart_processing_failed",
+            "original_size": original_size,
+            "final_size": original_size,
+            "pixel_reduction": 0
+        }
+
 @image_enhancement_bp.route("/", methods=["POST"], strict_slashes=False)
 def enhance():
     """Enhanced image processing endpoint with comprehensive error handling"""
@@ -1184,17 +1260,37 @@ def enhance():
         total_time = time.time() - request_start_time
         logger.info(f"[{request_id}] Total processing time: {total_time:.2f} seconds")
         
+        # Get processing information if available
+        processing_info = getattr(result, 'get', lambda x, default=None: default)('processing_info', {})
+        
         response_data = {
             "success": True,
             "enhancement_factors": factors,
             "enhanced_image_url": cloudinary_url,
-            "original_size": img.size,
+            "original_size": original_size,
             "enhanced_size": final_image.size,
             "processing_time": total_time,
             "request_id": request_id,
             "used_fallback": used_fallback,
             "fallback_reason": fallback_reason
         }
+        
+        # Add processing information if available
+        if processing_info:
+            response_data["processing_info"] = processing_info
+            
+            # Add user-friendly notes
+            if processing_info.get("resized"):
+                pixel_reduction = processing_info.get("pixel_reduction", 0)
+                original_mp = (processing_info.get("original_size", [0, 0])[0] * processing_info.get("original_size", [0, 0])[1]) / (1024 * 1024)
+                final_mp = (processing_info.get("final_size", [0, 0])[0] * processing_info.get("final_size", [0, 0])[1]) / (1024 * 1024)
+                
+                response_data["note"] = f"Your {original_mp:.1f}MP image was intelligently resized to {final_mp:.1f}MP for optimal processing while maintaining quality. Pixel reduction: {pixel_reduction:.1f}%"
+                
+                if processing_info.get("target_size"):
+                    response_data["quality_note"] = f"Image optimized to {processing_info['target_size']}p resolution for best enhancement results"
+            else:
+                response_data["note"] = "Image processed at original resolution for maximum quality"
         
         logger.info(f"[{request_id}] Request completed successfully!")
         logger.info(f"[{request_id}] Response data: {response_data}")
@@ -1364,7 +1460,8 @@ def enhance_batch():
                         "enhanced_image_url": cloudinary_url,
                         "enhancement_factors": result["factors"],
                         "used_fallback": result["used_fallback"],
-                        "fallback_reason": result["fallback_reason"]
+                        "fallback_reason": result["fallback_reason"],
+                        "processing_info": result.get("processing_info", {})
                     })
                     
                 except Exception as e:
@@ -1435,5 +1532,6 @@ def enhance_batch():
             "processing_time": total_time
         }), 200
 
+# Call demo function when module loads
 if __name__ == "__main__":
     app.run(debug=True)
