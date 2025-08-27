@@ -121,27 +121,30 @@ def enhance_image_pillow(img, factors):
     logger.info(f"Enhancement factors: {factors}")
     
     try:
+        # Create a copy of the image to avoid modifying the original
+        working_img = img.copy()
+        
         # Apply saturation enhancement
         logger.debug("Applying saturation enhancement...")
-        img = ImageEnhance.Color(img).enhance(factors.get("saturation", 1.0))
+        working_img = ImageEnhance.Color(working_img).enhance(factors.get("saturation", 1.0))
         
         # Apply brightness enhancement
         logger.debug("Applying brightness enhancement...")
-        img = ImageEnhance.Brightness(img).enhance(factors.get("brightness", 1.0))
+        working_img = ImageEnhance.Brightness(working_img).enhance(factors.get("brightness", 1.0))
         
         # Apply contrast enhancement
         logger.debug("Applying contrast enhancement...")
-        img = ImageEnhance.Contrast(img).enhance(factors.get("contrast", 1.0))
+        working_img = ImageEnhance.Contrast(working_img).enhance(factors.get("contrast", 1.0))
         
         # Apply sharpness enhancement
         logger.debug("Applying sharpness enhancement...")
-        img = ImageEnhance.Sharpness(img).enhance(factors.get("sharpness", 1.0))
+        working_img = ImageEnhance.Sharpness(working_img).enhance(factors.get("sharpness", 1.0))
         
         processing_time = time.time() - start_time
         logger.info(f"Image enhancement completed in {processing_time:.2f} seconds")
-        logger.info(f"Enhanced image size: {img.size}, Mode: {img.mode}")
+        logger.info(f"Enhanced image size: {working_img.size}, Mode: {working_img.mode}")
         
-        return img
+        return working_img
     except Exception as e:
         processing_time = time.time() - start_time
         error_msg = f"Error enhancing image after {processing_time:.2f} seconds: {str(e)}"
@@ -153,20 +156,72 @@ def enhance_image_pillow(img, factors):
 def analyze_image_characteristics(img):
     """Analyze basic image characteristics to provide fallback enhancement values"""
     try:
-        # Convert to RGB if needed
+        # Memory-efficient analysis without copying the entire image
+        # Use numpy arrays for faster, memory-efficient calculations
+        
+        # Get image data as numpy array for analysis
+        import numpy as np
+        
+        # Convert to RGB if needed (this creates a new object but we'll manage it carefully)
         if img.mode != 'RGB':
-            img = img.convert('RGB')
+            analysis_img = img.convert('RGB')
+        else:
+            analysis_img = img
         
-        # Calculate average brightness
-        img_array = img.convert('L')  # Convert to grayscale
-        avg_brightness = sum(img_array.getdata()) / len(img_array.getdata())
-        brightness_factor = 255  # Normalize to 0-1 scale
-        normalized_brightness = avg_brightness / brightness_factor
+        # Convert to numpy array for efficient analysis
+        img_array = np.array(analysis_img)
         
-        # Calculate average saturation (simplified)
-        img_hsv = img.convert('HSV')
-        h, s, v = img_hsv.split()
-        avg_saturation = sum(s.getdata()) / len(s.getdata()) / 255
+        # Calculate average brightness from RGB values (more accurate than L conversion)
+        # Use only a sample of pixels for large images to save memory
+        height, width = img_array.shape[:2]
+        total_pixels = height * width
+        
+        # For very large images, sample pixels to save memory
+        if total_pixels > 1000000:  # > 1MP
+            # Sample every 4th pixel
+            sample_step = 4
+            sampled_array = img_array[::sample_step, ::sample_step]
+            avg_brightness = np.mean(sampled_array)
+            # Scale back to full image average
+            avg_brightness = avg_brightness * (sample_step ** 2)
+        else:
+            # For smaller images, use all pixels
+            avg_brightness = np.mean(img_array)
+        
+        # Normalize brightness (0-255 to 0-1)
+        normalized_brightness = avg_brightness / 255.0
+        
+        # Calculate saturation using RGB values (avoid HSV conversion)
+        # Saturation = max(R,G,B) - min(R,G,B)
+        if total_pixels > 1000000:
+            # Use sampled array for large images
+            max_rgb = np.max(sampled_array, axis=2)
+            min_rgb = np.min(sampled_array, axis=2)
+            saturation_values = max_rgb - min_rgb
+            avg_saturation = np.mean(saturation_values) / 255.0
+        else:
+            max_rgb = np.max(img_array, axis=2)
+            min_rgb = np.min(img_array, axis=2)
+            saturation_values = max_rgb - min_rgb
+            avg_saturation = np.mean(saturation_values) / 255.0
+        
+        # Clean up numpy arrays to free memory
+        del img_array
+        if 'sampled_array' in locals():
+            del sampled_array
+        if 'max_rgb' in locals():
+            del max_rgb
+        if 'min_rgb' in locals():
+            del min_rgb
+        if 'saturation_values' in locals():
+            del saturation_values
+        
+        # Only close if we created a new image object
+        if analysis_img != img:
+            analysis_img.close()
+        
+        # Force garbage collection for numpy arrays
+        gc.collect()
         
         # Determine enhancement factors based on analysis
         if normalized_brightness < 0.4:  # Dark image
@@ -196,6 +251,8 @@ def analyze_image_characteristics(img):
         }
     except Exception as e:
         logger.error(f"Error analyzing image characteristics: {str(e)}")
+        # Force memory cleanup on error
+        gc.collect()
         return {
             "brightness": 1.05,
             "contrast": 1.15,
@@ -208,6 +265,13 @@ def analyze_image_characteristics(img):
 def get_ai_suggestions_parallel(image_url, img):
     """Get AI suggestions for image enhancement factors (optimized version)"""
     start_time = time.time()
+    
+    # Clean the URL to remove any trailing colons or invalid characters
+    clean_image_url = image_url.rstrip(':').strip()
+    if clean_image_url != image_url:
+        logger.warning(f"URL cleaned from '{image_url}' to '{clean_image_url}' for AI processing")
+        image_url = clean_image_url
+    
     logger.info(f"Starting AI suggestions for image: {image_url}")
     
     # Check if OpenAI API key is available
@@ -303,6 +367,12 @@ Base your values on the actual image analysis, not generic defaults.
         if is_generic:
             logger.warning("AI response appears to be generic, using image analysis fallback")
             try:
+                # Clean the URL to remove any trailing colons or invalid characters
+                clean_image_url = image_url.rstrip(':').strip()
+                if clean_image_url != image_url:
+                    logger.warning(f"URL cleaned from '{image_url}' to '{clean_image_url}' for fallback analysis")
+                    image_url = clean_image_url
+                
                 img_resp = requests.get(image_url, timeout=10)
                 img_resp.raise_for_status()
                 img = Image.open(BytesIO(img_resp.content))
@@ -328,6 +398,12 @@ Base your values on the actual image analysis, not generic defaults.
         
         # Try to analyze the image for fallback values
         try:
+            # Clean the URL to remove any trailing colons or invalid characters
+            clean_image_url = image_url.rstrip(':').strip()
+            if clean_image_url != image_url:
+                logger.warning(f"URL cleaned from '{image_url}' to '{clean_image_url}' for JSON error fallback")
+                image_url = clean_image_url
+            
             img_resp = requests.get(image_url, timeout=10)
             img_resp.raise_for_status()
             img = Image.open(BytesIO(img_resp.content))
@@ -355,6 +431,12 @@ Base your values on the actual image analysis, not generic defaults.
         
         # Try to analyze the image for fallback values
         try:
+            # Clean the URL to remove any trailing colons or invalid characters
+            clean_image_url = image_url.rstrip(':').strip()
+            if clean_image_url != image_url:
+                logger.warning(f"URL cleaned from '{image_url}' to '{clean_image_url}' for authentication error fallback")
+                image_url = clean_image_url
+            
             img_resp = requests.get(image_url, timeout=10)
             img_resp.raise_for_status()
             img = Image.open(BytesIO(img_resp.content))
@@ -382,6 +464,12 @@ Base your values on the actual image analysis, not generic defaults.
         
         # Try to analyze the image for fallback values
         try:
+            # Clean the URL to remove any trailing colons or invalid characters
+            clean_image_url = image_url.rstrip(':').strip()
+            if clean_image_url != image_url:
+                logger.warning(f"URL cleaned from '{image_url}' to '{clean_image_url}' for rate limit fallback")
+                image_url = clean_image_url
+            
             img_resp = requests.get(image_url, timeout=10)
             img_resp.raise_for_status()
             img = Image.open(BytesIO(img_resp.content))
@@ -409,6 +497,12 @@ Base your values on the actual image analysis, not generic defaults.
         
         # Try to analyze the image for fallback values
         try:
+            # Clean the URL to remove any trailing colons or invalid characters
+            clean_image_url = image_url.rstrip(':').strip()
+            if clean_image_url != image_url:
+                logger.warning(f"URL cleaned from '{image_url}' to '{clean_image_url}' for unexpected error fallback")
+                image_url = clean_image_url
+            
             img_resp = requests.get(image_url, timeout=10)
             img_resp.raise_for_status()
             img = Image.open(BytesIO(img_resp.content))
@@ -451,6 +545,12 @@ def validate_image_dimensions(img: Image.Image) -> tuple[bool, str]:
 def process_single_image(image_url):
     """Process a single image with all enhancement steps and smart memory management"""
     try:
+        # Clean the URL to remove any trailing colons or invalid characters
+        clean_image_url = image_url.rstrip(':').strip()
+        if clean_image_url != image_url:
+            logger.warning(f"URL cleaned from '{image_url}' to '{clean_image_url}' for processing")
+            image_url = clean_image_url
+        
         # Download image
         session = get_global_session()
         img_resp = session.get(image_url, timeout=30)
@@ -495,9 +595,11 @@ def process_single_image(image_url):
             
             # Clear original image from memory if it was resized
             if processing_info["resized"]:
-                img.close()
-                del img
-                gc.collect()
+                # Only close if it's not the same as processed_img
+                if img != processed_img:
+                    img.close()
+                    del img
+                    gc.collect()
                 img = processed_img  # Use the processed image for further processing
             
             # Get AI suggestions
@@ -506,15 +608,17 @@ def process_single_image(image_url):
             # Enhance image
             enhanced = enhance_image_pillow(img, factors)
             
-            # Clear intermediate images from memory
-            img.close()
-            del img
-            gc.collect()
-            
             # Prepare response with processing information
             final_image = enhanced
             used_fallback = processing_info["resized"]
             fallback_reason = processing_info["resize_reason"] if processing_info["resized"] else None
+            
+            # Don't close the image yet - it's still needed for the response
+            # Only close if we're not using it anymore
+            if img != final_image:
+                img.close()
+                del img
+                gc.collect()
             
             return {
                 "image_url": image_url,
@@ -548,9 +652,11 @@ def process_single_image(image_url):
                 }
                 
                 enhanced = enhance_image_pillow(fallback_img, factors)
-                fallback_img.close()
-                del fallback_img
-                gc.collect()
+                # Only close if it's different from enhanced
+                if fallback_img != enhanced:
+                    fallback_img.close()
+                    del fallback_img
+                    gc.collect()
                 
                 return {
                     "image_url": image_url,
@@ -639,6 +745,12 @@ def process_multiple_images_parallel(image_urls, request_id):
                     cleanup_memory_aggressive()
                 except concurrent.futures.TimeoutError:
                     url = future_to_url[future]
+                    # Clean the URL to remove any trailing colons or invalid characters
+                    clean_url = url.rstrip(':').strip()
+                    if clean_url != url:
+                        logger.warning(f"[{request_id}] URL cleaned from '{url}' to '{clean_url}' for timeout error")
+                        url = clean_url
+                    
                     logger.error(f"[{request_id}] Worker timed out for {url}")
                     results.append({
                         "image_url": url,
@@ -650,6 +762,12 @@ def process_multiple_images_parallel(image_urls, request_id):
                     cleanup_memory_aggressive()
                 except Exception as e:
                     url = future_to_url[future]
+                    # Clean the URL to remove any trailing colons or invalid characters
+                    clean_url = url.rstrip(':').strip()
+                    if clean_url != url:
+                        logger.warning(f"[{request_id}] URL cleaned from '{url}' to '{clean_url}' for worker error")
+                        url = clean_url
+                    
                     logger.error(f"[{request_id}] Worker failed for {url}: {str(e)}")
                     results.append({
                         "image_url": url,
@@ -680,6 +798,12 @@ def process_image_parallel(img, image_url, request_id):
     session = get_global_session()
     
     try:
+        # Clean the URL to remove any trailing colons or invalid characters
+        clean_image_url = image_url.rstrip(':').strip()
+        if clean_image_url != image_url:
+            logger.warning(f"[{request_id}] URL cleaned from '{image_url}' to '{clean_image_url}' for parallel processing")
+            image_url = clean_image_url
+        
         # Step 1: Get AI suggestions (this can run while we prepare other things)
         logger.info(f"[{request_id}] Getting AI suggestions in parallel...")
         ai_start = time.time()
@@ -720,6 +844,12 @@ def process_image_parallel(img, image_url, request_id):
 def get_image_size_from_url(image_url, session=None):
     """Get image size from URL without downloading the full image"""
     try:
+        # Clean the URL to remove any trailing colons or invalid characters
+        clean_image_url = image_url.rstrip(':').strip()
+        if clean_image_url != image_url:
+            logger.warning(f"URL cleaned from '{image_url}' to '{clean_image_url}' for size check")
+            image_url = clean_image_url
+        
         if session:
             response = session.head(image_url, timeout=10)
         else:
@@ -754,6 +884,12 @@ def should_process_sequentially(image_urls, session=None, size_threshold=5*1024*
     large_images = []
     
     for url in image_urls:
+        # Clean the URL to remove any trailing colons or invalid characters
+        clean_url = url.rstrip(':').strip()
+        if clean_url != url:
+            logger.warning(f"URL cleaned from '{url}' to '{clean_url}' for sequential check")
+            url = clean_url
+        
         size = get_image_size_from_url(url, session)
         if size and size > size_threshold:
             large_images.append((url, size))
@@ -812,10 +948,11 @@ def resize_image_if_large(img: Image.Image, max_size: int = None) -> Image.Image
                 resized_img = img.resize((new_width, new_height), Image.Resampling.LANCZOS)
                 logger.info(f"Image resized to {resized_img.size}")
                 
-                # Clear the original image from memory
-                img.close()
-                del img
-                gc.collect()
+                # Clear the original image from memory only if it's different
+                if img != resized_img:
+                    img.close()
+                    del img
+                    gc.collect()
                 
                 return resized_img
                 
@@ -835,15 +972,19 @@ def resize_image_if_large(img: Image.Image, max_size: int = None) -> Image.Image
                 
                 # Resize in steps to reduce memory usage
                 intermediate_img = img.resize((intermediate_width, intermediate_height), Image.Resampling.BOX)
-                img.close()
-                del img
-                gc.collect()
+                # Only close if it's different
+                if img != intermediate_img:
+                    img.close()
+                    del img
+                    gc.collect()
                 
                 # Now resize to final size
                 final_img = intermediate_img.resize((new_width, new_height), Image.Resampling.LANCZOS)
-                intermediate_img.close()
-                del intermediate_img
-                gc.collect()
+                # Only close if it's different
+                if intermediate_img != final_img:
+                    intermediate_img.close()
+                    del intermediate_img
+                    gc.collect()
                 
                 logger.info(f"Image resized to {final_img.size} using intermediate step")
                 return final_img
@@ -881,6 +1022,12 @@ def cleanup_memory_aggressive():
 def safe_process_image(image_url, request_id):
     """Safely process an image with comprehensive error handling"""
     try:
+        # Clean the URL to remove any trailing colons or invalid characters
+        clean_image_url = image_url.rstrip(':').strip()
+        if clean_image_url != image_url:
+            logger.warning(f"[{request_id}] URL cleaned from '{image_url}' to '{clean_image_url}' for safe processing")
+            image_url = clean_image_url
+        
         return process_single_image(image_url)
     except MemoryError as me:
         logger.error(f"[{request_id}] Memory error processing {image_url}: {str(me)}")
@@ -907,6 +1054,12 @@ def categorize_images_by_size(image_urls, session=None, size_threshold=5*1024*10
     small_images = []
     
     for url in image_urls:
+        # Clean the URL to remove any trailing colons or invalid characters
+        clean_url = url.rstrip(':').strip()
+        if clean_url != url:
+            logger.warning(f"URL cleaned from '{url}' to '{clean_url}' for categorization")
+            url = clean_url
+        
         size = get_image_size_from_url(url, session)
         if size and size > size_threshold:
             large_images.append((url, size))
@@ -923,6 +1076,12 @@ def process_mixed_batch(large_images, small_images, request_id):
     if large_images:
         logger.info(f"[{request_id}] Processing {len(large_images)} large images sequentially")
         for i, (image_url, size) in enumerate(large_images):
+            # Clean the URL to remove any trailing colons or invalid characters
+            clean_image_url = image_url.rstrip(':').strip()
+            if clean_image_url != image_url:
+                logger.warning(f"[{request_id}] URL cleaned from '{image_url}' to '{clean_image_url}' for large image processing")
+                image_url = clean_image_url
+            
             logger.info(f"[{request_id}] Processing large image {i+1}/{len(large_images)}: {image_url} ({size/1024/1024:.2f}MB)")
             
             try:
@@ -1072,7 +1231,9 @@ def convert_avif_to_jpeg(image_bytes):
         img.save(output, format='JPEG', quality=95)
         output.seek(0)
         
-        img.close()
+        # Only close if it's different from output
+        if img != output:
+            img.close()
         return output.getvalue()
         
     except ImportError:
@@ -1085,6 +1246,12 @@ def convert_avif_to_jpeg(image_bytes):
 def detect_and_convert_image_format(image_bytes, image_url):
     """Detect image format and convert if necessary"""
     try:
+        # Clean the URL to remove any trailing colons or invalid characters
+        clean_image_url = image_url.rstrip(':').strip()
+        if clean_image_url != image_url:
+            logger.warning(f"URL cleaned from '{image_url}' to '{clean_image_url}' for format detection")
+            image_url = clean_image_url
+        
         # Try to open with PIL first
         img = Image.open(BytesIO(image_bytes))
         logger.info(f"Image format detected: {img.format}, size: {img.size}")
@@ -1197,6 +1364,12 @@ def enhance():
         logger.info(f"[{request_id}] Step 2: Downloading image...")
         download_start = time.time()
         
+        # Clean the URL to remove any trailing colons or invalid characters
+        clean_image_url = image_url.rstrip(':').strip()
+        if clean_image_url != image_url:
+            logger.warning(f"[{request_id}] URL cleaned from '{image_url}' to '{clean_image_url}'")
+            image_url = clean_image_url
+        
         try:
             img_resp = requests.get(image_url, timeout=30)
             img_resp.raise_for_status()
@@ -1235,6 +1408,9 @@ def enhance():
             
             # Apply EXIF orientation correction safely
             img = ImageOps.exif_transpose(img).convert("RGB")
+            
+            # Store original size for response
+            original_size = img.size
             
             process_time = time.time() - process_start
             logger.info(f"[{request_id}] Image processed in {process_time:.2f} seconds")
@@ -1474,11 +1650,17 @@ def enhance_batch():
                 "request_id": request_id
             }), 200
 
-        # Validate URLs
+        # Validate URLs and clean them
         valid_urls = []
         for url in image_urls:
             if url and isinstance(url, str) and url.startswith(('http://', 'https://')):
-                valid_urls.append(url)
+                # Clean the URL to remove any trailing colons or invalid characters
+                clean_url = url.rstrip(':').strip()
+                if clean_url != url:
+                    logger.warning(f"[{request_id}] URL cleaned from '{url}' to '{clean_url}'")
+                    valid_urls.append(clean_url)
+                else:
+                    valid_urls.append(url)
             else:
                 logger.warning(f"[{request_id}] Invalid URL in batch: {url}")
 
@@ -1525,8 +1707,7 @@ def enhance_batch():
                     "image_url": url,
                     "success": False,
                     "error": f"Batch processing error: {str(e)}",
-                    "used_fallback": True,
-                    "fallback_reason": "batch_processing_error"
+                    "request_id": request_id
                 })
 
         # Upload results to Cloudinary
@@ -1559,9 +1740,9 @@ def enhance_batch():
                         "image_url": result["image_url"],
                         "success": True,
                         "enhanced_image_url": cloudinary_url,
-                        "enhancement_factors": result["factors"],
-                        "used_fallback": result["used_fallback"],
-                        "fallback_reason": result["fallback_reason"],
+                        "enhancement_factors": result.get("factors", {}),
+                        "used_fallback": result.get("used_fallback", False),
+                        "fallback_reason": result.get("fallback_reason", None),
                         "processing_info": result.get("processing_info", {})
                     })
                     
@@ -1581,7 +1762,7 @@ def enhance_batch():
                     "success": False,
                     "error": result.get("error", "Processing failed"),
                     "enhanced_image_url": "https://example.com/placeholder.jpg",
-                    "used_fallback": True,
+                    "used_fallback": result.get("used_fallback", True),
                     "fallback_reason": result.get("fallback_reason", "processing_failed")
                 })
 
