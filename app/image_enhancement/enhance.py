@@ -5,6 +5,7 @@ import logging
 import time
 import asyncio
 import concurrent.futures
+import threading  # ✅ Added threading import for processing locks
 import gc  # ✅ Added missing gc import for garbage collection
 from datetime import datetime
 from flask import Blueprint, request, jsonify
@@ -69,6 +70,10 @@ cloudinary.config(
 # Global session for connection pooling
 _global_session = None
 
+# Add processing lock to prevent duplicate processing
+_processing_locks = {}
+_lock_cleanup_time = {}
+
 # Global exception handler
 def global_exception_handler(exc_type, exc_value, exc_traceback):
     """Global exception handler to prevent crashes"""
@@ -98,6 +103,36 @@ def get_global_session():
             'User-Agent': 'Mozilla/5.0 (compatible; ImageEnhancement/1.0)'
         })
         # Configure connection pooling
+
+def get_processing_lock(image_url):
+    """Get or create a processing lock for an image URL to prevent duplicate processing"""
+    global _processing_locks, _lock_cleanup_time
+    
+    # Clean up old locks (older than 5 minutes)
+    current_time = time.time()
+    expired_locks = [url for url, lock_time in _lock_cleanup_time.items() 
+                     if current_time - lock_time > 300]
+    for url in expired_locks:
+        if url in _processing_locks:
+            del _processing_locks[url]
+        del _lock_cleanup_time[url]
+    
+    # Create lock if it doesn't exist
+    if image_url not in _processing_locks:
+        _processing_locks[image_url] = threading.Lock()
+        _lock_cleanup_time[image_url] = current_time
+    
+    return _processing_locks[image_url]
+
+def get_global_session():
+    """Get or create a global session for connection pooling"""
+    global _global_session
+    if _global_session is None:
+        _global_session = requests.Session()
+        _global_session.headers.update({
+            'User-Agent': 'Mozilla/5.0 (compatible; ImageEnhancement/1.0)'
+        })
+        # Configure connection pooling
         adapter = requests.adapters.HTTPAdapter(
             pool_connections=10,
             pool_maxsize=20,
@@ -113,6 +148,23 @@ def cleanup_memory():
     import gc
     gc.collect()
     logger.debug("Memory cleanup performed")
+
+def check_memory_usage():
+    """Check current memory usage and warn if too high"""
+    try:
+        import psutil
+        process = psutil.Process()
+        memory_info = process.memory_info()
+        memory_mb = memory_info.rss / 1024 / 1024
+        
+        if memory_mb > 1000:  # > 1GB
+            logger.warning(f"High memory usage detected: {memory_mb:.1f}MB - forcing cleanup")
+            cleanup_memory_aggressive()
+            return True
+        return False
+    except ImportError:
+        # psutil not available, skip memory check
+        return False
 
 def enhance_image_pillow(img, factors):
     """Enhance image using PIL with the given factors"""
@@ -544,155 +596,171 @@ def validate_image_dimensions(img: Image.Image) -> tuple[bool, str]:
 
 def process_single_image(image_url):
     """Process a single image with all enhancement steps and smart memory management"""
-    try:
-        # Clean the URL to remove any trailing colons or invalid characters
-        clean_image_url = image_url.rstrip(':').strip()
-        if clean_image_url != image_url:
-            logger.warning(f"URL cleaned from '{image_url}' to '{clean_image_url}' for processing")
-            image_url = clean_image_url
-        
-        # Download image
-        session = get_global_session()
-        img_resp = session.get(image_url, timeout=30)
-        img_resp.raise_for_status()
-        
-        # Check file size before processing
-        file_size = len(img_resp.content)
-        if file_size > MAX_FILE_SIZE:
-            logger.warning(f"File size {file_size/1024/1024:.1f}MB exceeds maximum allowed {MAX_FILE_SIZE/1024/1024:.1f}MB")
-            return {
-                "image_url": image_url,
-                "success": False,
-                "error": f"File too large ({file_size/1024/1024:.1f}MB > {MAX_FILE_SIZE/1024/1024:.1f}MB)",
-                "used_fallback": True,
-                "fallback_reason": "file_too_large",
-                "suggestion": f"Please resize your image to under {MAX_FILE_SIZE/1024/1024:.0f}MB or use our smart processing by reducing the file size",
-                "max_file_size_mb": MAX_FILE_SIZE / (1024 * 1024)
-            }
-        
-        # Process image with smart memory management
+    # Get processing lock to prevent duplicate processing
+    processing_lock = get_processing_lock(image_url)
+    
+    with processing_lock:
         try:
-            # Detect and convert image format if necessary
-            logger.info(f"Detecting image format for {image_url}")
-            converted_bytes, detected_format = detect_and_convert_image_format(img_resp.content, image_url)
+            # Clean the URL to remove any trailing colons or invalid characters
+            clean_image_url = image_url.rstrip(':').strip()
+            if clean_image_url != image_url:
+                logger.warning(f"URL cleaned from '{image_url}' to '{clean_image_url}' for processing")
+                image_url = clean_image_url
             
-            if converted_bytes != img_resp.content:
-                logger.info(f"Image converted from {detected_format} to JPEG format")
-                img = Image.open(BytesIO(converted_bytes))
-            else:
-                img = Image.open(BytesIO(img_resp.content))
+            # Download image
+            session = get_global_session()
+            img_resp = session.get(image_url, timeout=30)
+            img_resp.raise_for_status()
             
-            img = ImageOps.exif_transpose(img).convert("RGB")
+            # Check file size before processing
+            file_size = len(img_resp.content)
+            if file_size > MAX_FILE_SIZE:
+                logger.warning(f"File size {file_size/1024/1024:.1f}MB exceeds maximum allowed {MAX_FILE_SIZE/1024/1024:.1f}MB")
+                return {
+                    "image_url": image_url,
+                    "success": False,
+                    "error": f"File too large ({file_size/1024/1024:.1f}MB > {MAX_FILE_SIZE/1024/1024:.1f}MB)",
+                    "used_fallback": True,
+                    "fallback_reason": "file_too_large",
+                    "suggestion": f"Please resize your image to under {MAX_FILE_SIZE/1024/1024:.0f}MB or use our smart processing by reducing the file size",
+                    "max_file_size_mb": MAX_FILE_SIZE / (1024 * 1024)
+                }
             
-            original_size = img.size
-            total_pixels = img.width * img.height
+            # Additional memory safety check for extremely large images
+            if file_size > 100 * 1024 * 1024:  # > 100MB
+                logger.warning(f"Extremely large file detected: {file_size/1024/1024:.1f}MB - using aggressive processing")
+                # Force aggressive memory cleanup before processing
+                cleanup_memory_aggressive()
             
-            # Use smart processing instead of rejection
-            logger.info(f"Processing image: {original_size} ({total_pixels/1024/1024:.1f}MP)")
-            
-            # Smart processing with intelligent resizing
-            processed_img, processing_info = process_image_smartly(img, original_size)
-            
-            # Clear original image from memory if it was resized
-            if processing_info["resized"]:
-                # Only close if it's not the same as processed_img
-                if img != processed_img:
+            # Process image with smart memory management
+            try:
+                # Detect and convert image format if necessary
+                logger.info(f"Detecting image format for {image_url}")
+                converted_bytes, detected_format = detect_and_convert_image_format(img_resp.content, image_url)
+                
+                if converted_bytes != img_resp.content:
+                    logger.info(f"Image converted from {detected_format} to JPEG format")
+                    img = Image.open(BytesIO(converted_bytes))
+                else:
+                    img = Image.open(BytesIO(img_resp.content))
+                
+                img = ImageOps.exif_transpose(img).convert("RGB")
+                
+                original_size = img.size
+                total_pixels = img.width * img.height
+                
+                # Use smart processing instead of rejection
+                logger.info(f"Processing image: {original_size} ({total_pixels/1024/1024:.1f}MP)")
+                
+                # Smart processing with intelligent resizing
+                processed_img, processing_info = process_image_smartly(img, original_size)
+                
+                # Clear original image from memory if it was resized
+                if processing_info["resized"]:
+                    # Only close if it's not the same as processed_img
+                    if img != processed_img:
+                        img.close()
+                        del img
+                        gc.collect()
+                    img = processed_img  # Use the processed image for further processing
+                
+                # Check memory before AI processing
+                check_memory_usage()
+                
+                # Get AI suggestions
+                factors = get_ai_suggestions_parallel(image_url, img)
+                
+                # Check memory after AI processing
+                check_memory_usage()
+                
+                # Enhance image
+                enhanced = enhance_image_pillow(img, factors)
+                
+                # Prepare response with processing information
+                final_image = enhanced
+                used_fallback = processing_info["resized"]
+                fallback_reason = processing_info["resize_reason"] if processing_info["resized"] else None
+                
+                # Don't close the image yet - it's still needed for the response
+                # Only close if we're not using it anymore
+                if img != final_image:
                     img.close()
                     del img
-                    gc.collect()
-                img = processed_img  # Use the processed image for further processing
-            
-            # Get AI suggestions
-            factors = get_ai_suggestions_parallel(image_url, img)
-            
-            # Enhance image
-            enhanced = enhance_image_pillow(img, factors)
-            
-            # Prepare response with processing information
-            final_image = enhanced
-            used_fallback = processing_info["resized"]
-            fallback_reason = processing_info["resize_reason"] if processing_info["resized"] else None
-            
-            # Don't close the image yet - it's still needed for the response
-            # Only close if we're not using it anymore
-            if img != final_image:
-                img.close()
-                del img
-                gc.collect()
-            
-            return {
-                "image_url": image_url,
-                "success": True,
-                "final_image": final_image,
-                "factors": factors,
-                "used_fallback": used_fallback,
-                "fallback_reason": fallback_reason,
-                "processing_info": processing_info
-            }
-            
-        except MemoryError as me:
-            logger.error(f"Memory error processing {image_url}: {str(me)}")
-            # Try to process with a much smaller size as fallback
-            try:
-                logger.info(f"Attempting fallback processing with reduced size for {image_url}")
-                
-                # Create a very small thumbnail for fallback processing
-                fallback_img = Image.open(BytesIO(img_resp.content))
-                fallback_img = ImageOps.exif_transpose(fallback_img).convert("RGB")
-                fallback_img = fallback_img.resize((512, 512), Image.Resampling.BOX)
-                
-                # Use default enhancement factors
-                factors = {
-                    'brightness': 1.05,
-                    'contrast': 1.15,
-                    'saturation': 1.15,
-                    'sharpness': 1.2,
-                    'shadow': 1.0,
-                    'analyzed': False
-                }
-                
-                enhanced = enhance_image_pillow(fallback_img, factors)
-                # Only close if it's different from enhanced
-                if fallback_img != enhanced:
-                    fallback_img.close()
-                    del fallback_img
                     gc.collect()
                 
                 return {
                     "image_url": image_url,
                     "success": True,
-                    "final_image": enhanced,
+                    "final_image": final_image,
                     "factors": factors,
-                    "used_fallback": True,
-                    "fallback_reason": "memory_error_fallback",
-                    "processing_info": {
-                        "resized": True,
-                        "resize_reason": "memory_error_fallback",
-                        "original_size": original_size,
-                        "final_size": (512, 512),
-                        "pixel_reduction": 99.0
-                    }
+                    "used_fallback": used_fallback,
+                    "fallback_reason": fallback_reason,
+                    "processing_info": processing_info
                 }
                 
-            except Exception as fallback_error:
-                logger.error(f"Fallback processing also failed for {image_url}: {str(fallback_error)}")
-                return {
-                    "image_url": image_url,
-                    "success": False,
-                    "error": f"Memory error and fallback failed: {str(me)}",
-                    "used_fallback": True,
-                    "fallback_reason": "memory_error_fallback_failed"
-                }
-        
-    except Exception as e:
-        logger.error(f"Error processing {image_url}: {str(e)}")
-        return {
-            "image_url": image_url,
-            "success": False,
-            "error": str(e),
-            "used_fallback": True,
-            "fallback_reason": "processing_failed"
-        }
+            except MemoryError as me:
+                logger.error(f"Memory error processing {image_url}: {str(me)}")
+                # Try to process with a much smaller size as fallback
+                try:
+                    logger.info(f"Attempting fallback processing with reduced size for {image_url}")
+                    
+                    # Create a very small thumbnail for fallback processing
+                    fallback_img = Image.open(BytesIO(img_resp.content))
+                    fallback_img = ImageOps.exif_transpose(fallback_img).convert("RGB")
+                    fallback_img = fallback_img.resize((512, 512), Image.Resampling.BOX)
+                    
+                    # Use default enhancement factors
+                    factors = {
+                        'brightness': 1.05,
+                        'contrast': 1.15,
+                        'saturation': 1.15,
+                        'sharpness': 1.2,
+                        'shadow': 1.0,
+                        'analyzed': False
+                    }
+                    
+                    enhanced = enhance_image_pillow(fallback_img, factors)
+                    # Only close if it's different from enhanced
+                    if fallback_img != enhanced:
+                        fallback_img.close()
+                        del fallback_img
+                        gc.collect()
+                    
+                    return {
+                        "image_url": image_url,
+                        "success": True,
+                        "final_image": enhanced,
+                        "factors": factors,
+                        "used_fallback": True,
+                        "fallback_reason": "memory_error_fallback",
+                        "processing_info": {
+                            "resized": True,
+                            "resize_reason": "memory_error_fallback",
+                            "original_size": original_size,
+                            "final_size": (512, 512),
+                            "pixel_reduction": 99.0
+                        }
+                    }
+                    
+                except Exception as fallback_error:
+                    logger.error(f"Fallback processing also failed for {image_url}: {str(fallback_error)}")
+                    return {
+                        "image_url": image_url,
+                        "success": False,
+                        "error": f"Memory error and fallback failed: {str(me)}",
+                        "used_fallback": True,
+                        "fallback_reason": "memory_error_fallback_failed"
+                    }
+            
+        except Exception as e:
+            logger.error(f"Error processing {image_url}: {str(e)}")
+            return {
+                "image_url": image_url,
+                "success": False,
+                "error": str(e),
+                "used_fallback": True,
+                "fallback_reason": "processing_failed"
+            }
 
 def process_multiple_images_parallel(image_urls, request_id):
     """Process multiple images with smart parallel/sequential processing based on image sizes"""
@@ -1634,6 +1702,9 @@ def enhance_batch():
         data = request.json
         image_urls = data.get("image_urls", [])
         
+        # Add request-level processing cache to prevent duplicate processing
+        processing_cache = {}
+        
         if not image_urls or not isinstance(image_urls, list):
             return jsonify({
                 "success": False,
@@ -1652,15 +1723,22 @@ def enhance_batch():
 
         # Validate URLs and clean them
         valid_urls = []
+        seen_urls = set()  # Track seen URLs to prevent duplicates
+        
         for url in image_urls:
             if url and isinstance(url, str) and url.startswith(('http://', 'https://')):
                 # Clean the URL to remove any trailing colons or invalid characters
                 clean_url = url.rstrip(':').strip()
                 if clean_url != url:
                     logger.warning(f"[{request_id}] URL cleaned from '{url}' to '{clean_url}'")
-                    valid_urls.append(clean_url)
-                else:
-                    valid_urls.append(url)
+                
+                # Check for duplicates
+                if clean_url in seen_urls:
+                    logger.warning(f"[{request_id}] Duplicate URL skipped: {clean_url}")
+                    continue
+                
+                seen_urls.add(clean_url)
+                valid_urls.append(clean_url)
             else:
                 logger.warning(f"[{request_id}] Invalid URL in batch: {url}")
 
@@ -1682,6 +1760,18 @@ def enhance_batch():
             else:
                 logger.info(f"[{request_id}] All images are under size threshold, using parallel processing for smaller images.")
                 results = process_multiple_images_parallel(valid_urls, request_id)
+            
+            # Check for any duplicate processing results and deduplicate
+            seen_urls = set()
+            deduplicated_results = []
+            for result in results:
+                if result["image_url"] not in seen_urls:
+                    seen_urls.add(result["image_url"])
+                    deduplicated_results.append(result)
+                else:
+                    logger.warning(f"[{request_id}] Duplicate result found for {result['image_url']}, skipping")
+            
+            results = deduplicated_results
                 
         except MemoryError as me:
             logger.error(f"[{request_id}] Memory error during batch processing: {str(me)}")
