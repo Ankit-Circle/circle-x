@@ -5,6 +5,7 @@ import logging
 import time
 import asyncio
 import concurrent.futures
+import threading  # ✅ Added threading import for processing locks
 import gc  # ✅ Added missing gc import for garbage collection
 from datetime import datetime
 from flask import Blueprint, request, jsonify
