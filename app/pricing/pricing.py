@@ -36,6 +36,7 @@ def fetch_price_details(brand, model):
     try:
         prompt = (
             f"Please search **Amazon.in, Flipkart, Croma, Reliance Digital, Vijay Sales** for a **brand new {brand} {model}**. "
+            f"Do NOT search or include results from Indiamart. "
             f"Return both the **original MRP** and the **current best online price** (lowest price across all platforms) as two separate numeric values. "
             f"Also, mention the **source/platform name** where each price was found (MRP and best online price). "
             f"Format the response exactly like this:\n"
