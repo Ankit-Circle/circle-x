@@ -142,9 +142,15 @@ MOBILES91_BRANDS = {
 AMAZON_BASE_URL = "https://www.amazon.com"
 AMAZON_SEARCH_URL = "https://www.amazon.com/s"
 
-# Supabase Configuration
-SUPABASE_URL = os.getenv("SUPABASE_URL", "https://sfcogubngefogxboabwq.supabase.co")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY", "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InNmY29ndWJuZ2Vmb2d4Ym9hYndxIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc0ODg0NjUxMCwiZXhwIjoyMDY0NDIyNTEwfQ.sq5GbDfuxrA6GPbcFLd-ZKhU3OpK7cmdoqhGTBbZTFs")
+# Supabase Configuration - MUST be set in environment variables
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+
+# Validate required environment variables
+if not SUPABASE_URL:
+    raise ValueError("SUPABASE_URL environment variable is required")
+if not SUPABASE_KEY:
+    raise ValueError("SUPABASE_KEY environment variable is required")
 
 # Scraping Configuration - MOBILE PHONES ONLY
 BRANDS = {
