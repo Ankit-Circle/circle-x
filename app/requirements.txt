@@ -1,0 +1,33 @@
+# Core Flask dependencies
+flask
+flask-cors
+
+# Database and API
+supabase
+python-dotenv
+
+# HTTP and requests
+requests
+httpx
+aiohttp
+
+# Web scraping
+selenium
+webdriver-manager
+beautifulsoup4
+lxml
+
+# Data processing
+pandas
+numpy
+
+# AI and ML services
+openai
+replicate
+
+# Image processing
+cloudinary
+Pillow
+
+# Additional utilities
+typing-extensions
