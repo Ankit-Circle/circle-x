@@ -1,11 +1,26 @@
-# Core Flask dependencies
+# Core app dependencies
 Flask==3.0.3
 flask-cors==5.0.1
 gunicorn==21.2.0
-
-# Database and API
-supabase==2.17.0
+numpy==1.26.4
+pandas==2.2.3
+Pillow==10.0.0
+pillow-avif-plugin==1.5.2
+requests==2.32.3
+httpx
+aiohttp
 python-dotenv==1.1.1
+typing-extensions
+
+# AI and ML services
+openai==1.95.1
+replicate
+
+# Image processing
+cloudinary==1.37.0
+
+# Supabase and related packages
+supabase==2.17.0
 gotrue==2.12.3
 postgrest==1.1.1
 realtime==2.6.0
@@ -19,29 +34,8 @@ h2==4.2.0
 hpack==4.1.0
 hyperframe==6.1.0
 
-# HTTP and requests
-requests==2.32.3
-httpx
-aiohttp
-
 # Web scraping
 selenium
 webdriver-manager
 beautifulsoup4
 lxml
-
-# Data processing
-pandas==2.2.3
-numpy==1.26.4
-
-# AI and ML services
-openai==1.95.1
-replicate
-
-# Image processing
-cloudinary==1.37.0
-Pillow==10.0.0
-pillow-avif-plugin==1.5.2
-
-# Additional utilities
-typing-extensions
