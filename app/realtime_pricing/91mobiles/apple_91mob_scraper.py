@@ -372,8 +372,8 @@ class AppleOnlyScraper:
             # Random delay before navigation
             self.random_delay(1, 3)
             
-            # Set page load timeout
-            self.driver.set_page_load_timeout(30)
+            # Set page load timeout - more aggressive for problematic sites
+            self.driver.set_page_load_timeout(20)
             
             # Navigate to page
             logger.info("Starting page navigation...")
@@ -383,7 +383,7 @@ class AppleOnlyScraper:
             # Wait for page to load with shorter timeout
             logger.info("Waiting for page body to load...")
             try:
-                WebDriverWait(self.driver, 15).until(
+                WebDriverWait(self.driver, 10).until(
                     EC.presence_of_element_located((By.TAG_NAME, "body"))
                 )
                 logger.info("Page body loaded successfully")
@@ -1169,11 +1169,26 @@ class AppleOnlyScraper:
                 logger.error(f"Basic connectivity test failed: {str(e)}")
                 return all_products
             
-            # Start with the main Apple page
-            apple_url = "https://www.91mobiles.com/apple-mobile-price-list-in-india"
+            # Start with the main Apple page - try multiple URLs
+            apple_urls = [
+                "https://www.91mobiles.com/apple-mobile-price-list-in-india",
+                "https://91mobiles.com/apple-mobile-price-list-in-india",
+                "https://www.91mobiles.com/apple-mobiles"
+            ]
             
-            if not self.navigate_to_page(apple_url):
-                logger.error("Failed to navigate to Apple page")
+            apple_url = None
+            for url in apple_urls:
+                logger.info(f"Trying URL: {url}")
+                if self.navigate_to_page(url):
+                    apple_url = url
+                    logger.info(f"Successfully navigated to: {url}")
+                    break
+                else:
+                    logger.warning(f"Failed to navigate to: {url}")
+                    time.sleep(5)  # Wait before trying next URL
+            
+            if not apple_url:
+                logger.error("Failed to navigate to any Apple page URL")
                 return all_products
             
             # Get total pages

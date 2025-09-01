@@ -112,7 +112,8 @@ def scrape_mobiles():
             "message": "Scraping started successfully",
             "mobile": mobile,
             "platform": platform,
-            "status": "running"
+            "status": "running",
+            "note": "This may take several minutes to complete. Check logs for progress."
         }), 200
         
     except Exception as e:
