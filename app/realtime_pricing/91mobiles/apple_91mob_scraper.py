@@ -372,27 +372,47 @@ class AppleOnlyScraper:
             # Random delay before navigation
             self.random_delay(1, 3)
             
-            # Navigate to page
-            self.driver.get(url)
+            # Set page load timeout
+            self.driver.set_page_load_timeout(30)
             
-            # Wait for page to load
-            WebDriverWait(self.driver, 20).until(
-                EC.presence_of_element_located((By.TAG_NAME, "body"))
-            )
+            # Navigate to page
+            logger.info("Starting page navigation...")
+            self.driver.get(url)
+            logger.info("Page navigation completed")
+            
+            # Wait for page to load with shorter timeout
+            logger.info("Waiting for page body to load...")
+            try:
+                WebDriverWait(self.driver, 15).until(
+                    EC.presence_of_element_located((By.TAG_NAME, "body"))
+                )
+                logger.info("Page body loaded successfully")
+            except TimeoutException:
+                logger.warning("Page body load timeout, but continuing...")
+            
+            # Get current URL and title for debugging
+            current_url = self.driver.current_url
+            current_title = self.driver.title
+            logger.info(f"Current URL: {current_url}")
+            logger.info(f"Current title: {current_title}")
             
             # Simulate human behavior
             self.simulate_human_behavior()
             
             # Check if page loaded successfully
-            if "403" in self.driver.title or "Forbidden" in self.driver.title:
+            if "403" in current_title or "Forbidden" in current_title:
                 logger.error("Page returned 403 Forbidden")
+                return False
+            
+            if "404" in current_title or "Not Found" in current_title:
+                logger.error("Page returned 404 Not Found")
                 return False
             
             logger.info("Page loaded successfully")
             return True
             
-        except TimeoutException:
-            logger.error("Page load timeout")
+        except TimeoutException as e:
+            logger.error(f"Page load timeout: {str(e)}")
             return False
         except Exception as e:
             logger.error(f"Navigation error: {str(e)}")
@@ -1137,6 +1157,16 @@ class AppleOnlyScraper:
             # Setup Chrome driver first
             if not self.setup_driver():
                 logger.error("Failed to setup Chrome driver")
+                return all_products
+            
+            # Test basic connectivity first
+            try:
+                logger.info("Testing basic connectivity to Google...")
+                self.driver.get("https://www.google.com")
+                logger.info("Google connectivity test successful")
+                time.sleep(2)
+            except Exception as e:
+                logger.error(f"Basic connectivity test failed: {str(e)}")
                 return all_products
             
             # Start with the main Apple page
