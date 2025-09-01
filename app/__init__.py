@@ -6,10 +6,10 @@ def create_app():
     CORS(app)  # Enable CORS for all routes
 
     # Import Blueprints
-    from image_enhancement import image_enhancement_bp
-    from pricing import pricing_bp
-    from pricing import pricing_db_bp
-    from realtime_pricing import scraping_bp
+    from app.image_enhancement import image_enhancement_bp
+    from app.pricing import pricing_bp
+    from app.pricing import pricing_db_bp
+    from app.realtime_pricing import scraping_bp
 
     # Register with `/api/` prefix
     app.register_blueprint(image_enhancement_bp, url_prefix="/api/enhance")
