@@ -14,8 +14,8 @@ from io import BytesIO
 import openai
 
 # cloudinary
-# import cloudinary
-# import cloudinary.uploader
+import cloudinary
+import cloudinary.uploader
 
 
 
