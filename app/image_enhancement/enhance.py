@@ -13,9 +13,9 @@ from PIL import Image, ImageEnhance, ImageOps  # ✅ Added ImageOps for EXIF cor
 from io import BytesIO
 import openai
 
-import cloudinary
+import cloudinary 
 import cloudinary.uploader
-
+#Revert
 # Load environment variables from .env file
 try:
     from dotenv import load_dotenv
