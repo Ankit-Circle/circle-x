@@ -13,9 +13,10 @@ from PIL import Image, ImageEnhance, ImageOps  # ✅ Added ImageOps for EXIF cor
 from io import BytesIO
 import openai
 
-import cloudinary 
+# cloudinary
+import cloudinary
 import cloudinary.uploader
-#Revert
+
 # Load environment variables from .env file
 try:
     from dotenv import load_dotenv
@@ -26,6 +27,17 @@ except ImportError:
     logger = logging.getLogger(__name__)
     logger.warning("⚠️  python-dotenv not installed, using system environment variables")
 
+
+# Bunny upload helper
+try:
+    from app.image_enhancement.bunny_upload import is_bunny_configured, upload_to_bunny
+except Exception:
+    # If helper import fails, we will silently skip Bunny and use existing fallback
+    def is_bunny_configured():
+        return False
+    def upload_to_bunny(*args, **kwargs):  # type: ignore
+        raise RuntimeError("Bunny helper not available")
+        
 # Configuration constants for memory management
 MAX_IMAGE_DIMENSION = 8192  # Maximum width/height in pixels (8K)
 MAX_IMAGE_PIXELS = 100 * 1024 * 1024  # Maximum total pixels (100MP)
@@ -1393,7 +1405,7 @@ def enhance():
             return jsonify({
                 "success": False,
                 "error": "Invalid request format",
-                "enhanced_image_url": "https://example.com/placeholder.jpg",
+                "enhanced_image_url": "https://placehold.co/600x400?text=Image+Not+Found",
                 "used_fallback": True,
                 "fallback_reason": "invalid_request_format",
                 "request_id": request_id
@@ -1407,7 +1419,7 @@ def enhance():
             return jsonify({
                 "success": False,
                 "error": "Image URL is required",
-                "enhanced_image_url": "https://example.com/placeholder.jpg",
+                "enhanced_image_url": "https://placehold.co/600x400?text=Image+Not+Found",
                 "used_fallback": True,
                 "fallback_reason": "missing_image_url",
                 "request_id": request_id
@@ -1419,7 +1431,7 @@ def enhance():
             return jsonify({
                 "success": False,
                 "error": "Invalid image URL format",
-                "enhanced_image_url": "https://example.com/placeholder.jpg",
+                "enhanced_image_url": "https://placehold.co/600x400?text=Image+Not+Found",
                 "used_fallback": True,
                 "fallback_reason": "invalid_image_url",
                 "request_id": request_id
@@ -1453,7 +1465,7 @@ def enhance():
             return jsonify({
                 "success": False,
                 "error": "Unable to process image at this time",
-                "enhanced_image_url": "https://example.com/placeholder.jpg",
+                "enhanced_image_url": "https://placehold.co/600x400?text=Image+Not+Found",
                 "used_fallback": True,
                 "fallback_reason": "image_download_failed",
                 "request_id": request_id
@@ -1492,7 +1504,7 @@ def enhance():
             return jsonify({
                 "success": False,
                 "error": "Unable to process image at this time",
-                "enhanced_image_url": "https://example.com/placeholder.jpg",
+                "enhanced_image_url": "https://placehold.co/600x400?text=Image+Not+Found",
                 "used_fallback": True,
                 "fallback_reason": "image_processing_failed",
                 "request_id": request_id
@@ -1563,40 +1575,38 @@ def enhance():
         logger.info(f"[{request_id}] Final image saved in {save_time:.2f} seconds")
         logger.info(f"[{request_id}] Final image size: {final_size:,} bytes ({final_size/1024/1024:.2f} MB)")
 
-        # Step 9: Upload to Cloudinary
-        logger.info(f"[{request_id}] Step 9: Uploading to Cloudinary...")
+        # Step 9: Upload to Bunny (preferred) or Cloudinary (fallback)
+        logger.info(f"[{request_id}] Step 9: Uploading to storage...")
         upload_start = time.time()
         
         try:
-            # Check if Cloudinary credentials are available
-            if not all([
-                os.environ.get("CLOUDINARY_CLOUD_NAME"),
-                os.environ.get("CLOUDINARY_API_KEY"),
-                os.environ.get("CLOUDINARY_API_SECRET")
-            ]):
-                logger.warning(f"[{request_id}] Cloudinary credentials not found, skipping upload")
-                cloudinary_url = "https://example.com/placeholder.jpg"  # Placeholder
-            else:
-                upload_result = cloudinary.uploader.upload(
-                    buf,
+            upload_url = None
+            # Prefer Bunny if configured
+            if is_bunny_configured():
+                logger.info(f"[{request_id}] Bunny configured, uploading to Bunny Storage...")
+                bunny_res = upload_to_bunny(
+                    buf.getvalue(),
+                    content_type="image/jpeg",
                     folder="mediaenrichment/enhanced",
-                    resource_type="image",
-                    format="jpg"
+                    filename="enhanced.jpg",
                 )
-                cloudinary_url = upload_result.get("secure_url")
-                if not cloudinary_url:
-                    raise Exception("Failed to get Cloudinary URL")
-                
+                upload_url = bunny_res.get("public_url")
+                if not upload_url:
+                    raise Exception("Failed to get Bunny public URL")
                 upload_time = time.time() - upload_start
-                logger.info(f"[{request_id}] Cloudinary upload completed in {upload_time:.2f} seconds")
-                logger.info(f"[{request_id}] Uploaded URL: {cloudinary_url}")
+                logger.info(f"[{request_id}] Bunny upload completed in {upload_time:.2f} seconds")
+                logger.info(f"[{request_id}] Uploaded URL: {upload_url}")
+            else:
+                # Cloudinary fallback disabled; use placeholder if Bunny not configured
+                logger.warning(f"[{request_id}] Bunny not configured; using placeholder URL")
+                upload_url = "https://placehold.co/600x400?text=Image+Not+Found"
                 
         except Exception as e:
             upload_time = time.time() - upload_start
-            error_msg = f"Failed to upload to Cloudinary: {str(e)}"
+            error_msg = f"Failed to upload to storage: {str(e)}"
             logger.error(f"[{request_id}] ERROR: {error_msg} after {upload_time:.2f} seconds")
             # Use a placeholder URL instead of throwing error
-            cloudinary_url = "https://example.com/placeholder.jpg"
+            upload_url = "https://placehold.co/600x400?text=Image+Not+Found"
             logger.info(f"[{request_id}] Using placeholder URL due to upload failure")
 
         # Step 10: Prepare response
@@ -1611,7 +1621,7 @@ def enhance():
         response_data = {
             "success": True,
             "enhancement_factors": factors,
-            "enhanced_image_url": cloudinary_url,
+            "enhanced_image_url": upload_url,
             "original_size": original_size,
             "enhanced_size": final_image.size,
             "processing_time": total_time,
@@ -1654,7 +1664,7 @@ def enhance():
         return jsonify({
             "success": False,
             "error": "Image too large to process at this time",
-            "enhanced_image_url": "https://example.com/placeholder.jpg",
+            "enhanced_image_url": "https://placehold.co/600x400?text=Image+Not+Found",
             "used_fallback": True,
             "fallback_reason": "memory_error",
             "request_id": request_id,
@@ -1673,7 +1683,7 @@ def enhance():
         return jsonify({
             "success": False,
             "error": "Unable to process image at this time",
-            "enhanced_image_url": "https://example.com/placeholder.jpg",
+            "enhanced_image_url": "https://placehold.co/600x400?text=Image+Not+Found",
             "used_fallback": True,
             "fallback_reason": "unexpected_error",
             "request_id": request_id,
@@ -1800,7 +1810,7 @@ def enhance_batch():
                     "request_id": request_id
                 })
 
-        # Upload results to Cloudinary
+        # Upload results to Bunny (preferred); Cloudinary disabled per request
         uploaded_results = []
         for result in results:
             if result["success"]:
@@ -1810,26 +1820,35 @@ def enhance_batch():
                     result["final_image"].save(buf, format="JPEG", quality=100)
                     buf.seek(0)
                     
-                    # Upload to Cloudinary
-                    if all([
-                        os.environ.get("CLOUDINARY_CLOUD_NAME"),
-                        os.environ.get("CLOUDINARY_API_KEY"),
-                        os.environ.get("CLOUDINARY_API_SECRET")
-                    ]):
-                        upload_result = cloudinary.uploader.upload(
-                            buf,
+                    upload_url = None
+                    if is_bunny_configured():
+                        bunny_res = upload_to_bunny(
+                            buf.getvalue(),
+                            content_type="image/jpeg",
                             folder="mediaenrichment/enhanced",
-                            resource_type="image",
-                            format="jpg"
+                            filename="enhanced.jpg",
                         )
-                        cloudinary_url = upload_result.get("secure_url")
+                        upload_url = bunny_res.get("public_url")
+                    # elif all([
+                    #     os.environ.get("CLOUDINARY_CLOUD_NAME"),
+                    #     os.environ.get("CLOUDINARY_API_KEY"),
+                    #     os.environ.get("CLOUDINARY_API_SECRET")
+                    # ]):
+                    #     # Cloudinary upload disabled
+                    #     upload_result = cloudinary.uploader.upload(
+                    #         buf,
+                    #         folder="mediaenrichment/enhanced",
+                    #         resource_type="image",
+                    #         format="jpg"
+                    #     )
+                    #     upload_url = upload_result.get("secure_url")
                     else:
-                        cloudinary_url = "https://example.com/placeholder.jpg"
+                        upload_url = "https://placehold.co/600x400?text=Image+Not+Found"
                     
                     uploaded_results.append({
                         "image_url": result["image_url"],
                         "success": True,
-                        "enhanced_image_url": cloudinary_url,
+                        "enhanced_image_url": upload_url,
                         "enhancement_factors": result.get("factors", {}),
                         "used_fallback": result.get("used_fallback", False),
                         "fallback_reason": result.get("fallback_reason", None),
@@ -1842,7 +1861,7 @@ def enhance_batch():
                         "image_url": result["image_url"],
                         "success": False,
                         "error": "Upload failed",
-                        "enhanced_image_url": "https://example.com/placeholder.jpg",
+                        "enhanced_image_url": "https://placehold.co/600x400?text=Image+Not+Found",
                         "used_fallback": True,
                         "fallback_reason": "upload_failed"
                     })
@@ -1851,7 +1870,7 @@ def enhance_batch():
                     "image_url": result["image_url"],
                     "success": False,
                     "error": result.get("error", "Processing failed"),
-                    "enhanced_image_url": "https://example.com/placeholder.jpg",
+                    "enhanced_image_url": "https://placehold.co/600x400?text=Image+Not+Found",
                     "used_fallback": result.get("used_fallback", True),
                     "fallback_reason": result.get("fallback_reason", "processing_failed")
                 })
