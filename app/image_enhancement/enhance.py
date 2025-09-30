@@ -17,8 +17,6 @@ import openai
 import cloudinary
 import cloudinary.uploader
 
-
-
 # Load environment variables from .env file
 try:
     from dotenv import load_dotenv
