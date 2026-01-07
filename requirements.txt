@@ -7,6 +7,10 @@ pandas==2.2.3
 Pillow==10.0.0
 pillow-avif-plugin==1.5.2
 requests==2.32.3
+beautifulsoup4==4.12.3
+lxml==5.1.0
+selenium==4.15.2
+webdriver-manager==4.0.1
 python-dotenv==1.1.1
 openai==1.95.1
 cloudinary==1.37.0
