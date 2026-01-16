@@ -11,10 +11,10 @@ price_scraper_bp = Blueprint("price_scraper", __name__)
 
 # List of brand URLs to scrape
 BRAND_URLS = [
-    # 'https://www.cashify.in/sell-old-mobile-phone/sell-apple',
+    'https://www.cashify.in/sell-old-mobile-phone/sell-apple',
     'https://www.cashify.in/sell-old-mobile-phone/sell-xiaomi',
-    # 'https://www.cashify.in/sell-old-mobile-phone/sell-samsung',
-    # 'https://www.cashify.in/sell-old-mobile-phone/sell-oneplus',
+    'https://www.cashify.in/sell-old-mobile-phone/sell-samsung',
+    'https://www.cashify.in/sell-old-mobile-phone/sell-oneplus',
     # 'https://www.cashify.in/sell-old-mobile-phone/sell-nokia',
     # 'https://www.cashify.in/sell-old-mobile-phone/sell-poco',
     # 'https://www.cashify.in/sell-old-mobile-phone/sell-vivo',

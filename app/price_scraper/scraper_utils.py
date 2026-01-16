@@ -5,6 +5,7 @@ Converted from TypeScript Supabase Edge Function.
 import os
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urljoin, urlparse
@@ -18,6 +19,42 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import TimeoutException
+
+# Memory tracking
+try:
+    import psutil
+    HAS_PSUTIL = True
+except ImportError:
+    HAS_PSUTIL = False
+    try:
+        import resource
+        HAS_RESOURCE = True
+    except ImportError:
+        HAS_RESOURCE = False
+
+
+def get_memory_usage_mb() -> float:
+    """Get current memory usage in MB."""
+    try:
+        if HAS_PSUTIL:
+            process = psutil.Process(os.getpid())
+            return process.memory_info().rss / 1024 / 1024  # Convert to MB
+        elif HAS_RESOURCE:
+            # Linux resource module - ru_maxrss is peak memory, not current
+            # For current memory approximation, we'll use peak (best we can do without psutil)
+            return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024  # KB to MB
+        else:
+            return 0.0
+    except Exception:
+        return 0.0
+
+
+def get_memory_usage_string() -> str:
+    """Get current memory usage as formatted string."""
+    mem_mb = get_memory_usage_mb()
+    if mem_mb > 0:
+        return f"{mem_mb:.2f} MB"
+    return "N/A"
 
 
 def get_browser_headers() -> Dict[str, str]:
@@ -409,6 +446,7 @@ def scrape_cashify_brand_models(
             if not driver_initialized:
                 raise Exception(f"Failed to initialize ChromeDriver. System chromedriver not found. Error: {e}")
         driver.get(brand_url)
+        print(f'Memory after driver init: {get_memory_usage_string()}')
         
         # Wait for initial page load
         print('Waiting for page to load...')
@@ -417,6 +455,7 @@ def scrape_cashify_brand_models(
         # Scroll down completely to load all lazy-loaded content
         print('Scrolling page to load all content...')
         scroll_page_completely(driver)
+        print(f'Memory after scrolling: {get_memory_usage_string()}')
         
         # Save the scraped page data to a txt file
         try:
@@ -451,6 +490,7 @@ def scrape_cashify_brand_models(
                 models = extract_model_urls(document)
         
         print(f'Extracted {len(models)} unique models from {brand_url}')
+        print(f'Memory after extraction: {get_memory_usage_string()}')
 
         return {
             'success': True,
@@ -473,36 +513,90 @@ def scrape_cashify_brand_models(
                 pass
 
 
+def _scrape_single_brand(brand_url: str) -> Dict[str, Any]:
+    """Helper function to scrape a single brand URL (for parallel processing)."""
+    brand_name = extract_brand_from_url(brand_url)
+    result = scrape_cashify_brand_models(brand_url)
+    
+    return {
+        'brand_url': brand_url,
+        'brand_name': brand_name,
+        'result': result,
+    }
+
+
 def scrape_cashify_all_brand_models(
-    brand_urls: List[str]
+    brand_urls: List[str],
+    max_workers: int = 2
 ) -> Dict[str, Any]:
-    """Scrape multiple brand pages and extract all model URLs with brand and model names."""
+    """Scrape multiple brand pages and extract all model URLs with brand and model names.
+    
+    Processes brands in parallel (default: 2 at a time) to speed up scraping.
+    """
     results: List[Dict[str, Any]] = []
     total_models = 0
+    
+    # Track peak memory usage
+    peak_memory_mb = get_memory_usage_mb()
+    initial_memory = peak_memory_mb
 
-    print(f'Starting to scrape {len(brand_urls)} brand pages...')
+    print(f'Starting to scrape {len(brand_urls)} brand pages in parallel (max {max_workers} at a time)...')
+    print(f'Initial memory usage: {get_memory_usage_string()}')
 
-    # Process all brand URLs
-    for brand_url in brand_urls:
-        brand_name = extract_brand_from_url(brand_url)
-        result = scrape_cashify_brand_models(brand_url)
+    # Process brand URLs in parallel using ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        # Submit all tasks
+        future_to_brand = {
+            executor.submit(_scrape_single_brand, brand_url): brand_url 
+            for brand_url in brand_urls
+        }
         
-        if result['success']:
-            results.append({
-                'brand_url': brand_url,
-                'brand_name': brand_name,
-                'model_urls': result['models'],
-            })
-            total_models += len(result['models'])
-        else:
-            results.append({
-                'brand_url': brand_url,
-                'brand_name': brand_name,
-                'model_urls': [],
-                'error': result.get('error'),
-            })
+        # Process completed tasks as they finish
+        for future in as_completed(future_to_brand):
+            brand_url = future_to_brand[future]
+            try:
+                brand_data = future.result()
+                result = brand_data['result']
+                
+                # Check memory after each brand completes
+                current_memory = get_memory_usage_mb()
+                if current_memory > peak_memory_mb:
+                    peak_memory_mb = current_memory
+                
+                if result['success']:
+                    results.append({
+                        'brand_url': brand_data['brand_url'],
+                        'brand_name': brand_data['brand_name'],
+                        'model_urls': result['models'],
+                    })
+                    total_models += len(result['models'])
+                    print(f'✓ Completed {brand_data["brand_name"]}: {len(result["models"])} models found')
+                else:
+                    results.append({
+                        'brand_url': brand_data['brand_url'],
+                        'brand_name': brand_data['brand_name'],
+                        'model_urls': [],
+                        'error': result.get('error'),
+                    })
+                    print(f'✗ Failed {brand_data["brand_name"]}: {result.get("error", "Unknown error")}')
+            except Exception as e:
+                # Handle any exceptions from the parallel execution
+                brand_name = extract_brand_from_url(brand_url)
+                results.append({
+                    'brand_url': brand_url,
+                    'brand_name': brand_name,
+                    'model_urls': [],
+                    'error': str(e),
+                })
+                print(f'✗ Exception scraping {brand_name}: {e}')
+
+    # Final memory check
+    final_memory = get_memory_usage_mb()
+    if final_memory > peak_memory_mb:
+        peak_memory_mb = final_memory
 
     print(f'Completed scraping. Total models found: {total_models}')
+    print(f'Memory usage - Initial: {initial_memory:.2f} MB, Final: {final_memory:.2f} MB, Peak: {peak_memory_mb:.2f} MB')
 
     return {
         'success': True,
