@@ -18,7 +18,6 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import TimeoutException
-from webdriver_manager.chrome import ChromeDriverManager
 
 
 def get_browser_headers() -> Dict[str, str]:
@@ -297,10 +296,10 @@ def scroll_page_completely(driver: webdriver.Chrome, max_scrolls: int = 100) -> 
         driver.execute_script(f"window.scrollTo({{top: {new_position}, behavior: 'smooth'}});")
         
         # Wait for smooth scroll to complete and content to load
-        time.sleep(1.5)  # Increased wait time for slow scrolling
+        time.sleep(0.2)  # Reduced wait time for faster scrolling
         
         # Also wait a bit more for lazy-loaded content
-        time.sleep(0.5)
+        time.sleep(0.1)
         
         # Calculate new scroll height
         new_height = driver.execute_script("return document.body.scrollHeight")
@@ -321,13 +320,13 @@ def scroll_page_completely(driver: webdriver.Chrome, max_scrolls: int = 100) -> 
             if no_change_count >= 3:
                 # Try scrolling a bit more and waiting longer
                 driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-                time.sleep(2)
+                time.sleep(0.3)
                 
                 # Try scrolling up a bit and back down to trigger lazy loading
                 driver.execute_script("window.scrollTo(0, document.body.scrollHeight - 500);")
-                time.sleep(1)
+                time.sleep(0.2)
                 driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-                time.sleep(2)
+                time.sleep(0.3)
                 
                 # Check final height
                 final_height = driver.execute_script("return document.body.scrollHeight")
@@ -349,12 +348,12 @@ def scroll_page_completely(driver: webdriver.Chrome, max_scrolls: int = 100) -> 
     
     # Final scroll to very bottom to ensure everything is loaded
     driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-    time.sleep(2)
+    time.sleep(0.3)
     
     # Scroll back to top slowly
     print('Scrolling back to top...')
     driver.execute_script("window.scrollTo({top: 0, behavior: 'smooth'});")
-    time.sleep(2)
+    time.sleep(0.3)
     
     final_height = driver.execute_script("return document.body.scrollHeight")
     print(f'Scroll complete: final page height = {final_height}, total scrolls = {scroll_count}')
@@ -382,25 +381,38 @@ def scrape_cashify_brand_models(
         chrome_options.add_argument('--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36')
         
         # Initialize the driver
-        # In Docker, use system chromedriver directly; for local dev, try webdriver-manager
-        if os.path.exists('/usr/local/bin/chromedriver'):
-            # Docker environment - use system chromedriver
-            service = Service('/usr/local/bin/chromedriver')
-            driver = webdriver.Chrome(service=service, options=chrome_options)
-        else:
-            # Local dev - try webdriver-manager
-            try:
-                service = Service(ChromeDriverManager().install())
-                driver = webdriver.Chrome(service=service, options=chrome_options)
-            except Exception as e:
-                print(f'webdriver-manager failed, trying system chromedriver: {e}')
-                # Fallback to system chromedriver
-                driver = webdriver.Chrome(options=chrome_options)
+        # Always use system chromedriver (works reliably, avoids webdriver-manager issues)
+        try:
+            # Try system chromedriver first (uses PATH or common locations)
+            driver = webdriver.Chrome(options=chrome_options)
+            print('Successfully initialized ChromeDriver using system chromedriver')
+        except Exception as e:
+            # If system chromedriver not found, try common installation paths
+            common_paths = [
+                '/usr/local/bin/chromedriver',  # Docker/common Linux
+                '/usr/bin/chromedriver',         # System installation
+                '/opt/chromedriver',             # Alternative location
+            ]
+            
+            driver_initialized = False
+            for chromedriver_path in common_paths:
+                if os.path.exists(chromedriver_path) and os.access(chromedriver_path, os.X_OK):
+                    try:
+                        service = Service(chromedriver_path)
+                        driver = webdriver.Chrome(service=service, options=chrome_options)
+                        print(f'Successfully initialized ChromeDriver using {chromedriver_path}')
+                        driver_initialized = True
+                        break
+                    except Exception:
+                        continue
+            
+            if not driver_initialized:
+                raise Exception(f"Failed to initialize ChromeDriver. System chromedriver not found. Error: {e}")
         driver.get(brand_url)
         
         # Wait for initial page load
         print('Waiting for page to load...')
-        time.sleep(3)
+        time.sleep(1)
         
         # Scroll down completely to load all lazy-loaded content
         print('Scrolling page to load all content...')
