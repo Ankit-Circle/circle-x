@@ -101,33 +101,26 @@ def extract_model_urls_from_selenium(
     url_set = set()
     
     try:
-        # First, try to find the parent container
-        # Look for div with class "bg-surface" that contains model links
+        # Find the specific target container div
+        # Selector: #__csh > main > div > div.min-w-0... > div:nth-child(1) > div > div > div > div.bg-surface... > div > div
+        target_selector = '#__csh > main > div > div.min-w-0.flex.flex-row.flex-wrap.sm\\:flex.md\\:flex-wrap.content-start.md\\:m-auto.basis-full.md\\:basis-full.z-auto > div:nth-child(1) > div > div > div > div.bg-surface.rounded-lg.sm\\:rounded-none.mb-3.sm\\:mb-0.mt-4.sm\\:mt-5.overflow-hidden.flex.flex-col > div > div'
+        
         parent_container = None
+        try:
+            parent_container = driver.find_element(By.CSS_SELECTOR, target_selector)
+            print(f'Found target container div')
+        except Exception as e:
+            print(f'Could not find target container div: {e}')
+            print('No models will be extracted')
+            return models
         
-        # Try to find container with bg-surface class that has many model links
-        bg_surface_divs = driver.find_elements(By.CSS_SELECTOR, 'div.bg-surface')
-        
-        for div in bg_surface_divs:
-            # Check if this div contains model links
-            test_links = div.find_elements(By.CSS_SELECTOR, 'a[href*="/sell-old-mobile-phone/used-"]')
-            if len(test_links) > 5:  # Reasonable threshold for a brand page
-                parent_container = div
-                print(f'Found parent container with {len(test_links)} model links')
-                break
-        
-        # If parent container found, extract from it; otherwise extract from entire page
+        # Extract models only from this specific container
         if parent_container:
             model_links = parent_container.find_elements(By.CSS_SELECTOR, 'a[href*="/sell-old-mobile-phone/used-"]')
-            print(f'Extracting {len(model_links)} models from parent container')
+            print(f'Extracting {len(model_links)} models from target container')
         else:
-            # Fallback: find all model links, but filter by checking if they're in model divs
-            # Model divs have classes like "basis-full" and contain the links
-            model_links = driver.find_elements(By.CSS_SELECTOR, 'div.basis-full a[href*="/sell-old-mobile-phone/used-"]')
-            if not model_links:
-                # Last resort: all links
-                model_links = driver.find_elements(By.CSS_SELECTOR, 'a[href*="/sell-old-mobile-phone/used-"]')
-            print(f'Extracting {len(model_links)} models (parent container not found, using filtered search)')
+            print('Target container not found, no models extracted')
+            return models
         
         duplicates_count = 0
         no_name_count = 0
@@ -184,68 +177,35 @@ def extract_model_urls(
 ) -> List[Dict[str, str]]:
     """Extract model URLs and names from a brand page HTML.
     
-    First finds the parent container, then extracts models from within it.
+    Only extracts models from the specific target container div.
     """
     models: List[Dict[str, str]] = []
     url_set = set()
 
-    # Find the parent container step by step to avoid issues with escaped CSS selectors
-    # Start from #__csh > main, then navigate down
+    # Find the specific target container div
+    # Selector: #__csh > main > div > div.min-w-0... > div:nth-child(1) > div > div > div > div.bg-surface... > div > div
+    target_selector = '#__csh > main > div > div.min-w-0.flex.flex-row.flex-wrap.sm\\:flex.md\\:flex-wrap.content-start.md\\:m-auto.basis-full.md\\:basis-full.z-auto > div:nth-child(1) > div > div > div > div.bg-surface.rounded-lg.sm\\:rounded-none.mb-3.sm\\:mb-0.mt-4.sm\\:mt-5.overflow-hidden.flex.flex-col > div > div'
+    
     parent_container = None
     
     try:
-        # Step 1: Find the main container
-        main_elem = document.select_one('#__csh main')
-        if main_elem:
-            # Step 2: Find div with bg-surface class (the product grid container)
-            # Look for div with classes: bg-surface, rounded-lg, and contains model links
-            bg_surface_divs = main_elem.select('div.bg-surface')
-            
-            for div in bg_surface_divs:
-                # Check if this div contains model links
-                test_links = div.select('a[href*="/sell-old-mobile-phone/used-"]')
-                if len(test_links) > 0:
-                    # This is likely our parent container
-                    parent_container = div
-                    print(f'Found parent container with {len(test_links)} model links')
-                    break
-            
-            # If not found, try finding the direct parent of model links
-            if not parent_container:
-                # Find a model link first
-                sample_link = main_elem.select_one('a[href*="/sell-old-mobile-phone/used-"]')
-                if sample_link:
-                    # Navigate up to find the container div
-                    # Look for parent with classes containing "bg-surface" or "flex flex-col"
-                    current = sample_link.parent
-                    for _ in range(10):  # Max 10 levels up
-                        if current and current.name == 'div':
-                            classes = current.get('class', [])
-                            class_str = ' '.join(classes) if classes else ''
-                            if 'bg-surface' in class_str or ('flex' in class_str and 'flex-col' in class_str):
-                                # Check if this container has multiple model links
-                                links_in_container = current.select('a[href*="/sell-old-mobile-phone/used-"]')
-                                if len(links_in_container) > 5:  # Reasonable threshold
-                                    parent_container = current
-                                    print(f'Found parent container by navigating up, contains {len(links_in_container)} links')
-                                    break
-                        if current:
-                            current = current.parent
-                        else:
-                            break
+        parent_container = document.select_one(target_selector)
+        if parent_container:
+            print(f'Found target container div')
+        else:
+            print('Could not find target container div, no models will be extracted')
+            return models
     except Exception as e:
-        print(f'Error finding parent container: {e}')
+        print(f'Error finding target container: {e}')
+        return models
     
-    if not parent_container:
-        print('Warning: Could not find parent container, falling back to page-wide search')
-        # Fallback to original method if parent container not found
-        model_links = document.select('a[href*="/sell-old-mobile-phone/used-"]')
-    else:
-        print(f'Found parent container, searching for models within it...')
-        # Find all model divs within the parent container
-        # Each model is in a div with classes like "basis-full sm:rounded-lg border-b..."
-        # and contains an <a> tag with href="/sell-old-mobile-phone/used-..."
+    # Extract models only from this specific container
+    if parent_container:
+        print(f'Searching for models within target container...')
         model_links = parent_container.select('a[href*="/sell-old-mobile-phone/used-"]')
+    else:
+        print('Target container not found, no models extracted')
+        return models
     
     print(f'Found {len(model_links)} model links')
 
