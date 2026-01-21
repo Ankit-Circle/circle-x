@@ -10,11 +10,13 @@ def create_app():
     from app.pricing import pricing_bp
     from app.pricing import pricing_db_bp
     from app.price_scraper import price_scraper_bp
+    from app.price_scraper.variant_scraper import variant_scraper_bp
 
     # Register with `/api/` prefix
     app.register_blueprint(image_enhancement_bp, url_prefix="/api/enhance")
     app.register_blueprint(pricing_bp, url_prefix="/api/pricing")
     app.register_blueprint(pricing_db_bp, url_prefix="/api/pricing-db")
     app.register_blueprint(price_scraper_bp, url_prefix="/api/price-scraper")
+    app.register_blueprint(variant_scraper_bp, url_prefix="/api/variant-scraper")
 
     return app
