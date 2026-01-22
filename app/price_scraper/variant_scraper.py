@@ -4,6 +4,8 @@ Scrapes model pages to extract variants and prices.
 """
 import os
 import time
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Dict, Optional, Any
 from dotenv import load_dotenv
 
@@ -260,23 +262,117 @@ def scrape_variants_and_prices():
         
         print(f"Processing {len(models)} models...")
         
-        # Process each model
-        all_variants = []
+        # Thread-safe counters for tracking progress
+        variants_lock = threading.Lock()
+        all_variants = []  # Keep track of all variants for final stats
+        variants_buffer = []  # Buffer for batch insertion (50 variants)
         processed = 0
         failed = 0
+        BATCH_INSERT_SIZE = 50  # Insert every 50 variants
         
-        for model in models:
+        # Cumulative database stats
+        cumulative_stats = {'inserted': 0, 'errors': 0, 'skipped': 0}
+        
+        # Flag to control logging thread
+        logging_active = threading.Event()
+        logging_active.set()
+        
+        def log_progress():
+            """Periodically log progress every 5 seconds."""
+            while logging_active.is_set():
+                time.sleep(5)
+                if logging_active.is_set():  # Check again after sleep
+                    with variants_lock:
+                        total_variants = len(all_variants)
+                        total_failed = failed
+                    print(f"===>> total {total_variants} variants added till now")
+                    print(f"===> {total_failed} failed till now")
+        
+        # Start progress logging thread
+        log_thread = threading.Thread(target=log_progress, daemon=True)
+        log_thread.start()
+        
+        # Process models with 2 workers in parallel
+        NUM_WORKERS = 2
+        print(f"Using {NUM_WORKERS} workers for parallel processing...")
+        print(f"Will insert variants in batches of {BATCH_INSERT_SIZE}...")
+        
+        def insert_batch_if_needed():
+            """Insert variants from buffer if it reaches BATCH_INSERT_SIZE."""
+            nonlocal cumulative_stats
+            batch_to_insert = None
+            with variants_lock:
+                if len(variants_buffer) >= BATCH_INSERT_SIZE:
+                    batch_to_insert = variants_buffer[:BATCH_INSERT_SIZE]
+                    variants_buffer[:] = variants_buffer[BATCH_INSERT_SIZE:]
+            
+            # Insert the batch outside the lock to avoid blocking other threads
+            if batch_to_insert:
+                batch_stats = store_variants_in_database(batch_to_insert)
+                
+                # Update cumulative stats (need lock for this)
+                with variants_lock:
+                    cumulative_stats['inserted'] += batch_stats['inserted']
+                    cumulative_stats['errors'] += batch_stats['errors']
+                    cumulative_stats['skipped'] += batch_stats['skipped']
+                    total_inserted = cumulative_stats['inserted']
+                
+                print(f"Batch inserted: {batch_stats['inserted']} variants stored. Total inserted so far: {total_inserted}")
+        
+        def process_model_wrapper(model):
+            """Wrapper to process model and update counters."""
+            nonlocal processed, failed
             try:
                 variants = process_model(model)
-                all_variants.extend(variants)
-                processed += 1
+                with variants_lock:
+                    all_variants.extend(variants)
+                    variants_buffer.extend(variants)
+                    processed += 1
+                
+                # Check if we need to insert a batch (outside the lock)
+                insert_batch_if_needed()
+                
                 print(f"✓ Processed model {model['id']}: {len(variants)} variants found")
+                return {'success': True, 'model_id': model['id'], 'variants': len(variants)}
             except Exception as error:
-                failed += 1
+                with variants_lock:
+                    failed += 1
                 print(f"✗ Failed to process model {model['id']}: {error}")
+                return {'success': False, 'model_id': model['id'], 'error': str(error)}
         
-        # Store variants in database
-        storage_stats = store_variants_in_database(all_variants)
+        # Use ThreadPoolExecutor for parallel processing
+        with ThreadPoolExecutor(max_workers=NUM_WORKERS) as executor:
+            # Submit all tasks
+            future_to_model = {executor.submit(process_model_wrapper, model): model for model in models}
+            
+            # Process completed tasks
+            for future in as_completed(future_to_model):
+                try:
+                    result = future.result()
+                except Exception as exc:
+                    model = future_to_model[future]
+                    print(f"Model {model['id']} generated an exception: {exc}")
+                    with variants_lock:
+                        failed += 1
+        
+        # Stop logging thread
+        logging_active.clear()
+        time.sleep(0.1)  # Give logging thread a moment to finish
+        
+        # Final progress log
+        print(f"===>> total {len(all_variants)} variants added till now")
+        print(f"===> {failed} failed till now")
+        
+        # Insert any remaining variants in the buffer
+        if variants_buffer:
+            print(f"Inserting remaining {len(variants_buffer)} variants...")
+            remaining_stats = store_variants_in_database(variants_buffer)
+            cumulative_stats['inserted'] += remaining_stats['inserted']
+            cumulative_stats['errors'] += remaining_stats['errors']
+            cumulative_stats['skipped'] += remaining_stats['skipped']
+        
+        # Use cumulative stats as final storage stats
+        storage_stats = cumulative_stats
         
         elapsed_time = time.time() - start_time
         print(f"Completed scraping. Processed {processed} models, found {len(all_variants)} variants.")
