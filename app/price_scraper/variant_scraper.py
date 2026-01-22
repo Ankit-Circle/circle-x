@@ -245,6 +245,13 @@ def scrape_variants_and_prices():
             limit = int(request.json.get('limit'))
             print(f"Using limit: {limit} models")
         
+        # Get batch number from request (query parameter or JSON body)
+        batch_num = None
+        if request.args.get('batch'):
+            batch_num = int(request.args.get('batch'))
+        elif request.is_json and request.json.get('batch'):
+            batch_num = int(request.json.get('batch'))
+        
         # TESTING: Hardcode limit to 1 for testing
         # TEST_LIMIT = 10
         # if limit is None:
@@ -252,13 +259,35 @@ def scrape_variants_and_prices():
         #     print(f"[TEST MODE] Limited to {TEST_LIMIT} model for testing")
         
         # Fetch models from database
-        models = fetch_models_from_database(limit=limit)
+        all_models = fetch_models_from_database(limit=limit)
         
-        if not models:
+        if not all_models:
             return jsonify({
                 'error': 'No models found in database with cf_link.',
                 'success': False
             }), 404
+        
+        # If batch number is specified, process only that batch
+        if batch_num is not None:
+            if batch_num < 1 or batch_num > 4:
+                return jsonify({
+                    'error': 'Batch number must be between 1 and 4.',
+                    'success': False
+                }), 400
+            
+            TOTAL_BATCHES = 4
+            total_models = len(all_models)
+            models_per_batch = total_models / TOTAL_BATCHES
+            
+            # Calculate start and end indices for this batch
+            start_idx = int((batch_num - 1) * models_per_batch)
+            end_idx = int(batch_num * models_per_batch) if batch_num < TOTAL_BATCHES else total_models
+            
+            models = all_models[start_idx:end_idx]
+            print(f"Batch {batch_num}/{TOTAL_BATCHES}: Processing models {start_idx + 1}-{end_idx} out of {total_models} total models ({len(models)} models)")
+        else:
+            models = all_models
+            print(f"Processing all {len(models)} models (no batch specified)...")
         
         print(f"Processing {len(models)} models...")
         
@@ -285,8 +314,12 @@ def scrape_variants_and_prices():
                     with variants_lock:
                         total_variants = len(all_variants)
                         total_failed = failed
+                        total_processed = processed
+                    print("--------------------------------------------------------")
                     print(f"===>> total {total_variants} variants added till now")
                     print(f"===> {total_failed} failed till now")
+                    print(f"===> {total_processed} models processed till now")
+                    print("--------------------------------------------------------")
         
         # Start progress logging thread
         log_thread = threading.Thread(target=log_progress, daemon=True)
@@ -362,6 +395,7 @@ def scrape_variants_and_prices():
         # Final progress log
         print(f"===>> total {len(all_variants)} variants added till now")
         print(f"===> {failed} failed till now")
+        print(f"===> {processed} models processed till now")
         
         # Insert any remaining variants in the buffer
         if variants_buffer:
@@ -378,14 +412,22 @@ def scrape_variants_and_prices():
         print(f"Completed scraping. Processed {processed} models, found {len(all_variants)} variants.")
         print(f"Total time taken: {elapsed_time:.2f} seconds ({elapsed_time/60:.2f} minutes)")
         
-        return jsonify({
+        response_data = {
             'success': True,
             'models_processed': processed,
             'models_failed': failed,
             'variants_found': len(all_variants),
             'scraping_time_seconds': round(elapsed_time, 2),
             'database_stats': storage_stats,
-        }), 200
+        }
+        
+        # Add batch information if batch processing was used
+        if batch_num is not None:
+            response_data['batch'] = batch_num
+            response_data['total_batches'] = 4
+            response_data['total_models'] = len(all_models)
+        
+        return jsonify(response_data), 200
         
     except Exception as error:
         print(f"Error in variant-price scraper: {error}")
