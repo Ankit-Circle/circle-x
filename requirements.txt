@@ -10,6 +10,8 @@ requests==2.32.3
 python-dotenv==1.1.1
 openai==1.95.1
 cloudinary==1.37.0
+ortools==9.11.4210
+googlemaps==4.10.0
 
 # Supabase and related packages
 supabase==2.17.0
