@@ -506,24 +506,25 @@ def solve_vrp(
     # The high drop penalties will push the solver to include as many visits as possible
     distance_dimension.SetGlobalSpanCostCoefficient(1)  # Minimal cost for route length
     
-    # Add waypoint count constraint (max 25 waypoints per route)
-    # Create a count callback that returns 1 for each visit (excluding start/end)
+    # Add waypoint count constraint (max_stops physical locations per route)
+    # Each combined node = 1 physical stop (multiple visits at same lat/lng count as 1 stop)
     def count_callback(from_index):
-        """Returns 1 for each visit node, 0 for start/end nodes."""
+        """Returns 1 for each physical stop node, 0 for start/end nodes."""
         from_node = manager.IndexToNode(from_index)
-        # Count as 1 if it's a visit (not start or end)
+        # Count as 1 if it's a visit node (not start or end)
+        # Combined visits at same location are already merged into one node
         if from_node != start_index and from_node != end_index:
             return 1
         return 0
     
     count_callback_index = routing.RegisterUnaryTransitCallback(count_callback)
     
-    # Add dimension for waypoint count
+    # Add dimension for physical stop count (max_stops)
     waypoint_dimension_name = 'WaypointCount'
     routing.AddDimension(
         count_callback_index,
         0,  # no slack
-        max_waypoints,  # maximum waypoints per vehicle
+        max_waypoints,  # maximum physical stops per vehicle (combined locations)
         True,  # start cumul to zero
         waypoint_dimension_name
     )
@@ -739,7 +740,7 @@ def solve_vrp(
     # Log level for debugging (0 = silent, 1 = errors, 2 = warnings, 3 = info)
     search_parameters.log_search = False
     
-    logger.info(f"🚀 Starting solver with {num_vehicles} vehicles, {len(locations)} locations, time limit: {time_limit}s...")
+    logger.info(f"🚀 Starting solver with {num_vehicles} vehicles, {len(locations)} locations (max {max_waypoints} stops/truck), time limit: {time_limit}s...")
     # Solve the problem
     solution = None
     try:
@@ -926,16 +927,27 @@ def extract_solution(
         
         # Only add route if it has stops
         if stops:
-            # Enforce max waypoints limit - truncate if necessary
-            if len(stops) > max_waypoints:
-                logger.warning(f"Route for TRUCK_{vehicle_id + 1} has {len(stops)} stops, truncating to {max_waypoints}")
-                # Mark excess stops as unassigned
-                for excess_stop in stops[max_waypoints:]:
-                    unassigned_visits.append({
-                        "visitId": excess_stop['visitId'],
-                        "reason": "max_waypoints_exceeded"
-                    })
-                stops = stops[:max_waypoints]
+            # Count physical stops (unique sequence numbers = unique locations)
+            physical_stop_count = len(set(stop['sequence'] for stop in stops))
+            
+            # Enforce max waypoints limit based on PHYSICAL stops (locations), not individual visits
+            if physical_stop_count > max_waypoints:
+                logger.warning(f"Route for TRUCK_{vehicle_id + 1} has {physical_stop_count} physical stops, truncating to {max_waypoints}")
+                # Find the max allowed sequence number
+                max_allowed_sequence = sorted(set(stop['sequence'] for stop in stops))[max_waypoints - 1]
+                
+                # Keep stops up to max_allowed_sequence, mark the rest as unassigned
+                kept_stops = []
+                for stop in stops:
+                    if stop['sequence'] <= max_allowed_sequence:
+                        kept_stops.append(stop)
+                    else:
+                        unassigned_visits.append({
+                            "visitId": stop['visitId'],
+                            "reason": "max_stops_exceeded"
+                        })
+                stops = kept_stops
+                physical_stop_count = max_waypoints
             
             routes.append({
                 "truckId": f"TRUCK_{vehicle_id + 1}",
@@ -949,23 +961,26 @@ def extract_solution(
                 },
                 "stops": stops,
                 "estimated_km": round(estimated_road_distance_meters / 1000, 2),
-                "waypoint_count": len(stops)
+                "waypoint_count": physical_stop_count
             })
     
-    # Find unassigned visits
+    # Find unassigned visits - expand combined visit groups back to individual visits
     for i, location in enumerate(locations):
         if i not in assigned_indices and 'visitId' in location:
-            reason = "max_km_exceeded"
+            reason = "max_stops_exceeded" if solution else "max_km_exceeded"
             
-            # Check if it's due to distance constraint
-            if solution:
-                # Could be due to capacity or optimization
-                reason = "optimization_constraint"
-            
-            unassigned_visits.append({
-                "visitId": location['visitId'],
-                "reason": reason
-            })
+            # If we have visit_groups, expand the combined node to all individual visits
+            if visit_groups and i < len(visit_groups) and visit_groups[i]:
+                for visit_id in visit_groups[i]:
+                    unassigned_visits.append({
+                        "visitId": visit_id,
+                        "reason": reason
+                    })
+            else:
+                unassigned_visits.append({
+                    "visitId": location['visitId'],
+                    "reason": reason
+                })
     
     # Post-process: Ensure pickup-drop pairs are complete
     # If one part of a pair is assigned and other is not, move the assigned one to unassigned
@@ -1126,6 +1141,7 @@ def optimize_routes():
     {
         "trucks": 3,
         "max_km": 120,
+        "max_stops": 15,          // Optional: max stops per truck (default: 25)
         "start": { "lat": 12.97, "lng": 77.59 },
         "end": { "lat": 12.93, "lng": 77.62 },
         "visits": [
@@ -1169,7 +1185,7 @@ def optimize_routes():
             }
         ],
         "unassigned_visits": [
-            { "visitId": "V2", "reason": "max_km_exceeded" }
+            { "visitId": "V2", "reason": "max_stops_exceeded" }
         ]
     }
     """
@@ -1187,6 +1203,7 @@ def optimize_routes():
         
         num_trucks = data["trucks"]
         max_km = data["max_km"]
+        max_stops = data.get("max_stops", MAX_WAYPOINTS_PER_ROUTE)  # Optional, default 25
         start_point = data["start"]
         end_point = data["end"]
         visits = data["visits"]
@@ -1197,6 +1214,14 @@ def optimize_routes():
         
         if not isinstance(max_km, (int, float)) or max_km <= 0:
             return jsonify({"error": "max_km must be a positive number"}), 400
+        
+        if not isinstance(max_stops, int) or max_stops <= 0:
+            return jsonify({"error": "max_stops must be a positive integer"}), 400
+        
+        # Cap max_stops to the hard limit
+        if max_stops > MAX_WAYPOINTS_PER_ROUTE:
+            logger.warning(f"⚠️ max_stops ({max_stops}) exceeds hard limit ({MAX_WAYPOINTS_PER_ROUTE}), capping to {MAX_WAYPOINTS_PER_ROUTE}")
+            max_stops = MAX_WAYPOINTS_PER_ROUTE
         
         if not isinstance(visits, list) or len(visits) == 0:
             return jsonify({"error": "visits must be a non-empty list"}), 400
@@ -1213,7 +1238,7 @@ def optimize_routes():
                 if field not in visit:
                     return jsonify({"error": f"Visit {i} missing required field: {field}"}), 400
         
-        logger.info(f"Received routing request: {num_trucks} trucks, max {max_km}km, {len(visits)} visits")
+        logger.info(f"Received routing request: {num_trucks} trucks, max {max_km}km, max {max_stops} stops/truck, {len(visits)} visits")
         
         # Extract order_ids and visit_types from original visits
         original_order_ids = []
@@ -1333,6 +1358,7 @@ def optimize_routes():
             end_index=end_index,
             priorities=priorities,
             used_google_maps=used_google_maps,
+            max_waypoints=max_stops,
             combined_order_info=aligned_order_info,
             visit_groups=aligned_visit_groups,
             original_visits=visits  # Pass original visits for expanding in output
