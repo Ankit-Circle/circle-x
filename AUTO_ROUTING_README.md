@@ -17,7 +17,7 @@ The solver maximizes visit coverage (prioritizing SLA-breached visits) while min
 ## Features
 
 - **Hybrid VRP Solver** — CVRP + VRPPD + VRPTW in one optimization pass
-- **Real Road Distances** — Google Maps API (paid) → OSRM (free) → Haversine (fallback)
+- **Real Road Distances** — Google Maps Distance Matrix API
 - **SLA-Based Priority Routing** — Breached, urgent, warning, normal tiers
 - **Pickup-Drop Pair Constraints** — Same vehicle, pickup before drop, no cross-truck pairs
 - **Time Windows** — Optional per-visit earliest/latest arrival constraints
@@ -133,7 +133,6 @@ The solver maximizes visit coverage (prioritizing SLA-breached visits) while min
       ],
       "estimated_km": 38.4,
       "estimated_hours": 2.15,
-      "distance_source": "google_maps",
       "waypoint_count": 2
     }
   ],
@@ -154,7 +153,6 @@ The solver maximizes visit coverage (prioritizing SLA-breached visits) while min
 | `stops` | array | Ordered list of stops with visit details |
 | `estimated_km` | number | Estimated route distance in km |
 | `estimated_hours` | number | Estimated route duration in hours (travel + service time) |
-| `distance_source` | string | `"google_maps"`, `"osrm"`, or `"haversine"` |
 | `waypoint_count` | integer | Number of individual visits on this route |
 
 ### Unassigned Visit Reasons
@@ -178,33 +176,12 @@ The response includes a `validation_errors` field. If `null`, all pickup-drop co
 
 ## Distance Calculation
 
-The API uses a **3-tier fallback** system for real road distances:
+The API uses **Google Maps Distance Matrix API** for real road distances and travel durations.
 
-### 1. Google Maps Distance Matrix API (Primary)
-
-- **Type:** Paid, most accurate
-- Real road distances and travel durations
 - Requires `GOOGLE_MAPS_API_KEY` environment variable
-- Batched in chunks of 25 destinations per origin
-
-### 2. OSRM — Open Source Routing Machine (Secondary)
-
-- **Type:** Free, real road distances
-- Uses the OSRM Table API for distance and duration matrices
-- Default: public demo server (`http://router.project-osrm.org`)
-- Self-hosted option for production:
-  ```bash
-  docker run -t -v "${PWD}:/data" ghcr.io/project-osrm/osrm-backend osrm-routed --algorithm mld /data/region.osrm
-  ```
-- Set via `OSRM_BASE_URL` environment variable
-
-### 3. Haversine Formula (Fallback)
-
-- **Type:** Free, straight-line estimate
-- Calculates great-circle distance between two points
-- Travel duration estimated at average city speed (25 km/h)
-- A **1.3× road distance factor** is applied to account for Haversine underestimation
-- Used only when both Google Maps and OSRM are unavailable
+- Returns actual driving distances (meters) and durations (seconds)
+- Batched in chunks of 25 destinations per origin (Google Maps API limit)
+- `max_km` is applied directly — no approximation factor needed since distances are real road distances
 
 ## SLA Priority System
 
@@ -228,8 +205,7 @@ Visits are prioritized by SLA urgency. Higher-priority visits incur much larger 
 ### Distance Constraint (CVRP)
 
 - Each vehicle has a maximum travel distance (`max_km`)
-- For Haversine source: solver limit is `max_km / 1.3` to compensate for straight-line underestimation
-- For Google Maps / OSRM: solver uses `max_km` directly (real road distances)
+- Uses real road distances from Google Maps — no approximation needed
 
 ### Waypoint Limit (CVRP)
 
@@ -410,8 +386,7 @@ result = response.json()
 
 for route in result["routes"]:
     print(f"{route['truckId']}: {route['waypoint_count']} stops, "
-          f"{route['estimated_km']}km, {route['estimated_hours']}h "
-          f"[{route['distance_source']}]")
+          f"{route['estimated_km']}km, {route['estimated_hours']}h")
 
 print(f"Unassigned: {len(result['unassigned_visits'])}")
 ```
@@ -428,21 +403,19 @@ print(f"Unassigned: {len(result['unassigned_visits'])}")
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
-| `GOOGLE_MAPS_API_KEY` | No | — | Enables Google Maps Distance Matrix API (paid, most accurate) |
-| `OSRM_BASE_URL` | No | `http://router.project-osrm.org` | OSRM server URL (free road distances) |
+| `GOOGLE_MAPS_API_KEY` | **Yes** | — | Google Maps Distance Matrix API key |
 
 ## Dependencies
 
 ```bash
-pip install flask flask-cors ortools googlemaps requests
+pip install flask flask-cors ortools googlemaps
 ```
 
 ## Tech Stack
 
 - **Flask** — Web framework
 - **Google OR-Tools** — Constraint programming / VRP solver
-- **Google Maps API** — Distance matrix (paid, primary)
-- **OSRM** — Open Source Routing Machine (free, secondary)
+- **Google Maps API** — Distance matrix (real road distances + durations)
 - **Python 3.8+** — Runtime
 
 ## License

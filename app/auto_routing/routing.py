@@ -6,8 +6,6 @@ import tracemalloc
 from flask import Blueprint, request, jsonify
 from ortools.constraint_solver import routing_enums_pb2
 from ortools.constraint_solver import pywrapcp
-import math 
-import requests as http_requests  # renamed to avoid conflict with Flask's request
 import googlemaps
 from typing import List, Dict, Tuple, Optional
 
@@ -18,11 +16,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ─── Distance Source Configuration (priority order) ───
-# 1. Google Maps API (paid, most accurate)
-# 2. OSRM (free, real road distances + travel times)
-# 3. Haversine (free, straight-line fallback — least accurate)
-
+# ─── Google Maps Distance Matrix API ───
 GOOGLE_MAPS_API_KEY = os.environ.get("GOOGLE_MAPS_API_KEY")
 gmaps = None
 if GOOGLE_MAPS_API_KEY:
@@ -31,22 +25,13 @@ if GOOGLE_MAPS_API_KEY:
         logger.info("✅ Google Maps Client initialized")
     except Exception as e:
         logger.error(f"Failed to initialize Google Maps Client: {e}")
-
-# OSRM — Open Source Routing Machine (free real road distances + durations)
-# Default: public demo server (fine for dev, use self-hosted for production)
-# Self-host: docker run -t -v "${PWD}:/data" ghcr.io/project-osrm/osrm-backend osrm-routed --algorithm mld /data/region.osrm
-OSRM_BASE_URL = os.environ.get("OSRM_BASE_URL", "http://router.project-osrm.org")
-
-if not GOOGLE_MAPS_API_KEY:
-    logger.info(f"📍 Using OSRM for road distances: {OSRM_BASE_URL}")
+else:
+    logger.warning("⚠️ GOOGLE_MAPS_API_KEY not set — distance matrix will not work!")
 
 auto_routing_bp = Blueprint("auto_routing", __name__)
 
 # Maximum waypoints per route
 MAX_WAYPOINTS_PER_ROUTE = 25
-
-# Average city driving speed for Haversine duration estimation (km/h)
-AVG_CITY_SPEED_KMH = 25
 
 
 def log_memory(label: str, snapshot_start=None):
@@ -73,129 +58,51 @@ def log_memory(label: str, snapshot_start=None):
     return snapshot
 
 
-def haversine_distance(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
-    """
-    Calculate the great circle distance between two points 
-    on the earth (specified in decimal degrees) in kilometers
-    """
-    # Convert decimal degrees to radians
-    lat1, lng1, lat2, lng2 = map(math.radians, [lat1, lng1, lat2, lng2])
-    
-    # Haversine formula
-    dlat = lat2 - lat1
-    dlng = lng2 - lng1
-    a = math.sin(dlat/2)**2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlng/2)**2
-    c = 2 * math.asin(math.sqrt(a))
-    
-    # Radius of earth in kilometers
-    r = 6371
-    
-    return c * r
-
-
 def create_distance_matrix(
     locations: List[Dict]
-) -> Tuple[List[List[int]], List[List[int]], str]:
+) -> Tuple[List[List[int]], List[List[int]]]:
     """
-    Create distance AND duration matrices from a list of locations.
-    
-    Priority order:
-      1. Google Maps Distance Matrix API (paid, most accurate)
-      2. OSRM Table API (free, real road distances + travel times)
-      3. Haversine formula (free, straight-line estimate — last resort)
+    Create distance AND duration matrices using Google Maps Distance Matrix API.
     
     Returns:
-        (distance_matrix [meters], duration_matrix [seconds], source_type)
-        source_type is one of: "google_maps", "osrm", "haversine"
+        (distance_matrix [meters], duration_matrix [seconds])
+    
+    Raises:
+        Exception if Google Maps API key is not configured or API call fails.
     """
+    if not gmaps:
+        raise Exception("GOOGLE_MAPS_API_KEY is not configured. Cannot build distance matrix.")
+    
     n = len(locations)
     distance_matrix = [[0] * n for _ in range(n)]
     duration_matrix = [[0] * n for _ in range(n)]
     
-    # ─── 1. Try Google Maps API (paid, most accurate) ───
-    if gmaps:
-        try:
-            logger.info("🗺️  Using Google Maps for distance + duration matrix...")
-            coords = [(loc['lat'], loc['lng']) for loc in locations]
-            
-            for i in range(n):
-                for j in range(0, n, 25):
-                    chunk_destinations = coords[j : j + 25]
-                    result = gmaps.distance_matrix(
-                        origins=[coords[i]],
-                        destinations=chunk_destinations,
-                        mode="driving"
-                    )
-                    
-                    if result['status'] == 'OK':
-                        row_elements = result['rows'][0]['elements']
-                        for k, element in enumerate(row_elements):
-                            if element['status'] == 'OK':
-                                distance_matrix[i][j + k] = element['distance']['value']
-                                duration_matrix[i][j + k] = element['duration']['value']
-                            else:
-                                distance_matrix[i][j + k] = 9999999
-                                duration_matrix[i][j + k] = 9999999
-                    else:
-                        raise Exception(f"Google Maps API error: {result['status']}")
-            
-            logger.info(f"✅ Google Maps matrix built: {n}x{n} ({n*n} elements)")
-            return distance_matrix, duration_matrix, "google_maps"
-            
-        except Exception as e:
-            logger.error(f"Google Maps API failed: {str(e)}. Trying OSRM...")
+    logger.info(f"🗺️  Building {n}x{n} distance + duration matrix via Google Maps API...")
+    coords = [(loc['lat'], loc['lng']) for loc in locations]
     
-    # ─── 2. Try OSRM (free, real road distances + durations) ───
-    try:
-        logger.info(f"🛣️  Using OSRM for road distance + duration matrix ({OSRM_BASE_URL})...")
-        
-        # OSRM expects "lng,lat" format (note: longitude FIRST)
-        coord_str = ";".join(f"{loc['lng']},{loc['lat']}" for loc in locations)
-        
-        url = f"{OSRM_BASE_URL}/table/v1/driving/{coord_str}"
-        params = {"annotations": "distance,duration"}
-        
-        response = http_requests.get(url, params=params, timeout=30)
-        response.raise_for_status()
-        data = response.json()
-        
-        if data.get("code") == "Ok":
-            osrm_distances = data["distances"]  # meters
-            osrm_durations = data["durations"]  # seconds
-            
-            for i in range(n):
-                for j in range(n):
-                    dist = osrm_distances[i][j]
-                    dur = osrm_durations[i][j]
-                    distance_matrix[i][j] = int(dist) if dist is not None else 9999999
-                    duration_matrix[i][j] = int(dur) if dur is not None else 9999999
-            
-            logger.info(f"✅ OSRM matrix built: {n}x{n} ({n*n} elements) — real road distances")
-            return distance_matrix, duration_matrix, "osrm"
-        else:
-            raise Exception(f"OSRM error: {data.get('code')} — {data.get('message', 'unknown')}")
-    
-    except Exception as e:
-        logger.warning(f"⚠️ OSRM failed: {str(e)}. Falling back to Haversine (straight-line)...")
-    
-    # ─── 3. Haversine Fallback (straight-line, least accurate) ───
-    logger.warning("📐 Using Haversine formula (straight-line) — distances will be approximate!")
     for i in range(n):
-        for j in range(n):
-            if i != j:
-                dist_km = haversine_distance(
-                    locations[i]['lat'], locations[i]['lng'],
-                    locations[j]['lat'], locations[j]['lng']
-                )
-                dist_meters = int(dist_km * 1000)
-                distance_matrix[i][j] = dist_meters
-                # Estimate duration: distance / average city speed
-                duration_matrix[i][j] = int(dist_km / AVG_CITY_SPEED_KMH * 3600)
+        for j in range(0, n, 25):
+            chunk_destinations = coords[j : j + 25]
+            result = gmaps.distance_matrix(
+                origins=[coords[i]],
+                destinations=chunk_destinations,
+                mode="driving"
+            )
+            
+            if result['status'] == 'OK':
+                row_elements = result['rows'][0]['elements']
+                for k, element in enumerate(row_elements):
+                    if element['status'] == 'OK':
+                        distance_matrix[i][j + k] = element['distance']['value']
+                        duration_matrix[i][j + k] = element['duration']['value']
+                    else:
+                        distance_matrix[i][j + k] = 9999999
+                        duration_matrix[i][j + k] = 9999999
             else:
-                distance_matrix[i][j] = 0
-                duration_matrix[i][j] = 0
+                raise Exception(f"Google Maps API error: {result['status']}")
     
-    return distance_matrix, duration_matrix, "haversine"
+    logger.info(f"✅ Google Maps matrix built: {n}x{n} ({n*n} elements)")
+    return distance_matrix, duration_matrix
 
 
 def combine_visits_at_same_location(
@@ -452,7 +359,6 @@ def solve_vrp(
     start_index: int,
     end_index: int,
     priorities: List[int],
-    distance_source: str = "haversine",
     max_waypoints: int = MAX_WAYPOINTS_PER_ROUTE,
     combined_order_info: List[Dict] = None,
     visit_groups: List[List[str]] = None,
@@ -478,7 +384,6 @@ def solve_vrp(
         start_index: Index of the start location
         end_index: Index of the end location
         priorities: Priority values for each visit (higher = more urgent)
-        distance_source: "google_maps", "osrm", or "haversine"
         max_waypoints: Maximum stops per route (default: 25)
         combined_order_info: Order IDs and visit types at each combined location
         visit_groups: Visit IDs grouped by combined location
@@ -562,11 +467,11 @@ def solve_vrp(
     logger.info(f"📦 Vehicle fixed cost: {vehicle_fixed_cost} (packs trucks before using new ones)")
     
     # ─── WAYPOINT COUNT CONSTRAINT ───
-    # When multiple visits are combined at the same location (same lat/lng),
-    # the solver treats them as ONE node. But max_stops should count INDIVIDUAL visits.
-    # So count_callback returns the number of individual visits inside each combined node.
+    # max_stops counts PHYSICAL LOCATIONS (combined nodes), not individual visits.
+    # A combined location with 5 visits at the same lat/lng = 1 stop.
+    # Example: 15 visits at 10 unique locations + max_stops=10 → all fit.
     
-    # Build a lookup: node_index -> number of individual visits
+    # Build visits_per_node lookup (used for service time scaling, NOT for stop counting)
     visits_per_node = {}
     if visit_groups:
         for node_idx in range(len(locations)):
@@ -586,18 +491,21 @@ def solve_vrp(
     logger.info(f"📊 Visits per combined node: {', '.join(f'N{k}={v}' for k, v in visits_per_node.items() if v > 0)}")
     
     def count_callback(from_index):
-        """Returns the number of INDIVIDUAL visits at this combined node."""
+        """Returns 1 for each visit node (combined location = 1 stop)."""
         from_node = manager.IndexToNode(from_index)
-        return visits_per_node.get(from_node, 0)
+        # Start/end nodes = 0 stops; every other node = 1 physical stop
+        if from_node == start_index or from_node == end_index:
+            return 0
+        return 1
     
     count_callback_index = routing.RegisterUnaryTransitCallback(count_callback)
     
-    # Add dimension for waypoint count
+    # Add dimension for waypoint count (counts physical locations, not individual visits)
     waypoint_dimension_name = 'WaypointCount'
     routing.AddDimension(
         count_callback_index,
         0,  # no slack
-        max_waypoints,  # maximum individual visits per vehicle
+        max_waypoints,  # maximum physical locations (stops) per vehicle
         True,  # start cumul to zero
         waypoint_dimension_name
     )
@@ -923,7 +831,7 @@ def solve_vrp(
     if solution:
         return extract_solution(
             manager, routing, solution, locations, distance_matrix, duration_matrix,
-            start_index, end_index, num_vehicles, distance_source, max_waypoints,
+            start_index, end_index, num_vehicles, max_waypoints,
             combined_order_info, visit_groups, original_visits
         )
     else:
@@ -933,7 +841,7 @@ def solve_vrp(
 
 def extract_solution(
     manager, routing, solution, locations, distance_matrix, duration_matrix,
-    start_index, end_index, num_vehicles, distance_source: str = "haversine",
+    start_index, end_index, num_vehicles,
     max_waypoints: int = MAX_WAYPOINTS_PER_ROUTE,
     combined_order_info: List[Dict] = None,
     visit_groups: List[List[str]] = None,
@@ -1048,28 +956,34 @@ def extract_solution(
             route_distance_meters += distance_matrix[from_node][to_node]
             route_duration_seconds += duration_matrix[from_node][to_node]
         
-        # Apply road distance factor for display
-        # google_maps/osrm = real road distances (factor 1.0)
-        # haversine = straight-line, estimate road with 1.3x factor
-        ROAD_DISTANCE_FACTOR = 1.0 if distance_source in ("google_maps", "osrm") else 1.3
-        estimated_road_distance_meters = route_distance_meters * ROAD_DISTANCE_FACTOR
-        
-        # Duration factor: haversine speed estimate is rough, add 15% buffer
-        DURATION_FACTOR = 1.0 if distance_source in ("google_maps", "osrm") else 1.15
-        estimated_duration_seconds = route_duration_seconds * DURATION_FACTOR
+        # Google Maps gives real road distances — no adjustment needed
+        estimated_road_distance_meters = route_distance_meters
+        estimated_duration_seconds = route_duration_seconds
         
         # Only add route if it has stops
         if stops:
-            # Enforce max waypoints limit - truncate if necessary
-            if len(stops) > max_waypoints:
-                logger.warning(f"Route for TRUCK_{vehicle_id + 1} has {len(stops)} stops, truncating to {max_waypoints}")
-                # Mark excess stops as unassigned
-                for excess_stop in stops[max_waypoints:]:
-                    unassigned_visits.append({
-                        "visitId": excess_stop['visitId'],
-                        "reason": "max_waypoints_exceeded"
-                    })
-                stops = stops[:max_waypoints]
+            # Count unique locations (each sequence = 1 physical stop)
+            # Combined visits at the same location share the same sequence number
+            unique_locations = len(set(s['sequence'] for s in stops))
+            
+            # Enforce max waypoints limit by LOCATION count (not individual visits)
+            if unique_locations > max_waypoints:
+                logger.warning(f"Route for TRUCK_{vehicle_id + 1} has {unique_locations} locations, truncating to {max_waypoints}")
+                # Find which sequences to keep (first max_waypoints locations)
+                allowed_sequences = sorted(set(s['sequence'] for s in stops))[:max_waypoints]
+                allowed_set = set(allowed_sequences)
+                
+                kept_stops = []
+                for stop in stops:
+                    if stop['sequence'] in allowed_set:
+                        kept_stops.append(stop)
+                    else:
+                        unassigned_visits.append({
+                            "visitId": stop['visitId'],
+                            "reason": "max_waypoints_exceeded"
+                        })
+                stops = kept_stops
+                unique_locations = max_waypoints
             
             estimated_km = round(estimated_road_distance_meters / 1000, 2)
             estimated_hours = round(estimated_duration_seconds / 3600, 2)
@@ -1087,8 +1001,8 @@ def extract_solution(
                 "stops": stops,
                 "estimated_km": estimated_km,
                 "estimated_hours": estimated_hours,
-                "distance_source": distance_source,
-                "waypoint_count": len(stops)
+                "waypoint_count": unique_locations,
+                "total_visits": len(stops)
             })
     
     # Find unassigned visits
@@ -1187,7 +1101,8 @@ def extract_solution(
                         stop['sequence'] = seq
                     
                     route['stops'] = filtered_stops
-                    route['waypoint_count'] = len(filtered_stops)
+                    route['waypoint_count'] = len(set(s['sequence'] for s in filtered_stops)) if filtered_stops else 0
+                    route['total_visits'] = len(filtered_stops)
     
     # FINAL VALIDATION: Check for pickup-drop constraint violations
     validation_errors = []
@@ -1262,7 +1177,7 @@ def optimize_routes():
     Hybrid VRP Optimizer: CVRP + VRPPD + VRPTW
     
     Solves routing with capacity constraints, pickup-delivery pairs, and time windows.
-    Uses real road distances via OSRM (free) or Google Maps API.
+    Uses real road distances via Google Maps Distance Matrix API.
     
     Expected JSON input:
     {
@@ -1454,9 +1369,9 @@ def optimize_routes():
         end_index = len(locations) - 1
         
         # Create distance + duration matrices using combined locations
-        # Priority: Google Maps → OSRM (free road distances) → Haversine (fallback)
+        # Build distance + duration matrices via Google Maps API
         matrix_start = time.time()
-        distance_matrix, duration_matrix, distance_source = create_distance_matrix(locations)
+        distance_matrix, duration_matrix = create_distance_matrix(locations)
         matrix_elapsed = time.time() - matrix_start
         matrix_snap = log_memory("Distance matrix BUILT", api_snap)
         logger.info(f"⏱️  Distance matrix: {len(locations)}x{len(locations)} built in {matrix_elapsed:.2f}s")
@@ -1510,16 +1425,13 @@ def optimize_routes():
             aligned_service_times.append(svc_seconds * num_visits_at_node)
         aligned_service_times.append(0)  # 0 for end
         
-        # Convert max_km to meters, accounting for Haversine underestimation
-        # OSRM and Google Maps give real road distances; Haversine is ~30% shorter
-        ROAD_DISTANCE_FACTOR = 1.0 if distance_source in ("google_maps", "osrm") else 1.3
-        max_distance_meters = int(max_km * 1000 / ROAD_DISTANCE_FACTOR)
+        # Convert max_km to meters (Google Maps gives real road distances)
+        max_distance_meters = int(max_km * 1000)
         
         # Convert shift duration to seconds
         max_route_time = int(shift_duration_hours * 3600)
         
-        logger.info(f"📏 Distance: {max_km}km limit → {max_distance_meters/1000:.1f}km solver "
-                     f"(source: {distance_source}, factor: {ROAD_DISTANCE_FACTOR}x)")
+        logger.info(f"📏 Distance: {max_km}km limit → {max_distance_meters/1000:.1f}km solver (Google Maps)")
         logger.info(f"⏰ Time: {shift_duration_hours}h shift, {service_time_minutes}min/stop, "
                      f"time windows: {'YES' if has_any_time_window else 'NO'}")
         
@@ -1533,7 +1445,6 @@ def optimize_routes():
             start_index=start_index,
             end_index=end_index,
             priorities=priorities,
-            distance_source=distance_source,
             max_waypoints=max_stops,
             combined_order_info=aligned_order_info,
             visit_groups=aligned_visit_groups,
@@ -1557,21 +1468,24 @@ def optimize_routes():
             logger.info(f"Added {len(filtered_excluded_visits)} filtered visits to unassigned list")
         
         # Log route utilization summary
-        total_assigned = 0
+        total_locations = 0
+        total_visits_assigned = 0
         for route in result['routes']:
-            num_stops = route['waypoint_count']
+            num_locations = route['waypoint_count']
+            num_visits = route.get('total_visits', len(route['stops']))
             est_km = route['estimated_km']
             est_hrs = route.get('estimated_hours', 0)
             util_km = (est_km / max_km * 100) if max_km > 0 else 0
-            util_stops = (num_stops / max_stops * 100) if max_stops > 0 else 0
+            util_stops = (num_locations / max_stops * 100) if max_stops > 0 else 0
             util_time = (est_hrs / shift_duration_hours * 100) if shift_duration_hours > 0 else 0
-            total_assigned += num_stops
-            logger.info(f"📊 {route['truckId']}: {num_stops} stops ({util_stops:.0f}%), "
+            total_locations += num_locations
+            total_visits_assigned += num_visits
+            logger.info(f"📊 {route['truckId']}: {num_locations} locations/{num_visits} visits ({util_stops:.0f}%), "
                         f"{est_km:.1f}km ({util_km:.0f}%), "
-                        f"{est_hrs:.1f}h ({util_time:.0f}%) — "
-                        f"[{distance_source}]")
+                        f"{est_hrs:.1f}h ({util_time:.0f}%)")
         
-        logger.info(f"✅ Solution: {len(result['routes'])} routes, {total_assigned} assigned, "
+        logger.info(f"✅ Solution: {len(result['routes'])} routes, "
+                     f"{total_locations} locations/{total_visits_assigned} visits assigned, "
                      f"{len(result['unassigned_visits'])} unassigned out of {len(visits)} total visits")
         
         # ─── Final memory + timing summary ───

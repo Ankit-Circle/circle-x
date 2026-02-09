@@ -29,7 +29,7 @@ Optimizes delivery routes for multiple vehicles using a **Hybrid VRP** solver co
 - **VRPPD** — Pickup & delivery pairs (same vehicle, pickup before drop)
 - **VRPTW** — Time windows and shift duration limits
 
-Uses real road distances via Google Maps (paid) → OSRM (free) → Haversine (fallback).
+Uses real road distances via Google Maps Distance Matrix API.
 
 ### Pricing API
 
@@ -67,14 +67,12 @@ curl --location '0.0.0.0:5000/api/enhance' \
 Create a `.env` file with:
 
 ```bash
-GOOGLE_MAPS_API_KEY=your_api_key_here   # Optional: enables Google Maps (paid, most accurate)
-OSRM_BASE_URL=http://router.project-osrm.org  # Optional: OSRM server for free road distances
+GOOGLE_MAPS_API_KEY=your_api_key_here   # Required for auto-routing
 ```
 
 ## Tech Stack
 
 - **Flask**: Web framework
 - **Google OR-Tools**: Hybrid VRP solver (CVRP + VRPPD + VRPTW)
-- **Google Maps API**: Distance matrix (paid, primary)
-- **OSRM**: Open Source Routing Machine (free, secondary)
+- **Google Maps API**: Distance matrix (real road distances + durations)
 - **Flask-CORS**: Cross-origin support
