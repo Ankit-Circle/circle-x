@@ -1,4 +1,6 @@
-# circle-x AI Api server
+# circle-x AI API Server
+
+A Flask-based API server providing AI-powered services including vehicle route optimization, product pricing, and image enhancement.
 
 ## Running with Docker
 
@@ -14,9 +16,24 @@ Run the Docker container:
 docker run -p 5000:5000 circle-x
 ```
 
-## Example API Call
+## API Endpoints
 
-You can test the pricing API using the following `curl` command:
+### Auto Routing API — Hybrid VRP (CVRP + VRPPD + VRPTW)
+
+**Endpoint:** `POST /api/auto-routing/optimize`
+
+📖 **[See detailed Auto Routing API documentation →](AUTO_ROUTING_README.md)**
+
+Optimizes delivery routes for multiple vehicles using a **Hybrid VRP** solver combining:
+- **CVRP** — Capacity constraints (max km, max stops per truck)
+- **VRPPD** — Pickup & delivery pairs (same vehicle, pickup before drop)
+- **VRPTW** — Time windows and shift duration limits
+
+Uses real road distances via Google Maps (paid) → OSRM (free) → Haversine (fallback).
+
+### Pricing API
+
+**Endpoint:** `POST /api/pricing`
 
 ```bash
 curl --location '0.0.0.0:5000/api/pricing' \
@@ -33,7 +50,9 @@ curl --location '0.0.0.0:5000/api/pricing' \
 }'
 ```
 
-You can test the Image enhancement API using
+### Image Enhancement API
+
+**Endpoint:** `POST /api/enhance`
 
 ```bash
 curl --location '0.0.0.0:5000/api/enhance' \
@@ -43,3 +62,19 @@ curl --location '0.0.0.0:5000/api/enhance' \
 }'
 ```
 
+## Environment Variables
+
+Create a `.env` file with:
+
+```bash
+GOOGLE_MAPS_API_KEY=your_api_key_here   # Optional: enables Google Maps (paid, most accurate)
+OSRM_BASE_URL=http://router.project-osrm.org  # Optional: OSRM server for free road distances
+```
+
+## Tech Stack
+
+- **Flask**: Web framework
+- **Google OR-Tools**: Hybrid VRP solver (CVRP + VRPPD + VRPTW)
+- **Google Maps API**: Distance matrix (paid, primary)
+- **OSRM**: Open Source Routing Machine (free, secondary)
+- **Flask-CORS**: Cross-origin support

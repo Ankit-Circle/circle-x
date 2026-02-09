@@ -1,11 +1,15 @@
 import logging
 import os
+import sys
+import time
+import tracemalloc
 from flask import Blueprint, request, jsonify
 from ortools.constraint_solver import routing_enums_pb2
 from ortools.constraint_solver import pywrapcp
-import math
+import math 
+import requests as http_requests  # renamed to avoid conflict with Flask's request
 import googlemaps
-from typing import List, Dict, Tuple
+from typing import List, Dict, Tuple, Optional
 
 # Configure logging
 logging.basicConfig(
@@ -14,7 +18,11 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Initialize Google Maps Client
+# ─── Distance Source Configuration (priority order) ───
+# 1. Google Maps API (paid, most accurate)
+# 2. OSRM (free, real road distances + travel times)
+# 3. Haversine (free, straight-line fallback — least accurate)
+
 GOOGLE_MAPS_API_KEY = os.environ.get("GOOGLE_MAPS_API_KEY")
 gmaps = None
 if GOOGLE_MAPS_API_KEY:
@@ -23,13 +31,46 @@ if GOOGLE_MAPS_API_KEY:
         logger.info("✅ Google Maps Client initialized")
     except Exception as e:
         logger.error(f"Failed to initialize Google Maps Client: {e}")
-else:
-    logger.warning("⚠️ GOOGLE_MAPS_API_KEY not found. Using Haversine fallback.")
+
+# OSRM — Open Source Routing Machine (free real road distances + durations)
+# Default: public demo server (fine for dev, use self-hosted for production)
+# Self-host: docker run -t -v "${PWD}:/data" ghcr.io/project-osrm/osrm-backend osrm-routed --algorithm mld /data/region.osrm
+OSRM_BASE_URL = os.environ.get("OSRM_BASE_URL", "http://router.project-osrm.org")
+
+if not GOOGLE_MAPS_API_KEY:
+    logger.info(f"📍 Using OSRM for road distances: {OSRM_BASE_URL}")
 
 auto_routing_bp = Blueprint("auto_routing", __name__)
 
-# Maximum waypoints per route (Google Maps and other routing APIs limit)
+# Maximum waypoints per route
 MAX_WAYPOINTS_PER_ROUTE = 25
+
+# Average city driving speed for Haversine duration estimation (km/h)
+AVG_CITY_SPEED_KMH = 25
+
+
+def log_memory(label: str, snapshot_start=None):
+    """
+    Log current memory usage with a label.
+    If snapshot_start is provided, also logs the delta from that snapshot.
+    Returns the current tracemalloc snapshot for chaining.
+    """
+    snapshot = tracemalloc.take_snapshot()
+    current, peak = tracemalloc.get_traced_memory()
+    current_mb = current / (1024 * 1024)
+    peak_mb = peak / (1024 * 1024)
+    
+    msg = f"🧠 RAM [{label}]: current={current_mb:.2f} MB, peak={peak_mb:.2f} MB"
+    
+    if snapshot_start:
+        # Calculate delta from a previous snapshot
+        stats = snapshot.compare_to(snapshot_start, 'lineno')
+        delta_bytes = sum(stat.size_diff for stat in stats)
+        delta_mb = delta_bytes / (1024 * 1024)
+        msg += f", delta={delta_mb:+.2f} MB"
+    
+    logger.info(msg)
+    return snapshot
 
 
 def haversine_distance(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
@@ -52,29 +93,32 @@ def haversine_distance(lat1: float, lng1: float, lat2: float, lng2: float) -> fl
     return c * r
 
 
-def create_distance_matrix(locations: List[Dict]) -> Tuple[List[List[int]], bool]:
+def create_distance_matrix(
+    locations: List[Dict]
+) -> Tuple[List[List[int]], List[List[int]], str]:
     """
-    Create a distance matrix from a list of locations.
-    Uses Google Maps Distance Matrix API if available, otherwise Haversine.
-    Returns: (distance_matrix, used_google_maps)
+    Create distance AND duration matrices from a list of locations.
+    
+    Priority order:
+      1. Google Maps Distance Matrix API (paid, most accurate)
+      2. OSRM Table API (free, real road distances + travel times)
+      3. Haversine formula (free, straight-line estimate — last resort)
+    
+    Returns:
+        (distance_matrix [meters], duration_matrix [seconds], source_type)
+        source_type is one of: "google_maps", "osrm", "haversine"
     """
     n = len(locations)
     distance_matrix = [[0] * n for _ in range(n)]
+    duration_matrix = [[0] * n for _ in range(n)]
     
-    # Try using Google Maps if available
+    # ─── 1. Try Google Maps API (paid, most accurate) ───
     if gmaps:
         try:
-            logger.info("Using Google Maps for distance matrix...")
-            # Prepare coordinates
+            logger.info("🗺️  Using Google Maps for distance + duration matrix...")
             coords = [(loc['lat'], loc['lng']) for loc in locations]
             
-            # Google Maps Distance Matrix has limits (max 100 elements per request, e.g. 10x10)
-            # For larger sets, we calculate in chunks or row by row
-            # Since n is likely small (< 25) for this use case, we can try direct calls or row-based
-            
             for i in range(n):
-                # Request distances from origin 'i' to all destinations
-                # We can batch destinations in groups of 25 (safe limit)
                 for j in range(0, n, 25):
                     chunk_destinations = coords[j : j + 25]
                     result = gmaps.distance_matrix(
@@ -88,20 +132,54 @@ def create_distance_matrix(locations: List[Dict]) -> Tuple[List[List[int]], bool
                         for k, element in enumerate(row_elements):
                             if element['status'] == 'OK':
                                 distance_matrix[i][j + k] = element['distance']['value']
+                                duration_matrix[i][j + k] = element['duration']['value']
                             else:
-                                # Fallback for unreachable points
                                 distance_matrix[i][j + k] = 9999999
+                                duration_matrix[i][j + k] = 9999999
                     else:
                         raise Exception(f"Google Maps API error: {result['status']}")
             
-            return distance_matrix, True
+            logger.info(f"✅ Google Maps matrix built: {n}x{n} ({n*n} elements)")
+            return distance_matrix, duration_matrix, "google_maps"
             
         except Exception as e:
-            logger.error(f"Google Maps API failed, falling back to Haversine: {str(e)}")
-            # Fall through to Haversine
+            logger.error(f"Google Maps API failed: {str(e)}. Trying OSRM...")
     
-    # Haversine Fallback
-    logger.info("Using Haversine formula for distance matrix")
+    # ─── 2. Try OSRM (free, real road distances + durations) ───
+    try:
+        logger.info(f"🛣️  Using OSRM for road distance + duration matrix ({OSRM_BASE_URL})...")
+        
+        # OSRM expects "lng,lat" format (note: longitude FIRST)
+        coord_str = ";".join(f"{loc['lng']},{loc['lat']}" for loc in locations)
+        
+        url = f"{OSRM_BASE_URL}/table/v1/driving/{coord_str}"
+        params = {"annotations": "distance,duration"}
+        
+        response = http_requests.get(url, params=params, timeout=30)
+        response.raise_for_status()
+        data = response.json()
+        
+        if data.get("code") == "Ok":
+            osrm_distances = data["distances"]  # meters
+            osrm_durations = data["durations"]  # seconds
+            
+            for i in range(n):
+                for j in range(n):
+                    dist = osrm_distances[i][j]
+                    dur = osrm_durations[i][j]
+                    distance_matrix[i][j] = int(dist) if dist is not None else 9999999
+                    duration_matrix[i][j] = int(dur) if dur is not None else 9999999
+            
+            logger.info(f"✅ OSRM matrix built: {n}x{n} ({n*n} elements) — real road distances")
+            return distance_matrix, duration_matrix, "osrm"
+        else:
+            raise Exception(f"OSRM error: {data.get('code')} — {data.get('message', 'unknown')}")
+    
+    except Exception as e:
+        logger.warning(f"⚠️ OSRM failed: {str(e)}. Falling back to Haversine (straight-line)...")
+    
+    # ─── 3. Haversine Fallback (straight-line, least accurate) ───
+    logger.warning("📐 Using Haversine formula (straight-line) — distances will be approximate!")
     for i in range(n):
         for j in range(n):
             if i != j:
@@ -109,12 +187,15 @@ def create_distance_matrix(locations: List[Dict]) -> Tuple[List[List[int]], bool
                     locations[i]['lat'], locations[i]['lng'],
                     locations[j]['lat'], locations[j]['lng']
                 )
-                # Convert to meters and round to integer
-                distance_matrix[i][j] = int(dist_km * 1000)
+                dist_meters = int(dist_km * 1000)
+                distance_matrix[i][j] = dist_meters
+                # Estimate duration: distance / average city speed
+                duration_matrix[i][j] = int(dist_km / AVG_CITY_SPEED_KMH * 3600)
             else:
                 distance_matrix[i][j] = 0
+                duration_matrix[i][j] = 0
     
-    return distance_matrix, False
+    return distance_matrix, duration_matrix, "haversine"
 
 
 def combine_visits_at_same_location(
@@ -125,18 +206,7 @@ def combine_visits_at_same_location(
 ) -> Tuple[List[Dict], List[List[str]], List[Dict], Dict[str, List[str]]]:
     """
     Combine visits that are at the same location (within tolerance).
-    
-    IMPORTANT: Only combines ELIGIBLE visits. Visits that are part of a 
-    cross-location pickup-drop pair are kept as INDIVIDUAL nodes to prevent
-    conflicting constraints (e.g., node A must come before AND after node B).
-    
-    Eligible for combining:
-    - Standalone visits (no pickup-drop pair, or missing counterpart)
-    - Visits where pickup AND drop are at the SAME location
-    
-    NOT eligible (stay as individual nodes):
-    - Visits that are part of a pickup-drop pair where pickup and drop are
-      at DIFFERENT locations (these create ordering constraints)
+    Tracks ALL order_ids and visit_types at each location for pickup-drop constraints.
     
     Args:
         visits: List of visit dictionaries
@@ -151,41 +221,9 @@ def combine_visits_at_same_location(
         - combined_order_info: List of dicts with ALL order_ids and visit_types at each location
         - location_to_visits: Mapping of location key to list of visit IDs
     """
-    
-    # === STEP 1: Pre-scan to find cross-location pickup-drop pairs ===
-    # Build a map of order_id -> {'pickup_idx': i, 'drop_idx': j, 'pickup_loc': ..., 'drop_loc': ...}
-    order_pair_scan = {}
-    for i, (oid, vtype) in enumerate(zip(order_ids, visit_types)):
-        if oid and vtype:
-            if oid not in order_pair_scan:
-                order_pair_scan[oid] = {}
-            vtype_lower = vtype.lower()
-            loc_key = (
-                round(visits[i]['lat'] / tolerance) * tolerance,
-                round(visits[i]['lng'] / tolerance) * tolerance
-            )
-            if vtype_lower in ['pickup', 'pick']:
-                order_pair_scan[oid]['pickup_idx'] = i
-                order_pair_scan[oid]['pickup_loc'] = loc_key
-            elif vtype_lower in ['drop', 'delivery']:
-                order_pair_scan[oid]['drop_idx'] = i
-                order_pair_scan[oid]['drop_loc'] = loc_key
-    
-    # Identify visits that are part of CROSS-LOCATION pairs (not eligible for combining)
-    non_combinable_indices = set()
-    for oid, info in order_pair_scan.items():
-        if 'pickup_idx' in info and 'drop_idx' in info:
-            pickup_loc = info['pickup_loc']
-            drop_loc = info['drop_loc']
-            # If pickup and drop are at DIFFERENT locations, mark both as non-combinable
-            if pickup_loc != drop_loc:
-                non_combinable_indices.add(info['pickup_idx'])
-                non_combinable_indices.add(info['drop_idx'])
-    
-    logger.info(f"📊 Pre-scan: {len(order_pair_scan)} orders, {len(non_combinable_indices)} visits in cross-location pairs (kept individual)")
-    
-    # === STEP 2: Group visits by location ===
     location_map = {}  # (lat, lng) -> list of visit indices
+    
+    # Group ALL visits by location
     for i, visit in enumerate(visits):
         lat = round(visit['lat'] / tolerance) * tolerance
         lng = round(visit['lng'] / tolerance) * tolerance
@@ -197,63 +235,57 @@ def combine_visits_at_same_location(
     
     combined_visits = []
     visit_groups = []
-    combined_order_info = []
+    combined_order_info = []  # List of {'order_ids': [...], 'visit_types': [...], 'pairs': [...]}
     location_to_visits = {}
     
-    # === STEP 3: Create nodes - combine only eligible visits ===
+    # Create combined visits for each unique location
     for location_key, visit_indices in location_map.items():
-        # Separate into combinable and non-combinable visits at this location
-        combinable = [idx for idx in visit_indices if idx not in non_combinable_indices]
-        non_combinable = [idx for idx in visit_indices if idx in non_combinable_indices]
+        first_visit_idx = visit_indices[0]
+        first_visit = visits[first_visit_idx]
         
-        # Create ONE combined node for all combinable visits at this location
-        if combinable:
-            first_idx = combinable[0]
-            first_visit = visits[first_idx]
-            
-            visit_ids = [visits[idx]['visitId'] for idx in combinable]
-            orders = [order_ids[idx] for idx in combinable]
-            types = [visit_types[idx] for idx in combinable]
-            
-            combined_visit = {
-                'lat': first_visit['lat'],
-                'lng': first_visit['lng'],
-                'visitId': first_visit['visitId'],
-                'sla_days': min(visits[idx].get('sla_days', 5) for idx in combinable)
-            }
-            
-            combined_visits.append(combined_visit)
-            visit_groups.append(visit_ids)
-            location_to_visits[f"{first_visit['lat']},{first_visit['lng']}"] = visit_ids
-            combined_order_info.append({
-                'order_ids': orders,
-                'visit_types': types
-            })
-            
-            if len(visit_ids) > 1:
-                logger.info(f"✅ Combined {len(visit_ids)} standalone visits at ({first_visit['lat']}, {first_visit['lng']}): {visit_ids}")
+        # Collect all visit IDs at this location
+        visit_ids_at_location = [visits[idx]['visitId'] for idx in visit_indices]
         
-        # Create INDIVIDUAL nodes for each non-combinable visit (pickup-drop pair members)
-        for idx in non_combinable:
-            visit = visits[idx]
-            combined_visits.append({
-                'lat': visit['lat'],
-                'lng': visit['lng'],
-                'visitId': visit['visitId'],
-                'sla_days': visit.get('sla_days', 5)
-            })
-            visit_groups.append([visit['visitId']])
-            combined_order_info.append({
-                'order_ids': [order_ids[idx]],
-                'visit_types': [visit_types[idx]]
-            })
-            
-            oid = order_ids[idx]
-            vtype = visit_types[idx]
-            logger.info(f"📌 Kept individual: {visit['visitId']} (order {oid}, {vtype}) at ({visit['lat']}, {visit['lng']})")
-    
-    logger.info(f"✅ Processed {len(visits)} visits into {len(combined_visits)} nodes "
-                f"({len(visits) - len(non_combinable_indices)} combinable, {len(non_combinable_indices)} individual)")
+        # Collect ALL order_ids and visit_types at this location
+        orders_at_location = []
+        types_at_location = []
+        for idx in visit_indices:
+            orders_at_location.append(order_ids[idx])
+            types_at_location.append(visit_types[idx])
+        
+        # Create combined visit — carry forward time window from first visit
+        # (if multiple visits at same location, use the tightest time window)
+        tw_start_values = [visits[idx].get('time_window_start') for idx in visit_indices 
+                          if visits[idx].get('time_window_start') is not None]
+        tw_end_values = [visits[idx].get('time_window_end') for idx in visit_indices 
+                        if visits[idx].get('time_window_end') is not None]
+        
+        combined_visit = {
+            'lat': first_visit['lat'],
+            'lng': first_visit['lng'],
+            'visitId': first_visit['visitId'],
+            'sla_days': min(visits[idx].get('sla_days', 5) for idx in visit_indices)
+        }
+        # Use tightest time window from all visits at this location
+        if tw_start_values:
+            combined_visit['time_window_start'] = max(tw_start_values)  # latest start
+        if tw_end_values:
+            combined_visit['time_window_end'] = min(tw_end_values)  # earliest end
+        
+        combined_visits.append(combined_visit)
+        visit_groups.append(visit_ids_at_location)
+        location_to_visits[f"{first_visit['lat']},{first_visit['lng']}"] = visit_ids_at_location
+        
+        # Store ALL order info for this combined location
+        combined_order_info.append({
+            'order_ids': orders_at_location,
+            'visit_types': types_at_location
+        })
+        
+        if len(visit_ids_at_location) > 1:
+            logger.info(f"Combined {len(visit_ids_at_location)} visits at ({first_visit['lat']}, {first_visit['lng']}): {visit_ids_at_location}")
+        
+    logger.info(f"✅ Combined {len(visits)} visits into {len(combined_visits)} unique locations")
     
     return combined_visits, visit_groups, combined_order_info, location_to_visits
 
@@ -416,33 +448,53 @@ def solve_vrp(
     max_distance_per_vehicle: int,
     locations: List[Dict],
     distance_matrix: List[List[int]],
+    duration_matrix: List[List[int]],
     start_index: int,
     end_index: int,
     priorities: List[int],
-    used_google_maps: bool = False,
+    distance_source: str = "haversine",
     max_waypoints: int = MAX_WAYPOINTS_PER_ROUTE,
     combined_order_info: List[Dict] = None,
     visit_groups: List[List[str]] = None,
-    original_visits: List[Dict] = None
+    original_visits: List[Dict] = None,
+    time_windows: Optional[List[Optional[Tuple[int, int]]]] = None,
+    service_times: Optional[List[int]] = None,
+    max_route_time: int = 36000
 ) -> Dict:
     """
-    Solve the Vehicle Routing Problem using Google OR-Tools
+    Hybrid VRP Solver: CVRP + VRPPD + VRPTW
+    
+    Solves a Vehicle Routing Problem combining:
+      - CVRP:  Capacity constraints (max_km per vehicle, max_stops per vehicle)
+      - VRPPD: Pickup & Delivery pairs (same vehicle, pickup before drop)
+      - VRPTW: Time Windows (optional — visit within allowed time range)
     
     Args:
         num_vehicles: Number of trucks available
-        max_distance_per_vehicle: Maximum distance each truck can travel (in meters)
-        locations: List of all locations (start, end, and visits)
-        distance_matrix: Matrix of distances between all locations
+        max_distance_per_vehicle: Maximum distance each truck can travel (meters)
+        locations: List of all locations (start, visits, end)
+        distance_matrix: Matrix of distances between all locations (meters)
+        duration_matrix: Matrix of travel times between all locations (seconds)
         start_index: Index of the start location
         end_index: Index of the end location
         priorities: Priority values for each visit (higher = more urgent)
-        used_google_maps: Whether Google Maps was used for distances
-        max_waypoints: Maximum number of waypoints (stops) per route (default: 25)
-        combined_order_info: List of dicts with order_ids and visit_types at each location
+        distance_source: "google_maps", "osrm", or "haversine"
+        max_waypoints: Maximum stops per route (default: 25)
+        combined_order_info: Order IDs and visit types at each combined location
+        visit_groups: Visit IDs grouped by combined location
+        original_visits: Original visit data for output expansion
+        time_windows: Optional list of (earliest, latest) in seconds from shift start.
+                      None entries = no time window for that node.
+        service_times: Optional list of service durations per node (seconds).
+                       Default 10 minutes per visit.
+        max_route_time: Maximum route duration in seconds (default 10 hours)
     
     Returns:
         Dictionary containing routes and unassigned visits
     """
+    solver_snap = log_memory("Solver START")
+    solver_start_time = time.time()
+    
     # Create the routing index manager
     # When start and end are different, we need to use lists
     if start_index != end_index:
@@ -475,20 +527,9 @@ def solve_vrp(
     
     transit_callback_index = routing.RegisterTransitCallback(distance_callback)
     
-    # MAXIMIZE VISITS STRATEGY:
-    # Use a scaled-down arc cost so solver prioritizes visiting more nodes
-    # over minimizing total distance. The drop penalties do the heavy lifting.
-    def scaled_distance_callback(from_index, to_index):
-        """Returns scaled distance - lower values mean solver cares less about distance."""
-        from_node = manager.IndexToNode(from_index)
-        to_node = manager.IndexToNode(to_index)
-        # Scale down by 10x so penalties dominate the objective
-        return distance_matrix[from_node][to_node] // 10
-    
-    scaled_transit_callback_index = routing.RegisterTransitCallback(scaled_distance_callback)
-    
-    # Use scaled distance for arc costs (prioritizes including more visits)
-    routing.SetArcCostEvaluatorOfAllVehicles(scaled_transit_callback_index)
+    # Use ACTUAL distances for arc costs — ensures routes are distance-optimized
+    # (Previously scaled by /10 which caused inefficient routes that wasted km budget)
+    routing.SetArcCostEvaluatorOfAllVehicles(transit_callback_index)
     
     # Add Distance constraint
     dimension_name = 'Distance'
@@ -501,46 +542,144 @@ def solve_vrp(
     )
     distance_dimension = routing.GetDimensionOrDie(dimension_name)
     
-    # MAXIMIZE VISITS: Set very low arc cost coefficient
-    # This makes the solver prefer visiting more stops over minimizing distance
-    # The high drop penalties will push the solver to include as many visits as possible
-    distance_dimension.SetGlobalSpanCostCoefficient(1)  # Minimal cost for route length
+    # ─── SMART PACKING STRATEGY ───
+    # Goal: Fill each truck close to max_km/max_stops before using the next truck.
+    #
+    # 1. GlobalSpanCostCoefficient = 0  → Don't penalize route imbalance.
+    #    Let one truck fill up fully before another is used.
+    # 2. Fixed cost per vehicle         → Discourage opening extra trucks.
+    #    Solver packs visits into fewer trucks first.
+    # 3. High drop penalties (>> fixed cost) → Use a new truck rather than drop visits.
+    #    Ensures all trucks are used WHEN NEEDED.
+    #
+    # Relationship:  drop_penalty >> vehicle_fixed_cost >> typical_detour
+    # This guarantees: include visit > use new truck > minimize distance
+    distance_dimension.SetGlobalSpanCostCoefficient(0)
     
-    # Add waypoint count constraint (max_stops physical locations per route)
-    # Each combined node = 1 physical stop (multiple visits at same lat/lng count as 1 stop)
+    # Fixed cost per vehicle — solver will fill existing trucks before opening new ones
+    vehicle_fixed_cost = max_distance_per_vehicle * 3
+    routing.SetFixedCostOfAllVehicles(vehicle_fixed_cost)
+    logger.info(f"📦 Vehicle fixed cost: {vehicle_fixed_cost} (packs trucks before using new ones)")
+    
+    # ─── WAYPOINT COUNT CONSTRAINT ───
+    # When multiple visits are combined at the same location (same lat/lng),
+    # the solver treats them as ONE node. But max_stops should count INDIVIDUAL visits.
+    # So count_callback returns the number of individual visits inside each combined node.
+    
+    # Build a lookup: node_index -> number of individual visits
+    visits_per_node = {}
+    if visit_groups:
+        for node_idx in range(len(locations)):
+            if node_idx == start_index or node_idx == end_index:
+                visits_per_node[node_idx] = 0
+            elif node_idx < len(visit_groups) and visit_groups[node_idx]:
+                visits_per_node[node_idx] = len(visit_groups[node_idx])
+            else:
+                visits_per_node[node_idx] = 1
+    else:
+        for node_idx in range(len(locations)):
+            if node_idx == start_index or node_idx == end_index:
+                visits_per_node[node_idx] = 0
+            else:
+                visits_per_node[node_idx] = 1
+    
+    logger.info(f"📊 Visits per combined node: {', '.join(f'N{k}={v}' for k, v in visits_per_node.items() if v > 0)}")
+    
     def count_callback(from_index):
-        """Returns 1 for each physical stop node, 0 for start/end nodes."""
+        """Returns the number of INDIVIDUAL visits at this combined node."""
         from_node = manager.IndexToNode(from_index)
-        # Count as 1 if it's a visit node (not start or end)
-        # Combined visits at same location are already merged into one node
-        if from_node != start_index and from_node != end_index:
-            return 1
-        return 0
+        return visits_per_node.get(from_node, 0)
     
     count_callback_index = routing.RegisterUnaryTransitCallback(count_callback)
     
-    # Add dimension for physical stop count (max_stops)
+    # Add dimension for waypoint count
     waypoint_dimension_name = 'WaypointCount'
     routing.AddDimension(
         count_callback_index,
         0,  # no slack
-        max_waypoints,  # maximum physical stops per vehicle (combined locations)
+        max_waypoints,  # maximum individual visits per vehicle
         True,  # start cumul to zero
         waypoint_dimension_name
     )
     waypoint_dimension = routing.GetDimensionOrDie(waypoint_dimension_name)
     
-    # Build a mapping of order_id -> {'pickup': node_index, 'drop': node_index}
-    # Each combined location may contain multiple orders with different types
+    # ─── VRPTW: Time Dimension (travel time + service time + time windows) ───
+    # Service time per node = (service_time_per_visit × number_of_visits_at_node)
+    # A combined node with 5 visits takes 5×10min = 50min, not just 10min.
+    default_service_time = 600  # seconds (10 min) per individual visit
+    if service_times is None:
+        service_times = []
+        for i in range(len(locations)):
+            if i == start_index or i == end_index:
+                service_times.append(0)
+            else:
+                num_visits = visits_per_node.get(i, 1)
+                service_times.append(default_service_time * num_visits)
+    
+    def time_callback(from_index, to_index):
+        """Returns travel time + service time at the 'from' node."""
+        from_node = manager.IndexToNode(from_index)
+        to_node = manager.IndexToNode(to_index)
+        travel_time = duration_matrix[from_node][to_node]
+        svc_time = service_times[from_node] if from_node < len(service_times) else 0
+        return travel_time + svc_time
+    
+    time_callback_index = routing.RegisterTransitCallback(time_callback)
+    
+    # Add Time dimension — constrains total route duration
+    time_dimension_name = 'Time'
+    routing.AddDimension(
+        time_callback_index,
+        30 * 60,       # allow 30 min slack (waiting at time windows)
+        max_route_time,  # maximum route duration per vehicle (seconds)
+        False,         # Don't force start cumul to zero (allows flexible start)
+        time_dimension_name
+    )
+    time_dimension = routing.GetDimensionOrDie(time_dimension_name)
+    
+    # Apply time windows if provided (VRPTW)
+    has_time_windows = False
+    if time_windows:
+        for node in range(len(locations)):
+            if node == start_index or node == end_index:
+                continue
+            
+            if node < len(time_windows) and time_windows[node] is not None:
+                tw_start, tw_end = time_windows[node]
+                index = manager.NodeToIndex(node)
+                time_dimension.CumulVar(index).SetRange(tw_start, tw_end)
+                has_time_windows = True
+        
+        if has_time_windows:
+            logger.info(f"⏰ VRPTW: Time windows applied to visits")
+    
+    # Set start/end time constraints for all vehicles (shift window)
+    for vehicle_id in range(num_vehicles):
+        start_idx = routing.Start(vehicle_id)
+        end_idx = routing.End(vehicle_id)
+        time_dimension.CumulVar(start_idx).SetRange(0, max_route_time)
+        time_dimension.CumulVar(end_idx).SetRange(0, max_route_time)
+    
+    logger.info(f"⏱️  Time dimension: max {max_route_time/3600:.1f}h route, "
+                f"{default_service_time/60:.0f}min/stop service time, "
+                f"time windows: {'YES' if has_time_windows else 'NO'}")
+    
+    # ─── VRPPD: Build pickup-delivery pairs ───
+    # OR-Tools REQUIREMENT: Each node can appear in AT MOST ONE AddPickupAndDelivery pair.
+    # When visits are combined at the same location, multiple orders can map to the
+    # same node. We must deduplicate and enforce the one-pair-per-node rule.
+    
     order_map = {}
-    paired_nodes = set()
-    pickup_drop_pairs = []
+    paired_nodes = set()          # nodes that ended up in a constraint
+    pickup_drop_pairs = []        # unique (pickup_node, drop_node) constraints to add
+    nodes_used_in_pairs = set()   # tracks nodes already committed to a pair
+    seen_node_pairs = set()       # dedup (pickup_node, drop_node) combos
     
     logger.info(f"🔍 Building pickup-drop pairs from combined location info...")
     
     if combined_order_info:
+        # Step 1: Build order_map  — order_id -> {'pickup': node, 'drop': node}
         for node in range(len(locations)):
-            # Skip start and end nodes
             if node == start_index or node == end_index:
                 continue
             
@@ -549,7 +688,6 @@ def solve_vrp(
                 order_ids_at_node = info.get('order_ids', [])
                 visit_types_at_node = info.get('visit_types', [])
                 
-                # Process ALL order_ids and visit_types at this combined location
                 for order_id, visit_type in zip(order_ids_at_node, visit_types_at_node):
                     if order_id and visit_type:
                         if order_id not in order_map:
@@ -557,46 +695,87 @@ def solve_vrp(
                         
                         if visit_type.lower() in ['pickup', 'pick']:
                             order_map[order_id]['pickup'] = node
-                            logger.debug(f"  Found PICKUP for order {order_id} at node {node}")
                         elif visit_type.lower() in ['drop', 'delivery']:
                             order_map[order_id]['drop'] = node
-                            logger.debug(f"  Found DROP for order {order_id} at node {node}")
         
-        # Mark nodes that have both pickup and drop (at DIFFERENT locations)
+        # Step 2: Collect candidate pairs, sorted by priority (breached first)
+        candidate_pairs = []
         for order_id, nodes in order_map.items():
             if 'pickup' in nodes and 'drop' in nodes:
                 pickup_node = nodes['pickup']
                 drop_node = nodes['drop']
                 
-                # Only add constraint if pickup and drop are at DIFFERENT nodes
-                if pickup_node != drop_node:
-                    paired_nodes.add(pickup_node)
-                    paired_nodes.add(drop_node)
-                    pickup_drop_pairs.append({
-                        'order_id': order_id,
-                        'pickup_node': pickup_node,
-                        'drop_node': drop_node
-                    })
-                    logger.info(f"✅ Complete pair for order {order_id}: pickup node {pickup_node} -> drop node {drop_node}")
-                else:
-                    logger.info(f"📍 Order {order_id}: pickup and drop at SAME location (node {pickup_node}) - no constraint needed")
+                if pickup_node == drop_node:
+                    logger.info(f"📍 Order {order_id}: pickup and drop at SAME location (node {pickup_node}) — no constraint needed")
+                    continue
+                
+                # Get priority of the drop node for sorting
+                pri = priorities[drop_node] if drop_node < len(priorities) else 5
+                candidate_pairs.append({
+                    'order_id': order_id,
+                    'pickup_node': pickup_node,
+                    'drop_node': drop_node,
+                    'priority': pri
+                })
+                logger.info(f"✅ Complete pair for order {order_id}: pickup node {pickup_node} -> drop node {drop_node}")
             elif 'pickup' in nodes:
                 logger.warning(f"⚠️ Order {order_id} has PICKUP (node {nodes['pickup']}) but NO DROP")
             elif 'drop' in nodes:
                 logger.warning(f"⚠️ Order {order_id} has DROP (node {nodes['drop']}) but NO PICKUP")
+        
+        # Step 3: Select one pair per node (highest priority wins)
+        # Sort candidates so highest-priority pairs are picked first
+        candidate_pairs.sort(key=lambda p: p['priority'], reverse=True)
+        
+        skipped = 0
+        for pair in candidate_pairs:
+            pn = pair['pickup_node']
+            dn = pair['drop_node']
+            node_pair_key = (pn, dn)
+            
+            # Skip if this exact (pickup, drop) combo was already added
+            if node_pair_key in seen_node_pairs:
+                logger.info(f"⏭️  Skipping duplicate pair ({pn}->{dn}) for order {pair['order_id']}")
+                skipped += 1
+                continue
+            
+            # Skip if EITHER node is already committed to another pair
+            # (OR-Tools crashes if a node is in multiple AddPickupAndDelivery calls)
+            if pn in nodes_used_in_pairs or dn in nodes_used_in_pairs:
+                logger.info(f"⏭️  Skipping pair ({pn}->{dn}) for order {pair['order_id']} — "
+                            f"node {'%d' % pn if pn in nodes_used_in_pairs else '%d' % dn} already in another pair")
+                skipped += 1
+                continue
+            
+            # Accept this pair
+            seen_node_pairs.add(node_pair_key)
+            nodes_used_in_pairs.add(pn)
+            nodes_used_in_pairs.add(dn)
+            paired_nodes.add(pn)
+            paired_nodes.add(dn)
+            pickup_drop_pairs.append(pair)
+        
+        if skipped:
+            logger.info(f"⏭️  Skipped {skipped} pairs (duplicate or node-conflict). "
+                        f"Kept {len(pickup_drop_pairs)} safe pairs.")
     
-    # Add disjunctions for ALL visit nodes (including paired ones)
-    # This allows solver to always find a solution - unassigned visits go to unassigned list
-    # 
-    # Priority mapping (from priorities list):
-    # - priority 15+ = SLA breached (sla_days <= 0) -> Very high penalty
-    # - priority 8-9 = SLA 1-2 days -> High penalty
-    # - priority 7 = SLA 3 days -> Medium-high penalty
-    # - priority < 7 = SLA > 3 days -> Standard penalty
+    # ─── DROP PENALTIES (disjunctions) ───
+    # Penalties for NOT visiting a node. Calibrated relative to distances:
+    #   drop_penalty >> vehicle_fixed_cost >> typical_detour_distance
+    #
+    # With max_distance M and vehicle_fixed_cost = M*3:
+    #   base_drop_penalty  = M * 20  (>> vehicle fixed cost of M*3)
+    #
+    # This ensures:
+    #   - Solver always includes a visit if ANY truck can reach it
+    #   - Solver fills trucks before using new ones (fixed cost > detour)
+    #   - Solver opens new truck rather than drop a visit (penalty > fixed cost)
+    #   - SLA-breached visits get extreme penalties (practically never dropped)
     
-    base_penalty = 50000  # High base penalty - maximize all visits
+    base_penalty = max_distance_per_vehicle * 20
     
-    logger.info(f"Adding disjunctions for ALL visit nodes (solver will always find a solution)...")
+    logger.info(f"Adding disjunctions — base penalty: {base_penalty} "
+                f"(vehicle fixed cost: {vehicle_fixed_cost})")
     
     breached_count = 0
     urgent_count = 0
@@ -609,21 +788,21 @@ def solve_vrp(
         
         priority = priorities[node] if node < len(priorities) else 5
         
-        # Calculate penalty based on SLA urgency
+        # Penalty tiers — all >> vehicle_fixed_cost so solver uses trucks over dropping
         if priority >= 15:
-            node_penalty = base_penalty * 100  # 5,000,000
+            node_penalty = base_penalty * 10   # SLA BREACHED — never drop
             breached_count += 1
         elif priority >= 8:
-            node_penalty = base_penalty * 50   # 2,500,000
+            node_penalty = base_penalty * 5    # Urgent (SLA 1-2 days)
             urgent_count += 1
         elif priority >= 7:
-            node_penalty = base_penalty * 25   # 1,250,000
+            node_penalty = base_penalty * 3    # Warning (SLA 3 days)
         else:
-            node_penalty = base_penalty * 10   # 500,000
+            node_penalty = base_penalty * 2    # Normal
         
-        # Paired nodes get even higher penalty to encourage keeping pairs together
+        # Paired nodes (pickup-drop) get extra penalty to keep pairs together
         if node in paired_nodes:
-            node_penalty = node_penalty * 2  # Double penalty for paired nodes
+            node_penalty = node_penalty * 2
             paired_count += 1
         
         routing.AddDisjunction([manager.NodeToIndex(node)], node_penalty)
@@ -631,120 +810,89 @@ def solve_vrp(
     logger.info(f"✅ Added disjunctions for {len(locations) - 2} visit nodes")
     logger.info(f"   {breached_count} BREACHED, {urgent_count} urgent, {paired_count} in pairs")
     
-    # CRITICAL: Detect and resolve CONTRADICTORY pickup-drop constraints
-    # When locations are combined, we can get:
-    #   Order A: pickup node 12 -> drop node 1 (node 12 must come BEFORE node 1)
-    #   Order B: pickup node 1 -> drop node 12 (node 1 must come BEFORE node 12)
-    # These are IMPOSSIBLE to satisfy simultaneously and will CRASH the solver.
-    #
-    # Resolution: For each pair of nodes (A,B), count how many orders go A->B vs B->A.
-    # Keep only the MAJORITY direction. The minority direction orders lose their
-    # pickup-drop constraint but their visits still happen at the combined location.
-    
-    # Group pairs by node-pair (direction-agnostic)
-    edge_directions = {}  # (min_node, max_node) -> {'forward': [pairs], 'reverse': [pairs]}
+    # Add pickup and delivery constraints for complete pairs
+    # AddPickupAndDelivery enforces: same vehicle + pickup before drop
+    # IMPORTANT: Do NOT add explicit CumulVar ordering constraints (solver().Add)
+    # on disjunction nodes — when a node is dropped, its CumulVar is undefined,
+    # causing C++ segfaults in the OR-Tools constraint propagation engine.
     for pair in pickup_drop_pairs:
-        p, d = pair['pickup_node'], pair['drop_node']
-        edge_key = (min(p, d), max(p, d))
-        if edge_key not in edge_directions:
-            edge_directions[edge_key] = {'forward': [], 'reverse': []}
-        if p == edge_key[0]:
-            edge_directions[edge_key]['forward'].append(pair)
-        else:
-            edge_directions[edge_key]['reverse'].append(pair)
-    
-    # Filter out contradictory pairs
-    valid_pairs = []
-    skipped_pairs = []
-    for edge_key, directions in edge_directions.items():
-        fwd = directions['forward']
-        rev = directions['reverse']
-        
-        if fwd and rev:
-            # CONFLICT detected! Both directions exist between same two nodes
-            logger.warning(f"⚠️ CONFLICT: {len(fwd)} orders go node {edge_key[0]}→{edge_key[1]}, "
-                          f"{len(rev)} orders go node {edge_key[1]}→{edge_key[0]}")
-            
-            # Keep the majority direction, skip the minority
-            if len(fwd) >= len(rev):
-                valid_pairs.extend(fwd)
-                skipped_pairs.extend(rev)
-                logger.warning(f"   → Keeping {len(fwd)} forward pairs, skipping {len(rev)} reverse pairs")
-            else:
-                valid_pairs.extend(rev)
-                skipped_pairs.extend(fwd)
-                logger.warning(f"   → Keeping {len(rev)} reverse pairs, skipping {len(fwd)} forward pairs")
-        else:
-            # No conflict - add all pairs
-            valid_pairs.extend(fwd)
-            valid_pairs.extend(rev)
-    
-    if skipped_pairs:
-        logger.warning(f"⚠️ Skipped {len(skipped_pairs)} contradictory pickup-drop pairs to prevent solver crash")
-        for sp in skipped_pairs:
-            logger.warning(f"   Skipped order {sp['order_id']}: pickup {sp['pickup_node']} -> drop {sp['drop_node']}")
-    
-    # Add pickup and delivery constraints for VALID (non-contradictory) pairs only
-    # This ensures: same vehicle + pickup before drop (if both are scheduled)
-    added_count = 0
-    for pair in valid_pairs:
         pickup_index = manager.NodeToIndex(pair['pickup_node'])
         drop_index = manager.NodeToIndex(pair['drop_node'])
         
-        try:
-            # AddPickupAndDelivery enforces ordering and same-vehicle constraints
-            routing.AddPickupAndDelivery(pickup_index, drop_index)
-            
-            # Ensure they're on the same vehicle
-            routing.solver().Add(
-                routing.VehicleVar(pickup_index) == routing.VehicleVar(drop_index)
-            )
-            
-            # Ensure pickup comes before drop (cumulative distance constraint)
-            routing.solver().Add(
-                distance_dimension.CumulVar(pickup_index) <= distance_dimension.CumulVar(drop_index)
-            )
-            
-            added_count += 1
-            logger.info(f"Added pickup-drop pair for order {pair['order_id']}: pickup node {pair['pickup_node']} -> drop node {pair['drop_node']}")
-        except Exception as e:
-            logger.error(f"❌ Failed to add constraint for order {pair['order_id']}: {str(e)}")
+        # This single call handles: same vehicle + pickup-before-drop ordering
+        routing.AddPickupAndDelivery(pickup_index, drop_index)
+        
+        # Reinforce same-vehicle (safe with disjunctions — if one is dropped, both are)
+        routing.solver().Add(
+            routing.VehicleVar(pickup_index) == routing.VehicleVar(drop_index)
+        )
+        
+        logger.info(f"Added pickup-drop pair for order {pair['order_id']}: pickup node {pair['pickup_node']} -> drop node {pair['drop_node']}")
     
-    logger.info(f"✅ Finished adding {added_count} pickup-drop pairs (skipped {len(skipped_pairs)} conflicting)")
+    logger.info(f"✅ Finished adding {len(pickup_drop_pairs)} pickup-drop pairs")
     
-    # Setting first solution heuristic - optimized for MAXIMIZING VISITS
+    # ─── SOLVER SEARCH PARAMETERS ───
     logger.info("Setting up solver parameters...")
     search_parameters = pywrapcp.DefaultRoutingSearchParameters()
     
-    # Use PARALLEL_CHEAPEST_INSERTION - good for fitting many stops
+    # PARALLEL_CHEAPEST_INSERTION: inserts visits into cheapest position.
+    # Combined with high vehicle fixed costs, it fills existing trucks first.
     search_parameters.first_solution_strategy = (
         routing_enums_pb2.FirstSolutionStrategy.PARALLEL_CHEAPEST_INSERTION
     )
     
-    # Use GUIDED_LOCAL_SEARCH - better at finding solutions with more visits
+    # GUIDED_LOCAL_SEARCH: escapes local minima by penalizing repeated arcs.
+    # Good at moving visits between vehicles to find better packing.
     search_parameters.local_search_metaheuristic = (
         routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH
     )
     
-    # Dynamic time limit based on problem size
+    # Dynamic time limit — give solver enough time to explore multi-vehicle solutions
     num_nodes = len(locations)
-    if num_nodes <= 15:
+    if num_nodes <= 10:
         time_limit = 10
-    elif num_nodes <= 30:
-        time_limit = 20
+    elif num_nodes <= 20:
+        time_limit = 15
+    elif num_nodes <= 35:
+        time_limit = 25
     else:
-        time_limit = 30  # More time for large problems to maximize visits
+        time_limit = 40  # Large problems need more time for proper truck packing
     
     search_parameters.time_limit.seconds = time_limit
-    
-    # Log level for debugging (0 = silent, 1 = errors, 2 = warnings, 3 = info)
     search_parameters.log_search = False
     
-    logger.info(f"🚀 Starting solver with {num_vehicles} vehicles, {len(locations)} locations (max {max_waypoints} stops/truck), time limit: {time_limit}s...")
-    # Solve the problem
-    solution = None
+    logger.info(f"🚀 Starting solver: {num_vehicles} vehicles, {len(locations)} locations, "
+                f"max {max_distance_per_vehicle/1000:.0f}km/truck, max {max_waypoints} stops/truck, "
+                f"time limit: {time_limit}s")
+    
+    model_snap = log_memory("Model BUILT (pre-solve)", solver_snap)
+    model_build_time = time.time() - solver_start_time
+    logger.info(f"⏱️  Model build time: {model_build_time:.2f}s")
+    
+    # ─── SOLVE ───
+    # IMPORTANT: Stop tracemalloc before the C++ solver runs.
+    # tracemalloc hooks into Python's memory allocator; when OR-Tools' C++ code
+    # invokes Python callbacks (distance_callback, time_callback) during solving,
+    # the tracing can corrupt internal state and cause segfaults.
+    was_tracing = tracemalloc.is_tracing()
+    if was_tracing:
+        tracemalloc.stop()
+    
+    logger.info("🔧 Launching OR-Tools solver...")
+    # Flush all log handlers so we see the message even if the process crashes
+    for handler in logging.getLogger().handlers:
+        handler.flush()
+    sys.stdout.flush()
+    sys.stderr.flush()
+    
+    solve_start = time.time()
     try:
         solution = routing.SolveWithParameters(search_parameters)
+        solve_elapsed = time.time() - solve_start
+        
+        # Restart tracemalloc after solver finishes
+        if was_tracing:
+            tracemalloc.start()
         
         # Check solver status
         status = routing.status()
@@ -756,57 +904,36 @@ def solve_vrp(
             4: "ROUTING_INVALID"
         }
         status_name = status_names.get(status, f"UNKNOWN({status})")
-        logger.info(f"✅ Solver completed with status: {status_name}. Solution found: {solution is not None}")
+        logger.info(f"✅ Solver completed in {solve_elapsed:.2f}s — status: {status_name}, solution: {solution is not None}")
+        log_memory("Solver DONE", model_snap)
         
         if not solution:
             logger.error(f"❌ No solution found. Status: {status_name}")
             if status == 3:
                 logger.error("Solver timed out. Try reducing visits or increasing time limit.")
             elif status == 2:
-                logger.error("Solver failed - constraints may be infeasible.")
+                logger.error("Solver failed - constraints may be infeasible. Check pickup-drop pairs and distance limits.")
     except Exception as e:
-        logger.error(f"❌ Solver crashed with exception: {str(e)}", exc_info=True)
-        solution = None
+        solve_elapsed = time.time() - solve_start
+        logger.error(f"❌ Solver crashed after {solve_elapsed:.2f}s: {str(e)}", exc_info=True)
+        if was_tracing and not tracemalloc.is_tracing():
+            tracemalloc.start()
+        return None
     
     if solution:
         return extract_solution(
-            manager, routing, solution, locations, distance_matrix, 
-            start_index, end_index, num_vehicles, used_google_maps, max_waypoints,
+            manager, routing, solution, locations, distance_matrix, duration_matrix,
+            start_index, end_index, num_vehicles, distance_source, max_waypoints,
             combined_order_info, visit_groups, original_visits
         )
     else:
-        # FALLBACK: Return all visits as unassigned instead of failing
-        logger.warning("⚠️ No solution found - returning all visits as unassigned")
-        fallback_unassigned = []
-        if original_visits:
-            for visit in original_visits:
-                visit_id = visit.get('visitId') or visit.get('visit_id')
-                if visit_id:
-                    fallback_unassigned.append({
-                        "visitId": visit_id,
-                        "reason": "solver_no_solution"
-                    })
-        elif visit_groups:
-            for group in visit_groups:
-                for visit_id in group:
-                    fallback_unassigned.append({
-                        "visitId": visit_id,
-                        "reason": "solver_no_solution"
-                    })
-        
-        return {
-            "routes": [],
-            "unassigned_visits": fallback_unassigned,
-            "total_distance_km": 0,
-            "total_visits": 0,
-            "used_google_maps": used_google_maps,
-            "validation_errors": ["Solver could not find a solution - all visits returned as unassigned. Try increasing max_km or reducing constraints."]
-        }
+        logger.error("No solution found!")
+        return None
 
 
 def extract_solution(
-    manager, routing, solution, locations, distance_matrix, 
-    start_index, end_index, num_vehicles, used_google_maps: bool = False,
+    manager, routing, solution, locations, distance_matrix, duration_matrix,
+    start_index, end_index, num_vehicles, distance_source: str = "haversine",
     max_waypoints: int = MAX_WAYPOINTS_PER_ROUTE,
     combined_order_info: List[Dict] = None,
     visit_groups: List[List[str]] = None,
@@ -841,7 +968,6 @@ def extract_solution(
         stops = []
         sequence = 1
         route_nodes = [start_index]  # Track all nodes in order for distance calculation
-        prev_location = None  # Track previous location coordinates
         
         while not routing.IsEnd(index):
             node_index = manager.IndexToNode(index)
@@ -849,12 +975,6 @@ def extract_solution(
             # Add to stops if it's not start or end
             if node_index != start_index and node_index != end_index:
                 visit_info = locations[node_index]
-                current_location = (visit_info['lat'], visit_info['lng'])
-                
-                # Check if location changed from previous stop
-                # If location is same as previous, keep same sequence number
-                if prev_location is not None and current_location != prev_location:
-                    sequence += 1
                 
                 # If we have visit_groups, expand the combined visit to individual visits
                 if visit_groups and node_index < len(visit_groups):
@@ -885,7 +1005,7 @@ def extract_solution(
                                 stop_data["visit_type"] = original_visit['visit_type']
                         
                         stops.append(stop_data)
-                        # Note: All visits at the same location get the same sequence number
+                        # Note: We keep the same sequence for all visits at the same location
                 else:
                     # No visit groups - single visit at this location
                     stop_data = {
@@ -907,8 +1027,7 @@ def extract_solution(
                     
                     stops.append(stop_data)
                 
-                # Update previous location for next iteration
-                prev_location = current_location
+                sequence += 1
                 assigned_indices.add(node_index)
             
             previous_index = index
@@ -919,43 +1038,41 @@ def extract_solution(
             if next_node != route_nodes[-1]:  # Avoid duplicates
                 route_nodes.append(next_node)
         
-        # Calculate actual route distance from distance matrix
+        # Calculate actual route distance AND duration from matrices
         # Sum: start→stop1 + stop1→stop2 + ... + stopN→end
         route_distance_meters = 0
+        route_duration_seconds = 0
         for i in range(len(route_nodes) - 1):
             from_node = route_nodes[i]
             to_node = route_nodes[i + 1]
             route_distance_meters += distance_matrix[from_node][to_node]
+            route_duration_seconds += duration_matrix[from_node][to_node]
         
-        # Apply road distance factor
-        # If using Google Maps (used_google_maps=True), we have real road distances -> Factor 1.0
-        # If using Haversine (used_google_maps=False), we estimate -> Factor 1.3
-        ROAD_DISTANCE_FACTOR = 1.0 if used_google_maps else 1.3
+        # Apply road distance factor for display
+        # google_maps/osrm = real road distances (factor 1.0)
+        # haversine = straight-line, estimate road with 1.3x factor
+        ROAD_DISTANCE_FACTOR = 1.0 if distance_source in ("google_maps", "osrm") else 1.3
         estimated_road_distance_meters = route_distance_meters * ROAD_DISTANCE_FACTOR
+        
+        # Duration factor: haversine speed estimate is rough, add 15% buffer
+        DURATION_FACTOR = 1.0 if distance_source in ("google_maps", "osrm") else 1.15
+        estimated_duration_seconds = route_duration_seconds * DURATION_FACTOR
         
         # Only add route if it has stops
         if stops:
-            # Count physical stops (unique sequence numbers = unique locations)
-            physical_stop_count = len(set(stop['sequence'] for stop in stops))
+            # Enforce max waypoints limit - truncate if necessary
+            if len(stops) > max_waypoints:
+                logger.warning(f"Route for TRUCK_{vehicle_id + 1} has {len(stops)} stops, truncating to {max_waypoints}")
+                # Mark excess stops as unassigned
+                for excess_stop in stops[max_waypoints:]:
+                    unassigned_visits.append({
+                        "visitId": excess_stop['visitId'],
+                        "reason": "max_waypoints_exceeded"
+                    })
+                stops = stops[:max_waypoints]
             
-            # Enforce max waypoints limit based on PHYSICAL stops (locations), not individual visits
-            if physical_stop_count > max_waypoints:
-                logger.warning(f"Route for TRUCK_{vehicle_id + 1} has {physical_stop_count} physical stops, truncating to {max_waypoints}")
-                # Find the max allowed sequence number
-                max_allowed_sequence = sorted(set(stop['sequence'] for stop in stops))[max_waypoints - 1]
-                
-                # Keep stops up to max_allowed_sequence, mark the rest as unassigned
-                kept_stops = []
-                for stop in stops:
-                    if stop['sequence'] <= max_allowed_sequence:
-                        kept_stops.append(stop)
-                    else:
-                        unassigned_visits.append({
-                            "visitId": stop['visitId'],
-                            "reason": "max_stops_exceeded"
-                        })
-                stops = kept_stops
-                physical_stop_count = max_waypoints
+            estimated_km = round(estimated_road_distance_meters / 1000, 2)
+            estimated_hours = round(estimated_duration_seconds / 3600, 2)
             
             routes.append({
                 "truckId": f"TRUCK_{vehicle_id + 1}",
@@ -968,27 +1085,26 @@ def extract_solution(
                     "lng": locations[end_index]['lng']
                 },
                 "stops": stops,
-                "estimated_km": round(estimated_road_distance_meters / 1000, 2),
-                "waypoint_count": physical_stop_count
+                "estimated_km": estimated_km,
+                "estimated_hours": estimated_hours,
+                "distance_source": distance_source,
+                "waypoint_count": len(stops)
             })
     
-    # Find unassigned visits - expand combined visit groups back to individual visits
+    # Find unassigned visits
     for i, location in enumerate(locations):
         if i not in assigned_indices and 'visitId' in location:
-            reason = "max_stops_exceeded" if solution else "max_km_exceeded"
+            reason = "max_km_exceeded"
             
-            # If we have visit_groups, expand the combined node to all individual visits
-            if visit_groups and i < len(visit_groups) and visit_groups[i]:
-                for visit_id in visit_groups[i]:
-                    unassigned_visits.append({
-                        "visitId": visit_id,
-                        "reason": reason
-                    })
-            else:
-                unassigned_visits.append({
-                    "visitId": location['visitId'],
-                    "reason": reason
-                })
+            # Check if it's due to distance constraint
+            if solution:
+                # Could be due to capacity or optimization
+                reason = "optimization_constraint"
+            
+            unassigned_visits.append({
+                "visitId": location['visitId'],
+                "reason": reason
+            })
     
     # Post-process: Ensure pickup-drop pairs are complete
     # If one part of a pair is assigned and other is not, move the assigned one to unassigned
@@ -1143,13 +1259,18 @@ def extract_solution(
 @auto_routing_bp.route("/optimize", methods=["POST"])
 def optimize_routes():
     """
-    API endpoint to optimize truck routes
+    Hybrid VRP Optimizer: CVRP + VRPPD + VRPTW
+    
+    Solves routing with capacity constraints, pickup-delivery pairs, and time windows.
+    Uses real road distances via OSRM (free) or Google Maps API.
     
     Expected JSON input:
     {
         "trucks": 3,
         "max_km": 120,
-        "max_stops": 15,          // Optional: max stops per truck (default: 25)
+        "max_stops": 25,               // Optional, default 25 — max stops per truck
+        "shift_duration_hours": 10,     // Optional, default 10 — max hours per driver shift
+        "service_time_minutes": 10,     // Optional, default 10 — minutes spent at each stop
         "start": { "lat": 12.97, "lng": 77.59 },
         "end": { "lat": 12.93, "lng": 77.62 },
         "visits": [
@@ -1158,16 +1279,18 @@ def optimize_routes():
                 "lat": 12.95, 
                 "lng": 77.60, 
                 "sla_days": 0,
-                "order_id": "ORD123",  // Optional
-                "visit_type": "pickup"  // Optional: "pickup" or "drop"
+                "order_id": "ORD123",       // Optional
+                "visit_type": "pickup",     // Optional: "pickup" or "drop"
+                "time_window_start": 60,    // Optional: earliest arrival (min from shift start)
+                "time_window_end": 300      // Optional: latest arrival (min from shift start)
             },
             { 
                 "visitId": "V2", 
                 "lat": 12.99, 
                 "lng": 77.61, 
                 "sla_days": 3,
-                "order_id": "ORD123",  // Optional
-                "visit_type": "drop"  // Optional: "pickup" or "drop"
+                "order_id": "ORD123",       // Optional
+                "visit_type": "drop"        // Optional: "pickup" or "drop"
             }
         ]
     }
@@ -1193,15 +1316,22 @@ def optimize_routes():
             }
         ],
         "unassigned_visits": [
-            { "visitId": "V2", "reason": "max_stops_exceeded" }
+            { "visitId": "V2", "reason": "max_km_exceeded" }
         ]
     }
     """
     try:
+        # ─── Start memory + time tracking ───
+        if not tracemalloc.is_tracing():
+            tracemalloc.start()
+        api_start_time = time.time()
+        api_snap = log_memory("API START")
+        
         data = request.get_json()
         
         # Validate input
         if not data:
+            tracemalloc.stop()
             return jsonify({"error": "No JSON data provided"}), 400
         
         required_fields = ["trucks", "max_km", "start", "end", "visits"]
@@ -1211,7 +1341,9 @@ def optimize_routes():
         
         num_trucks = data["trucks"]
         max_km = data["max_km"]
-        max_stops = data.get("max_stops", MAX_WAYPOINTS_PER_ROUTE)  # Optional, default 25
+        max_stops = data.get("max_stops", MAX_WAYPOINTS_PER_ROUTE)  # Default 25
+        shift_duration_hours = data.get("shift_duration_hours", 10)  # Default 10h shift
+        service_time_minutes = data.get("service_time_minutes", 10)  # Default 10min per stop
         start_point = data["start"]
         end_point = data["end"]
         visits = data["visits"]
@@ -1222,14 +1354,6 @@ def optimize_routes():
         
         if not isinstance(max_km, (int, float)) or max_km <= 0:
             return jsonify({"error": "max_km must be a positive number"}), 400
-        
-        if not isinstance(max_stops, int) or max_stops <= 0:
-            return jsonify({"error": "max_stops must be a positive integer"}), 400
-        
-        # Cap max_stops to the hard limit
-        if max_stops > MAX_WAYPOINTS_PER_ROUTE:
-            logger.warning(f"⚠️ max_stops ({max_stops}) exceeds hard limit ({MAX_WAYPOINTS_PER_ROUTE}), capping to {MAX_WAYPOINTS_PER_ROUTE}")
-            max_stops = MAX_WAYPOINTS_PER_ROUTE
         
         if not isinstance(visits, list) or len(visits) == 0:
             return jsonify({"error": "visits must be a non-empty list"}), 400
@@ -1246,7 +1370,10 @@ def optimize_routes():
                 if field not in visit:
                     return jsonify({"error": f"Visit {i} missing required field: {field}"}), 400
         
-        logger.info(f"Received routing request: {num_trucks} trucks, max {max_km}km, max {max_stops} stops/truck, {len(visits)} visits")
+        logger.info(f"🚛 Hybrid VRP (CVRP+VRPPD+VRPTW): {num_trucks} trucks, "
+                     f"max {max_km}km, max {max_stops} stops/truck, "
+                     f"{shift_duration_hours}h shift, {service_time_minutes}min/stop, "
+                     f"{len(visits)} visits")
         
         # Extract order_ids and visit_types from original visits
         original_order_ids = []
@@ -1326,8 +1453,13 @@ def optimize_routes():
         start_index = 0
         end_index = len(locations) - 1
         
-        # Create distance matrix using combined locations
-        distance_matrix, used_google_maps = create_distance_matrix(locations)
+        # Create distance + duration matrices using combined locations
+        # Priority: Google Maps → OSRM (free road distances) → Haversine (fallback)
+        matrix_start = time.time()
+        distance_matrix, duration_matrix, distance_source = create_distance_matrix(locations)
+        matrix_elapsed = time.time() - matrix_start
+        matrix_snap = log_memory("Distance matrix BUILT", api_snap)
+        logger.info(f"⏱️  Distance matrix: {len(locations)}x{len(locations)} built in {matrix_elapsed:.2f}s")
         
         # Create priority list (inverse of SLA days - lower SLA = higher priority)
         priorities = [5]  # Start point - neutral priority
@@ -1353,26 +1485,67 @@ def optimize_routes():
         # [None (start), ...visit groups..., None (end)]
         aligned_visit_groups = [None] + visit_groups + [None]
         
-        # Convert max_km to meters
-        max_distance_meters = int(max_km * 1000)
+        # ─── Build time windows from visit data (VRPTW) ───
+        # time_window_start/end are in MINUTES from shift start
+        # Convert to seconds for the solver
+        aligned_time_windows = [None]  # None for start node
+        has_any_time_window = False
+        for visit in combined_visits:
+            tw_start = visit.get("time_window_start")
+            tw_end = visit.get("time_window_end")
+            if tw_start is not None and tw_end is not None:
+                aligned_time_windows.append((int(tw_start * 60), int(tw_end * 60)))
+                has_any_time_window = True
+            else:
+                aligned_time_windows.append(None)
+        aligned_time_windows.append(None)  # None for end node
         
-        # Solve the VRP
+        # Build service times aligned with locations (seconds)
+        # A combined node with N visits gets N × service_time (e.g., 5 visits × 10min = 50min)
+        aligned_service_times = [0]  # 0 for start
+        svc_seconds = int(service_time_minutes * 60)
+        for idx, _ in enumerate(combined_visits):
+            # visit_groups[idx] contains the list of visit IDs at this combined location
+            num_visits_at_node = len(visit_groups[idx]) if idx < len(visit_groups) and visit_groups[idx] else 1
+            aligned_service_times.append(svc_seconds * num_visits_at_node)
+        aligned_service_times.append(0)  # 0 for end
+        
+        # Convert max_km to meters, accounting for Haversine underestimation
+        # OSRM and Google Maps give real road distances; Haversine is ~30% shorter
+        ROAD_DISTANCE_FACTOR = 1.0 if distance_source in ("google_maps", "osrm") else 1.3
+        max_distance_meters = int(max_km * 1000 / ROAD_DISTANCE_FACTOR)
+        
+        # Convert shift duration to seconds
+        max_route_time = int(shift_duration_hours * 3600)
+        
+        logger.info(f"📏 Distance: {max_km}km limit → {max_distance_meters/1000:.1f}km solver "
+                     f"(source: {distance_source}, factor: {ROAD_DISTANCE_FACTOR}x)")
+        logger.info(f"⏰ Time: {shift_duration_hours}h shift, {service_time_minutes}min/stop, "
+                     f"time windows: {'YES' if has_any_time_window else 'NO'}")
+        
+        # Solve the Hybrid VRP (CVRP + VRPPD + VRPTW)
         result = solve_vrp(
             num_vehicles=num_trucks,
             max_distance_per_vehicle=max_distance_meters,
             locations=locations,
             distance_matrix=distance_matrix,
+            duration_matrix=duration_matrix,
             start_index=start_index,
             end_index=end_index,
             priorities=priorities,
-            used_google_maps=used_google_maps,
+            distance_source=distance_source,
             max_waypoints=max_stops,
             combined_order_info=aligned_order_info,
             visit_groups=aligned_visit_groups,
-            original_visits=visits  # Pass original visits for expanding in output
+            original_visits=visits,
+            time_windows=aligned_time_windows if has_any_time_window else None,
+            service_times=aligned_service_times,
+            max_route_time=max_route_time
         )
         
         if result is None:
+            if tracemalloc.is_tracing():
+                tracemalloc.stop()
             return jsonify({
                 "error": "Could not find a solution for the given constraints",
                 "suggestion": "Try increasing max_km or number of trucks"
@@ -1383,12 +1556,44 @@ def optimize_routes():
             result['unassigned_visits'].extend(filtered_excluded_visits)
             logger.info(f"Added {len(filtered_excluded_visits)} filtered visits to unassigned list")
         
-        logger.info(f"Solution found: {len(result['routes'])} routes, {len(result['unassigned_visits'])} unassigned visits")
+        # Log route utilization summary
+        total_assigned = 0
+        for route in result['routes']:
+            num_stops = route['waypoint_count']
+            est_km = route['estimated_km']
+            est_hrs = route.get('estimated_hours', 0)
+            util_km = (est_km / max_km * 100) if max_km > 0 else 0
+            util_stops = (num_stops / max_stops * 100) if max_stops > 0 else 0
+            util_time = (est_hrs / shift_duration_hours * 100) if shift_duration_hours > 0 else 0
+            total_assigned += num_stops
+            logger.info(f"📊 {route['truckId']}: {num_stops} stops ({util_stops:.0f}%), "
+                        f"{est_km:.1f}km ({util_km:.0f}%), "
+                        f"{est_hrs:.1f}h ({util_time:.0f}%) — "
+                        f"[{distance_source}]")
+        
+        logger.info(f"✅ Solution: {len(result['routes'])} routes, {total_assigned} assigned, "
+                     f"{len(result['unassigned_visits'])} unassigned out of {len(visits)} total visits")
+        
+        # ─── Final memory + timing summary ───
+        total_elapsed = time.time() - api_start_time
+        current_mem, peak_mem = tracemalloc.get_traced_memory()
+        tracemalloc.stop()
+        
+        logger.info(f"{'='*60}")
+        logger.info(f"🧠 MEMORY SUMMARY:")
+        logger.info(f"   Peak RAM used:    {peak_mem / (1024*1024):.2f} MB")
+        logger.info(f"   Final RAM used:   {current_mem / (1024*1024):.2f} MB")
+        logger.info(f"⏱️  TIMING SUMMARY:")
+        logger.info(f"   Total API time:   {total_elapsed:.2f}s")
+        logger.info(f"{'='*60}")
         
         return jsonify(result), 200
         
     except Exception as e:
         logger.error(f"Error in optimize_routes: {str(e)}", exc_info=True)
+        # Stop tracemalloc if it was started
+        if tracemalloc.is_tracing():
+            tracemalloc.stop()
         return jsonify({"error": f"Internal server error: {str(e)}"}), 500
 
 

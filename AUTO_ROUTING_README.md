@@ -1,27 +1,37 @@
-# Auto Routing API Documentation
+# Auto Routing API — Hybrid VRP Optimizer
 
-Intelligent vehicle routing optimization API using Google OR-Tools for multi-vehicle delivery route planning.
+Intelligent vehicle routing optimization API using **Google OR-Tools** to solve a **Hybrid VRP: CVRP + VRPPD + VRPTW**.
 
 ## Overview
 
-The Auto Routing API optimizes delivery routes for multiple vehicles while respecting distance constraints, SLA priorities, and pickup-drop pair requirements. It uses Google OR-Tools' constraint solver to maximize visit coverage while minimizing total distance traveled.
+The Auto Routing API optimizes delivery routes for multiple vehicles by combining three VRP variants into a single solver:
+
+| Variant | Full Name | What It Handles |
+|---------|-----------|-----------------|
+| **CVRP** | Capacitated VRP | Max distance (km) and max stops per vehicle |
+| **VRPPD** | VRP with Pickup & Delivery | Pickup-drop pairs on the same vehicle, in order |
+| **VRPTW** | VRP with Time Windows | Visit-level time window constraints and shift limits |
+
+The solver maximizes visit coverage (prioritizing SLA-breached visits) while minimizing total travel distance.
 
 ## Features
 
-- ✅ **Multi-vehicle route optimization** with distance constraints
-- ✅ **SLA-based priority routing** (breached, urgent, warning, normal)
-- ✅ **Pickup-drop pair constraints** for order fulfillment
-- ✅ **Google Maps integration** for accurate road distances
-- ✅ **Smart visit combining** at same locations
-- ✅ **Waypoint limits** (max 25 stops per route)
-- ✅ **Flexible solver** that maximizes visit coverage
-- ✅ **Automatic fallback** to Haversine distance calculation
+- **Hybrid VRP Solver** — CVRP + VRPPD + VRPTW in one optimization pass
+- **Real Road Distances** — Google Maps API (paid) → OSRM (free) → Haversine (fallback)
+- **SLA-Based Priority Routing** — Breached, urgent, warning, normal tiers
+- **Pickup-Drop Pair Constraints** — Same vehicle, pickup before drop, no cross-truck pairs
+- **Time Windows** — Optional per-visit earliest/latest arrival constraints
+- **Shift Duration Limits** — Max hours per driver shift
+- **Service Time Modeling** — Configurable minutes per stop (scales for combined locations)
+- **Smart Location Combining** — Multiple visits at the same coordinates = 1 solver node
+- **Vehicle Cost Optimization** — Fills trucks before using new ones (fixed cost per vehicle)
+- **Memory & Timing Telemetry** — RAM usage and execution time logged per request
+- **Configurable Waypoint Limits** — Default 25, adjustable via `max_stops`
+- **Auto-Scaling Solver Time** — 10–40 seconds based on problem size
 
 ## API Endpoint
 
-**Endpoint:** `POST /api/auto-routing/optimize`
-
-Optimizes delivery routes for multiple vehicles with pickup-drop constraints.
+**`POST /api/auto-routing/optimize`**
 
 ## Request Format
 
@@ -29,40 +39,37 @@ Optimizes delivery routes for multiple vehicles with pickup-drop constraints.
 
 ```json
 {
-  "num_vehicles": 3,
-  "max_distance_per_vehicle_km": 100,
-  "start_location": {
-    "lat": 28.6139,
-    "lng": 77.2090
-  },
-  "end_location": {
-    "lat": 28.6139,
-    "lng": 77.2090
-  },
+  "trucks": 3,
+  "max_km": 120,
+  "max_stops": 25,
+  "shift_duration_hours": 10,
+  "service_time_minutes": 10,
+  "start": { "lat": 12.97, "lng": 77.59 },
+  "end": { "lat": 12.93, "lng": 77.62 },
   "visits": [
     {
-      "visitId": "v1",
-      "lat": 28.7041,
-      "lng": 77.1025,
-      "sla_days": 1,
-      "order_id": "order_123",
-      "visit_type": "pickup"
+      "visitId": "V1",
+      "lat": 12.95,
+      "lng": 77.60,
+      "sla_days": 0,
+      "order_id": "ORD123",
+      "visit_type": "pickup",
+      "time_window_start": 60,
+      "time_window_end": 300
     },
     {
-      "visitId": "v2",
-      "lat": 28.5355,
-      "lng": 77.3910,
-      "sla_days": 1,
-      "order_id": "order_123",
+      "visitId": "V2",
+      "lat": 12.99,
+      "lng": 77.61,
+      "sla_days": 3,
+      "order_id": "ORD123",
       "visit_type": "drop"
     },
     {
-      "visitId": "v3",
-      "lat": 28.6500,
-      "lng": 77.2167,
-      "sla_days": 0,
-      "order_id": null,
-      "visit_type": null
+      "visitId": "V3",
+      "lat": 13.01,
+      "lng": 77.63,
+      "sla_days": 5
     }
   ]
 }
@@ -70,24 +77,32 @@ Optimizes delivery routes for multiple vehicles with pickup-drop constraints.
 
 ### Request Parameters
 
-| Parameter | Type | Required | Description |
-|-----------|------|----------|-------------|
-| `num_vehicles` | integer | Yes | Number of vehicles available for routing |
-| `max_distance_per_vehicle_km` | number | Yes | Maximum distance each vehicle can travel (in km) |
-| `start_location` | object | Yes | Starting location with `lat` and `lng` |
-| `end_location` | object | Yes | Ending location with `lat` and `lng` |
-| `visits` | array | Yes | List of visit objects to be routed |
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `trucks` | integer | **Yes** | — | Number of vehicles available |
+| `max_km` | number | **Yes** | — | Maximum distance each vehicle can travel (km) |
+| `start` | object | **Yes** | — | Start location `{ "lat", "lng" }` |
+| `end` | object | **Yes** | — | End location `{ "lat", "lng" }` |
+| `visits` | array | **Yes** | — | List of visit objects |
+| `max_stops` | integer | No | `25` | Maximum stops per truck (individual visits, not combined nodes) |
+| `shift_duration_hours` | number | No | `10` | Maximum hours per driver shift |
+| `service_time_minutes` | number | No | `10` | Minutes spent at each stop (scales for combined locations) |
+| `max_visits_for_routing` | integer | No | `80` | Auto-filter threshold; larger datasets are trimmed by SLA priority |
+| `max_unique_locations` | integer | No | `40` | Max unique locations passed to solver after combining |
+| `sla_threshold` | integer | No | `3` | SLA cutoff for priority filtering |
 
 ### Visit Object
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `visitId` | string | Yes | Unique identifier for the visit |
-| `lat` | number | Yes | Latitude of visit location |
-| `lng` | number | Yes | Longitude of visit location |
-| `sla_days` | integer | No | Days until SLA breach (default: 5) |
-| `order_id` | string | No | Order ID for pickup-drop pairing |
-| `visit_type` | string | No | Type: "pickup", "drop", "delivery", or null |
+| `visitId` | string | **Yes** | Unique identifier for the visit |
+| `lat` | number | **Yes** | Latitude |
+| `lng` | number | **Yes** | Longitude |
+| `sla_days` | integer | **Yes** | Days until SLA breach (≤0 = already breached) |
+| `order_id` | string | No | Order ID — links pickup-drop pairs |
+| `visit_type` | string | No | `"pickup"`, `"drop"`, `"delivery"`, or `null` |
+| `time_window_start` | number | No | Earliest arrival in **minutes** from shift start |
+| `time_window_end` | number | No | Latest arrival in **minutes** from shift start |
 
 ## Response Format
 
@@ -95,160 +110,261 @@ Optimizes delivery routes for multiple vehicles with pickup-drop constraints.
 {
   "routes": [
     {
-      "vehicle_id": 0,
+      "truckId": "TRUCK_1",
+      "start": { "lat": 12.97, "lng": 77.59 },
+      "end": { "lat": 12.93, "lng": 77.62 },
       "stops": [
         {
-          "visitIds": ["v1", "v4"],
-          "location": {
-            "lat": 28.7041,
-            "lng": 77.1025
-          },
-          "distance_from_previous_km": 12.5,
-          "cumulative_distance_km": 12.5
+          "visitId": "V1",
+          "lat": 12.95,
+          "lng": 77.60,
+          "sequence": 1,
+          "order_id": "ORD123",
+          "visit_type": "pickup"
         },
         {
-          "visitIds": ["v2"],
-          "location": {
-            "lat": 28.5355,
-            "lng": 77.3910
-          },
-          "distance_from_previous_km": 18.3,
-          "cumulative_distance_km": 30.8
+          "visitId": "V2",
+          "lat": 12.99,
+          "lng": 77.61,
+          "sequence": 2,
+          "order_id": "ORD123",
+          "visit_type": "drop"
         }
       ],
-      "total_distance_km": 45.3,
-      "total_stops": 2,
-      "total_visits": 3
+      "estimated_km": 38.4,
+      "estimated_hours": 2.15,
+      "distance_source": "google_maps",
+      "waypoint_count": 2
     }
   ],
   "unassigned_visits": [
-    {
-      "visitId": "v99",
-      "reason": "exceeds_distance_constraint"
-    }
+    { "visitId": "V3", "reason": "optimization_constraint" }
   ],
-  "total_distance_km": 120.5,
-  "distance_calculation_method": "google_maps",
-  "total_vehicles_used": 2,
-  "total_visits_assigned": 15,
-  "total_visits_unassigned": 3
+  "validation_errors": null
 }
 ```
 
-### Response Fields
+### Route Object
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `routes` | array | List of optimized routes for each vehicle |
-| `unassigned_visits` | array | Visits that couldn't be assigned |
-| `total_distance_km` | number | Total distance across all routes |
-| `distance_calculation_method` | string | "google_maps" or "haversine" |
-| `total_vehicles_used` | integer | Number of vehicles with assigned routes |
-| `total_visits_assigned` | integer | Total visits successfully routed |
-| `total_visits_unassigned` | integer | Total visits not routed |
+| `truckId` | string | Vehicle identifier (`TRUCK_1`, `TRUCK_2`, …) |
+| `start` | object | Start location `{ "lat", "lng" }` |
+| `end` | object | End location `{ "lat", "lng" }` |
+| `stops` | array | Ordered list of stops with visit details |
+| `estimated_km` | number | Estimated route distance in km |
+| `estimated_hours` | number | Estimated route duration in hours (travel + service time) |
+| `distance_source` | string | `"google_maps"`, `"osrm"`, or `"haversine"` |
+| `waypoint_count` | integer | Number of individual visits on this route |
 
-## SLA Priority System
+### Unassigned Visit Reasons
 
-The API prioritizes visits based on SLA urgency:
+| Reason | Description |
+|--------|-------------|
+| `max_km_exceeded` | Visit would exceed vehicle's max distance |
+| `max_waypoints_exceeded` | Route would exceed `max_stops` limit |
+| `optimization_constraint` | Solver could not fit visit within all constraints |
+| `filtered_by_priority` | Excluded during SLA-based pre-filtering (large datasets) |
+| `filtered_by_location_limit` | Excluded because unique locations exceeded solver limit |
+| `incomplete_pair_no_pickup` | Drop visit whose pickup wasn't routable |
+| `drop_rescheduled_pickup_in_route` | Drop unassigned; its pickup is in a route |
 
-### Priority Levels
+### Validation Errors
 
-1. **CRITICAL** (sla_days ≤ 0)
-   - SLA already breached
-   - Must complete today
-   - Highest penalty for dropping
-   - Always included if possible
+The response includes a `validation_errors` field. If `null`, all pickup-drop constraints are satisfied. Otherwise, it lists violations like:
 
-2. **URGENT** (sla_days 1-2)
-   - About to breach within 1-2 days
-   - High priority
-   - Strong preference for inclusion
-
-3. **WARNING** (sla_days = 3)
-   - Close to breach
-   - Medium priority
-   - Included after critical and urgent
-
-4. **NORMAL** (sla_days > 3)
-   - Standard priority
-   - Included to fill remaining capacity
-
-## Routing Constraints
-
-### Distance Constraint
-- Each vehicle has a maximum travel distance (`max_distance_per_vehicle_km`)
-- Routes exceeding this limit are not allowed
-- Visits that would exceed the limit are marked as unassigned
-
-### Waypoint Limit
-- Maximum **25 physical stops** per route
-- Multiple visits at the same location count as **1 stop**
-- Prevents exceeding Google Maps waypoint limits
-
-### Pickup-Drop Constraints
-For visits with the same `order_id`:
-- **Same Vehicle**: Pickup and drop must be on the same vehicle
-- **Ordering**: Pickup must occur before drop
-- **Optional**: If constraints can't be met, both visits may be unassigned
-
-### Location Combining
-- Visits within ~11 meters (0.0001 degrees) are combined into one stop
-- Reduces total stops and improves efficiency
-- **Exception**: Pickup-drop pairs at different locations are kept separate
+- Pickup and drop on different trucks (cross-truck)
+- Drop sequenced before pickup on the same truck
 
 ## Distance Calculation
 
-### Google Maps Distance Matrix API (Primary)
-- Uses actual road distances
-- Accounts for traffic patterns
-- More accurate for urban routing
-- Requires `GOOGLE_MAPS_API_KEY` environment variable
+The API uses a **3-tier fallback** system for real road distances:
 
-### Haversine Formula (Fallback)
-- Calculates straight-line distances
-- Used when Google Maps API is unavailable
-- Less accurate but always available
+### 1. Google Maps Distance Matrix API (Primary)
+
+- **Type:** Paid, most accurate
+- Real road distances and travel durations
+- Requires `GOOGLE_MAPS_API_KEY` environment variable
+- Batched in chunks of 25 destinations per origin
+
+### 2. OSRM — Open Source Routing Machine (Secondary)
+
+- **Type:** Free, real road distances
+- Uses the OSRM Table API for distance and duration matrices
+- Default: public demo server (`http://router.project-osrm.org`)
+- Self-hosted option for production:
+  ```bash
+  docker run -t -v "${PWD}:/data" ghcr.io/project-osrm/osrm-backend osrm-routed --algorithm mld /data/region.osrm
+  ```
+- Set via `OSRM_BASE_URL` environment variable
+
+### 3. Haversine Formula (Fallback)
+
+- **Type:** Free, straight-line estimate
+- Calculates great-circle distance between two points
+- Travel duration estimated at average city speed (25 km/h)
+- A **1.3× road distance factor** is applied to account for Haversine underestimation
+- Used only when both Google Maps and OSRM are unavailable
+
+## SLA Priority System
+
+Visits are prioritized by SLA urgency. Higher-priority visits incur much larger penalties if dropped by the solver.
+
+### Priority Tiers
+
+| Tier | SLA Days | Description | Drop Penalty Multiplier |
+|------|----------|-------------|------------------------|
+| **CRITICAL** | ≤ 0 | SLA already breached | 10× base |
+| **URGENT** | 1–2 | About to breach | 5× base |
+| **WARNING** | 3 | Close to breach | 3× base |
+| **NORMAL** | > 3 | Standard priority | 2× base |
+
+- **Base penalty** = `max_distance_per_vehicle × 20`
+- Pickup-drop paired visits receive an additional **2× multiplier**
+- Combined effect: dropping a breached paired visit costs **20× base penalty**, making it extremely unlikely
+
+## Routing Constraints
+
+### Distance Constraint (CVRP)
+
+- Each vehicle has a maximum travel distance (`max_km`)
+- For Haversine source: solver limit is `max_km / 1.3` to compensate for straight-line underestimation
+- For Google Maps / OSRM: solver uses `max_km` directly (real road distances)
+
+### Waypoint Limit (CVRP)
+
+- Configurable via `max_stops` (default 25)
+- Counts **individual visits**, not combined nodes
+- Example: a combined location with 3 visits counts as 3 toward the limit
+
+### Time Constraint (VRPTW)
+
+- Each vehicle is limited by `shift_duration_hours` (default 10 hours)
+- Service time at each stop = `service_time_minutes` × number of visits at that location
+- Optional per-visit time windows: `time_window_start` / `time_window_end` (minutes from shift start)
+
+### Pickup-Drop Constraints (VRPPD)
+
+For visits sharing the same `order_id`:
+- **Same Vehicle:** Pickup and drop are assigned to the same truck
+- **Ordering:** Pickup is visited before drop (enforced by `AddPickupAndDelivery`)
+- **No Cross-Truck:** Validated post-solve; violations are flagged in `validation_errors`
+- **Disjunctions:** If constraints can't be met, both pickup and drop may be unassigned
+- **One Pair Per Node:** Each solver node can belong to at most one pickup-delivery pair (required by OR-Tools)
+
+### Location Combining
+
+- Visits within **~11 meters** (0.0001°) are combined into a single solver node
+- Reduces solver complexity and API calls
+- After solving, combined nodes are expanded back into individual visits
+- The solver's internal waypoint counter accounts for expanded visits at each combined node
+
+### Vehicle Fixed Cost
+
+- A fixed cost is added per vehicle used: `max_distance × 3`
+- Encourages the solver to **fill existing trucks** before activating new ones
+- Prevents unnecessary vehicle usage when visits fit on fewer trucks
+
+## Optimization Strategy
+
+### Solver Configuration
+
+| Setting | Value | Purpose |
+|---------|-------|---------|
+| First Solution Strategy | `PARALLEL_CHEAPEST_INSERTION` | Fast initial solution via parallel heuristic |
+| Local Search Metaheuristic | `GUIDED_LOCAL_SEARCH` | Escapes local optima for better solutions |
+| Global Span Cost Coefficient | `0` | No pressure for balanced routes; fill trucks naturally |
+| Time Limit | 10–40s (dynamic) | Based on number of nodes |
+
+### Dynamic Solver Time
+
+| Problem Size | Time Limit |
+|--------------|------------|
+| < 15 nodes | 10 seconds |
+| 15–25 nodes | 20 seconds |
+| 26–35 nodes | 30 seconds |
+| > 35 nodes | 40 seconds |
+
+### How the Solver Decides
+
+1. **High drop penalties** make it very expensive to leave visits unassigned
+2. **Vehicle fixed costs** encourage filling trucks before using new ones
+3. **SLA priorities** ensure breached/urgent visits are assigned first
+4. **Distance minimization** produces efficient routes after coverage is maximized
+5. **Pickup-delivery pairs** are kept together on the same vehicle
+6. **Time windows** (if provided) constrain when visits can be served
+
+## Memory & Performance Telemetry
+
+Each request logs memory and timing information:
+
+```
+🧠 RAM [API START]: current=0.12 MB, peak=0.12 MB
+🧠 RAM [Distance matrix BUILT]: current=0.45 MB, peak=0.45 MB, delta=+0.33 MB
+🧠 RAM [Solver START]: current=0.48 MB, peak=0.48 MB
+🧠 RAM [Solver END]: current=1.20 MB, peak=2.10 MB, delta=+0.72 MB
+============================================================
+🧠 MEMORY SUMMARY:
+   Peak RAM used:    2.10 MB
+   Final RAM used:   1.20 MB
+⏱️  TIMING SUMMARY:
+   Total API time:   15.32s
+============================================================
+```
+
+> **Note:** Memory tracing (`tracemalloc`) is paused during the OR-Tools C++ solver execution to avoid interference with the native solver's memory allocator.
+
+### Performance Limits
+
+| Metric | Recommended | Maximum |
+|--------|-------------|---------|
+| Total visits | Up to 50 | 80 (auto-filtered by SLA) |
+| Unique locations | Up to 30 | 40 (configurable) |
+| Solver time | 10–40s | Depends on node count |
 
 ## Example Usage
 
-### cURL Example
+### cURL
 
 ```bash
-curl --location 'http://localhost:5000/api/auto-routing/optimize' \
---header 'Content-Type: application/json' \
---data '{
-  "num_vehicles": 2,
-  "max_distance_per_vehicle_km": 50,
-  "start_location": {
-    "lat": 28.6139,
-    "lng": 77.2090
-  },
-  "end_location": {
-    "lat": 28.6139,
-    "lng": 77.2090
-  },
+curl -X POST http://localhost:5000/api/auto-routing/optimize \
+  -H 'Content-Type: application/json' \
+  -d '{
+  "trucks": 3,
+  "max_km": 65,
+  "max_stops": 10,
+  "shift_duration_hours": 8,
+  "service_time_minutes": 10,
+  "start": { "lat": 12.9172, "lng": 77.6349 },
+  "end": { "lat": 12.9172, "lng": 77.6349 },
   "visits": [
     {
       "visitId": "pickup_1",
-      "lat": 28.7041,
-      "lng": 77.1025,
-      "sla_days": 0,
+      "lat": 12.9670,
+      "lng": 77.5201,
+      "sla_days": -28,
       "order_id": "ORD001",
       "visit_type": "pickup"
     },
     {
       "visitId": "drop_1",
-      "lat": 28.5355,
-      "lng": 77.3910,
-      "sla_days": 0,
+      "lat": 13.0137,
+      "lng": 77.6480,
+      "sla_days": -25,
       "order_id": "ORD001",
       "visit_type": "drop"
+    },
+    {
+      "visitId": "standalone_1",
+      "lat": 12.9571,
+      "lng": 77.6550,
+      "sla_days": -2
     }
   ]
 }'
 ```
 
-### Python Example
+### Python
 
 ```python
 import requests
@@ -256,32 +372,35 @@ import requests
 url = "http://localhost:5000/api/auto-routing/optimize"
 
 payload = {
-    "num_vehicles": 2,
-    "max_distance_per_vehicle_km": 50,
-    "start_location": {
-        "lat": 28.6139,
-        "lng": 77.2090
-    },
-    "end_location": {
-        "lat": 28.6139,
-        "lng": 77.2090
-    },
+    "trucks": 3,
+    "max_km": 65,
+    "max_stops": 10,
+    "shift_duration_hours": 8,
+    "service_time_minutes": 10,
+    "start": {"lat": 12.9172, "lng": 77.6349},
+    "end": {"lat": 12.9172, "lng": 77.6349},
     "visits": [
         {
             "visitId": "pickup_1",
-            "lat": 28.7041,
-            "lng": 77.1025,
-            "sla_days": 0,
+            "lat": 12.9670,
+            "lng": 77.5201,
+            "sla_days": -28,
             "order_id": "ORD001",
             "visit_type": "pickup"
         },
         {
             "visitId": "drop_1",
-            "lat": 28.5355,
-            "lng": 77.3910,
-            "sla_days": 0,
+            "lat": 13.0137,
+            "lng": 77.6480,
+            "sla_days": -25,
             "order_id": "ORD001",
             "visit_type": "drop"
+        },
+        {
+            "visitId": "standalone_1",
+            "lat": 12.9571,
+            "lng": 77.6550,
+            "sla_days": -2
         }
     ]
 }
@@ -289,94 +408,42 @@ payload = {
 response = requests.post(url, json=payload)
 result = response.json()
 
-print(f"Total routes: {len(result['routes'])}")
-print(f"Total distance: {result['total_distance_km']} km")
+for route in result["routes"]:
+    print(f"{route['truckId']}: {route['waypoint_count']} stops, "
+          f"{route['estimated_km']}km, {route['estimated_hours']}h "
+          f"[{route['distance_source']}]")
+
+print(f"Unassigned: {len(result['unassigned_visits'])}")
 ```
 
-## Optimization Strategy
+## Health Check
 
-The solver uses the following strategy to maximize visit coverage:
-
-1. **High Drop Penalties**: Unassigned visits incur large penalties
-   - Critical (breached): 5,000,000 penalty
-   - Urgent (1-2 days): 2,500,000 penalty
-   - Warning (3 days): 1,250,000 penalty
-   - Normal (>3 days): 500,000 penalty
-
-2. **Low Arc Costs**: Distance costs are scaled down 10x
-   - Encourages visiting more stops over minimizing distance
-
-3. **Guided Local Search**: Uses metaheuristic to escape local optima
-   - Better at finding solutions with more visits
-
-4. **Dynamic Time Limits**:
-   - Small problems (<15 nodes): 10 seconds
-   - Medium problems (15-30 nodes): 20 seconds
-   - Large problems (>30 nodes): 30 seconds
-
-## Error Handling
-
-### Common Unassignment Reasons
-
-| Reason | Description |
-|--------|-------------|
-| `exceeds_distance_constraint` | Visit would exceed vehicle's max distance |
-| `exceeds_waypoint_limit` | Route would exceed 25 stops |
-| `filtered_by_priority` | Excluded during pre-filtering (>70 visits) |
-| `solver_no_solution` | Solver couldn't find feasible solution |
-| `pickup_without_drop` | Pickup visit without matching drop |
-| `drop_without_pickup` | Drop visit without matching pickup |
-
-### API Error Responses
+**`GET /api/auto-routing/health`**
 
 ```json
-{
-  "error": "Invalid request format",
-  "message": "Missing required field: num_vehicles"
-}
+{ "status": "healthy", "service": "auto-routing", "version": "1.0.0" }
 ```
 
-## Performance Considerations
+## Environment Variables
 
-### Visit Limits
-- **Recommended**: Up to 50 visits for optimal performance
-- **Maximum**: 70 visits (automatically filtered by SLA priority)
-- **Large datasets**: Critical/urgent visits prioritized automatically
+| Variable | Required | Default | Description |
+|----------|----------|---------|-------------|
+| `GOOGLE_MAPS_API_KEY` | No | — | Enables Google Maps Distance Matrix API (paid, most accurate) |
+| `OSRM_BASE_URL` | No | `http://router.project-osrm.org` | OSRM server URL (free road distances) |
 
-### Solver Time
-- Solver runs for 10-30 seconds depending on problem size
-- Returns best solution found within time limit
-- May not always find optimal solution for large problems
-
-### Distance Matrix
-- Google Maps API has rate limits
-- Batch requests for efficiency
-- Fallback to Haversine if API fails
-
-## Environment Setup
-
-### Required Environment Variables
+## Dependencies
 
 ```bash
-# .env file
-GOOGLE_MAPS_API_KEY=your_google_maps_api_key_here
-```
-
-### Dependencies
-
-```bash
-pip install flask
-pip install flask-cors
-pip install ortools
-pip install googlemaps
+pip install flask flask-cors ortools googlemaps requests
 ```
 
 ## Tech Stack
 
-- **Flask**: Web framework
-- **Google OR-Tools**: Constraint programming solver
-- **Google Maps API**: Distance matrix calculations
-- **Python 3.8+**: Runtime environment
+- **Flask** — Web framework
+- **Google OR-Tools** — Constraint programming / VRP solver
+- **Google Maps API** — Distance matrix (paid, primary)
+- **OSRM** — Open Source Routing Machine (free, secondary)
+- **Python 3.8+** — Runtime
 
 ## License
 
@@ -384,4 +451,4 @@ Proprietary
 
 ---
 
-**Last Updated**: February 2026
+**Last Updated:** February 2026
