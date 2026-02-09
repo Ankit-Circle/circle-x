@@ -841,6 +841,7 @@ def extract_solution(
         stops = []
         sequence = 1
         route_nodes = [start_index]  # Track all nodes in order for distance calculation
+        prev_location = None  # Track previous location coordinates
         
         while not routing.IsEnd(index):
             node_index = manager.IndexToNode(index)
@@ -848,6 +849,12 @@ def extract_solution(
             # Add to stops if it's not start or end
             if node_index != start_index and node_index != end_index:
                 visit_info = locations[node_index]
+                current_location = (visit_info['lat'], visit_info['lng'])
+                
+                # Check if location changed from previous stop
+                # If location is same as previous, keep same sequence number
+                if prev_location is not None and current_location != prev_location:
+                    sequence += 1
                 
                 # If we have visit_groups, expand the combined visit to individual visits
                 if visit_groups and node_index < len(visit_groups):
@@ -878,7 +885,7 @@ def extract_solution(
                                 stop_data["visit_type"] = original_visit['visit_type']
                         
                         stops.append(stop_data)
-                        # Note: We keep the same sequence for all visits at the same location
+                        # Note: All visits at the same location get the same sequence number
                 else:
                     # No visit groups - single visit at this location
                     stop_data = {
@@ -900,7 +907,8 @@ def extract_solution(
                     
                     stops.append(stop_data)
                 
-                sequence += 1
+                # Update previous location for next iteration
+                prev_location = current_location
                 assigned_indices.add(node_index)
             
             previous_index = index
