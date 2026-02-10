@@ -15,7 +15,8 @@ def create_auto_routing_app():
     def health():
         return jsonify({
             "status": "ok",
-            "service": "auto-routing"
+            "service": "auto-routing",
+            "blueprints": list(app.blueprints.keys())
         }), 200
 
     return app
