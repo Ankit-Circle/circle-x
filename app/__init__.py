@@ -1,4 +1,4 @@
-from flask import Flask
+from flask import Flask, jsonify
 from flask_cors import CORS
 
 def create_app():
@@ -15,4 +15,11 @@ def create_app():
     app.register_blueprint(pricing_bp, url_prefix="/api/pricing")
     app.register_blueprint(pricing_db_bp, url_prefix="/api/pricing-db")
 
+    @app.route("/health", methods=["GET"])
+    def health():
+        return jsonify({
+            "status": "ok",
+            "service": "circle-x",
+            "blueprints": list(app.blueprints.keys())
+        }), 200
     return app
