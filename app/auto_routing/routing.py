@@ -839,6 +839,75 @@ def solve_vrp(
         return None
 
 
+def validate_routes(routes: List[Dict]) -> List[str]:
+    """
+    Validate routes for pickup-drop constraint violations.
+    
+    Checks:
+    1. Within-truck: DROP must not come before PICKUP (by sequence)
+    2. Cross-truck: PICKUP and DROP for the same order must be on the same truck
+    
+    Returns list of error strings (empty = no violations).
+    """
+    validation_errors = []
+    
+    # Check within-truck ordering
+    for route in routes:
+        truck_id = route['truckId']
+        order_sequence = {}
+        
+        for stop in route['stops']:
+            order_id = stop.get('order_id')
+            visit_type = stop.get('visit_type')
+            seq = stop.get('sequence')
+            
+            if order_id and visit_type:
+                if order_id not in order_sequence:
+                    order_sequence[order_id] = {}
+                
+                vtype = visit_type.lower()
+                if vtype in ['pickup', 'pick']:
+                    order_sequence[order_id]['pickup_seq'] = seq
+                elif vtype in ['drop', 'delivery']:
+                    order_sequence[order_id]['drop_seq'] = seq
+        
+        for order_id, seq_info in order_sequence.items():
+            if 'pickup_seq' in seq_info and 'drop_seq' in seq_info:
+                if seq_info['pickup_seq'] > seq_info['drop_seq']:
+                    validation_errors.append(
+                        f"❌ Order {order_id}: DROP (seq {seq_info['drop_seq']}) "
+                        f"before PICKUP (seq {seq_info['pickup_seq']}) in {truck_id}"
+                    )
+    
+    # Check cross-truck violations
+    all_order_trucks = {}
+    for route in routes:
+        truck_id = route['truckId']
+        for stop in route['stops']:
+            order_id = stop.get('order_id')
+            visit_type = stop.get('visit_type')
+            
+            if order_id and visit_type:
+                if order_id not in all_order_trucks:
+                    all_order_trucks[order_id] = {}
+                
+                vtype = visit_type.lower()
+                if vtype in ['pickup', 'pick']:
+                    all_order_trucks[order_id]['pickup_truck'] = truck_id
+                elif vtype in ['drop', 'delivery']:
+                    all_order_trucks[order_id]['drop_truck'] = truck_id
+    
+    for order_id, truck_info in all_order_trucks.items():
+        if 'pickup_truck' in truck_info and 'drop_truck' in truck_info:
+            if truck_info['pickup_truck'] != truck_info['drop_truck']:
+                validation_errors.append(
+                    f"❌ Order {order_id}: PICKUP in {truck_info['pickup_truck']} "
+                    f"but DROP in {truck_info['drop_truck']}"
+                )
+    
+    return validation_errors
+
+
 def extract_solution(
     manager, routing, solution, locations, distance_matrix, duration_matrix,
     start_index, end_index, num_vehicles,
@@ -1105,60 +1174,10 @@ def extract_solution(
                     route['total_visits'] = len(filtered_stops)
     
     # FINAL VALIDATION: Check for pickup-drop constraint violations
-    validation_errors = []
-    
-    for route in routes:
-        truck_id = route['truckId']
-        stops = route['stops']
-        
-        # Build order sequence for this route
-        order_sequence = {}  # order_id -> {'pickup_seq': N, 'drop_seq': M}
-        for stop in stops:
-            order_id = stop.get('order_id')
-            visit_type = stop.get('visit_type')
-            seq = stop.get('sequence')
-            
-            if order_id and visit_type:
-                if order_id not in order_sequence:
-                    order_sequence[order_id] = {}
-                
-                if visit_type.lower() in ['pickup', 'pick']:
-                    order_sequence[order_id]['pickup_seq'] = seq
-                    order_sequence[order_id]['pickup_truck'] = truck_id
-                elif visit_type.lower() in ['drop', 'delivery']:
-                    order_sequence[order_id]['drop_seq'] = seq
-                    order_sequence[order_id]['drop_truck'] = truck_id
-        
-        # Check for violations within this route
-        for order_id, seq_info in order_sequence.items():
-            if 'pickup_seq' in seq_info and 'drop_seq' in seq_info:
-                if seq_info['pickup_seq'] > seq_info['drop_seq']:
-                    validation_errors.append(f"❌ Order {order_id}: DROP (seq {seq_info['drop_seq']}) before PICKUP (seq {seq_info['pickup_seq']}) in {truck_id}")
-    
-    # Check for cross-truck violations
-    all_order_trucks = {}  # order_id -> {'pickup_truck': X, 'drop_truck': Y}
-    for route in routes:
-        truck_id = route['truckId']
-        for stop in route['stops']:
-            order_id = stop.get('order_id')
-            visit_type = stop.get('visit_type')
-            
-            if order_id and visit_type:
-                if order_id not in all_order_trucks:
-                    all_order_trucks[order_id] = {}
-                
-                if visit_type.lower() in ['pickup', 'pick']:
-                    all_order_trucks[order_id]['pickup_truck'] = truck_id
-                elif visit_type.lower() in ['drop', 'delivery']:
-                    all_order_trucks[order_id]['drop_truck'] = truck_id
-    
-    for order_id, truck_info in all_order_trucks.items():
-        if 'pickup_truck' in truck_info and 'drop_truck' in truck_info:
-            if truck_info['pickup_truck'] != truck_info['drop_truck']:
-                validation_errors.append(f"❌ Order {order_id}: PICKUP in {truck_info['pickup_truck']} but DROP in {truck_info['drop_truck']}")
+    validation_errors = validate_routes(routes)
     
     if validation_errors:
-        logger.error(f"🚨 VALIDATION FAILED - {len(validation_errors)} pickup-drop constraint violations:")
+        logger.error(f"🚨 VALIDATION FOUND {len(validation_errors)} pickup-drop constraint violations (will attempt post-fix):")
         for error in validation_errors:
             logger.error(f"  {error}")
     else:
@@ -1169,6 +1188,424 @@ def extract_solution(
         "unassigned_visits": unassigned_visits,
         "validation_errors": validation_errors if validation_errors else None
     }
+
+
+def fix_validation_errors(
+    result: Dict,
+    distance_matrix: List[List[int]],
+    duration_matrix: List[List[int]],
+    locations: List[Dict],
+    start_index: int,
+    end_index: int,
+    max_distance_per_vehicle: int,
+    max_waypoints: int = MAX_WAYPOINTS_PER_ROUTE
+) -> Dict:
+    """
+    Post-processing step to fix ALL pickup-drop validation errors.
+    
+    Handles two types of violations:
+    1. Cross-truck: PICKUP on truck A, DROP on truck B
+       Fix: Move DROP to pickup's truck (or PICKUP to drop's truck) if constraints allow.
+    2. Ordering: DROP before PICKUP on the same truck
+       Fix: Move DROP to after PICKUP (may add revisit waypoint) if constraints allow.
+    
+    If a violation cannot be fixed within constraints (max_km, max_waypoints),
+    the offending visits are moved to unassigned.
+    
+    Iterates up to 3 passes to handle cascading fixes.
+    """
+    routes = result['routes']
+    unassigned = result.get('unassigned_visits', [])
+    
+    if not result.get('validation_errors'):
+        return result
+    
+    logger.info(f"🔧 Post-processing: Fixing {len(result['validation_errors'])} validation errors...")
+    
+    # ─── Helper: location → node index mapping ───
+    loc_to_node = {}
+    for i, loc in enumerate(locations):
+        key = (round(loc['lat'], 7), round(loc['lng'], 7))
+        loc_to_node[key] = i
+    
+    def find_node(lat, lng):
+        """Find the node index in the locations/distance_matrix for a given lat/lng."""
+        key = (round(lat, 7), round(lng, 7))
+        if key in loc_to_node:
+            return loc_to_node[key]
+        # Fuzzy match (within ~11m)
+        best = None
+        best_dist = float('inf')
+        for k, v in loc_to_node.items():
+            d = abs(k[0] - lat) + abs(k[1] - lng)
+            if d < 0.001 and d < best_dist:
+                best = v
+                best_dist = d
+        return best
+    
+    def get_ordered_waypoint_nodes(route):
+        """Get ordered list of unique waypoint node indices for a route."""
+        stops = sorted(route['stops'], key=lambda s: s['sequence'])
+        nodes = []
+        seen_seq = set()
+        for s in stops:
+            if s['sequence'] not in seen_seq:
+                seen_seq.add(s['sequence'])
+                n = find_node(s['lat'], s['lng'])
+                if n is not None:
+                    nodes.append(n)
+        return nodes
+    
+    def calc_route_distance(node_list):
+        """Calculate total distance and duration for a route given ordered node list."""
+        total_dist = 0
+        total_dur = 0
+        prev = start_index
+        for n in node_list:
+            total_dist += distance_matrix[prev][n]
+            total_dur += duration_matrix[prev][n]
+            prev = n
+        total_dist += distance_matrix[prev][end_index]
+        total_dur += duration_matrix[prev][end_index]
+        return total_dist, total_dur
+    
+    def calc_insertion_cost_after(route, insert_node, after_seq):
+        """Calculate route distance if we insert a new waypoint AFTER the given sequence."""
+        stops = sorted(route['stops'], key=lambda s: s['sequence'])
+        new_nodes = []
+        seen_seq = set()
+        insert_idx = -1
+        for s in stops:
+            if s['sequence'] not in seen_seq:
+                seen_seq.add(s['sequence'])
+                n = find_node(s['lat'], s['lng'])
+                if n is not None:
+                    new_nodes.append(n)
+                    if s['sequence'] == after_seq:
+                        insert_idx = len(new_nodes)
+        if insert_idx >= 0:
+            new_nodes.insert(insert_idx, insert_node)
+        else:
+            new_nodes.append(insert_node)
+        return calc_route_distance(new_nodes)
+    
+    def calc_insertion_cost_before(route, insert_node, before_seq):
+        """Calculate route distance if we insert a new waypoint BEFORE the given sequence."""
+        stops = sorted(route['stops'], key=lambda s: s['sequence'])
+        new_nodes = []
+        seen_seq = set()
+        inserted = False
+        for s in stops:
+            if s['sequence'] not in seen_seq:
+                seen_seq.add(s['sequence'])
+                n = find_node(s['lat'], s['lng'])
+                if n is not None:
+                    if s['sequence'] == before_seq and not inserted:
+                        new_nodes.append(insert_node)
+                        inserted = True
+                    new_nodes.append(n)
+        return calc_route_distance(new_nodes)
+    
+    def rebuild_route_stats(route):
+        """Rebuild sequence numbers, waypoint counts, and distance stats for a modified route."""
+        stops = route['stops']
+        if not stops:
+            route['waypoint_count'] = 0
+            route['total_visits'] = 0
+            route['estimated_km'] = 0
+            route['estimated_hours'] = 0
+            return
+        
+        # Sort by current sequence (supports float sequences from insertions)
+        stops.sort(key=lambda s: s['sequence'])
+        
+        # Build ordered waypoints: consecutive stops at same location = 1 waypoint
+        # Non-consecutive stops at same location = separate waypoints (revisits)
+        waypoints = []  # [(loc_key, [stops])]
+        for s in stops:
+            loc_key = (round(s['lat'], 6), round(s['lng'], 6))
+            if waypoints and waypoints[-1][0] == loc_key:
+                waypoints[-1][1].append(s)
+            else:
+                waypoints.append((loc_key, [s]))
+        
+        # Assign clean integer sequences
+        for seq_num, (_, wp_stops) in enumerate(waypoints, 1):
+            for s in wp_stops:
+                s['sequence'] = seq_num
+        
+        route['stops'] = stops
+        route['waypoint_count'] = len(waypoints)
+        route['total_visits'] = len(stops)
+        
+        # Recalculate distance and duration
+        nodes = get_ordered_waypoint_nodes(route)
+        if nodes:
+            dist, dur = calc_route_distance(nodes)
+            route['estimated_km'] = round(dist / 1000, 2)
+            route['estimated_hours'] = round(dur / 3600, 2)
+    
+    # Track which visitIds are already unassigned (avoid duplicates)
+    seen_unassigned = set(u.get('visitId') for u in unassigned if u.get('visitId'))
+    
+    # ─── Iterative fixing (max 3 passes) ───
+    for iteration in range(3):
+        # Build order info from CURRENT route state
+        order_info = {}
+        for ridx, route in enumerate(routes):
+            truck_id = route['truckId']
+            for stop in route['stops']:
+                oid = stop.get('order_id')
+                vtype = (stop.get('visit_type') or '').lower()
+                if not oid or vtype not in ['pickup', 'pick', 'drop', 'delivery']:
+                    continue
+                if oid not in order_info:
+                    order_info[oid] = {'pickups': [], 'drops': []}
+                
+                visit_data = {
+                    'truck': truck_id, 'ridx': ridx, 'seq': stop['sequence'],
+                    'lat': stop['lat'], 'lng': stop['lng'], 'stop': stop
+                }
+                if vtype in ['pickup', 'pick']:
+                    order_info[oid]['pickups'].append(visit_data)
+                else:
+                    order_info[oid]['drops'].append(visit_data)
+        
+        # Identify violations
+        cross_violations = []   # (order_id, pickup_data, drop_data)
+        order_violations = []   # (order_id, pickup_data, drop_data)
+        
+        for oid, info in order_info.items():
+            for pu in info.get('pickups', []):
+                for dr in info.get('drops', []):
+                    if pu['truck'] != dr['truck']:
+                        cross_violations.append((oid, pu, dr))
+                    elif dr['seq'] < pu['seq']:
+                        order_violations.append((oid, pu, dr))
+        
+        if not cross_violations and not order_violations:
+            logger.info(f"✅ All validation errors fixed after {iteration + 1} pass(es)")
+            break
+        
+        logger.info(f"🔧 Fix pass {iteration + 1}: "
+                     f"{len(cross_violations)} cross-truck, {len(order_violations)} ordering violations")
+        
+        # ─── Phase 1: Fix cross-truck violations ───
+        # Strategy: Move DROP to pickup's truck (preferred) or PICKUP to drop's truck.
+        for oid, pu, dr in cross_violations:
+            pickup_route = routes[pu['ridx']]
+            drop_route = routes[dr['ridx']]
+            drop_visit = dr['stop']
+            pickup_visit = pu['stop']
+            
+            if drop_visit['visitId'] in seen_unassigned or pickup_visit['visitId'] in seen_unassigned:
+                continue
+            
+            moved = False
+            
+            # ── Strategy A: Move DROP to pickup's truck ──
+            # Check if pickup truck already visits the drop location AFTER the pickup
+            existing_seq_after = None
+            for s in pickup_route['stops']:
+                if (abs(s['lat'] - dr['lat']) < 0.0001 and
+                    abs(s['lng'] - dr['lng']) < 0.0001 and
+                    s['sequence'] > pu['seq']):
+                    existing_seq_after = s['sequence']
+                    break
+            
+            if existing_seq_after is not None:
+                # Truck already visits this location after the pickup — just add the visit
+                new_stop = dict(drop_visit)
+                new_stop['sequence'] = existing_seq_after
+                pickup_route['stops'].append(new_stop)
+                drop_route['stops'] = [s for s in drop_route['stops']
+                                       if s.get('visitId') != drop_visit['visitId']]
+                moved = True
+                logger.info(f"  ✅ Order {oid}: Moved DROP to {pu['truck']} "
+                            f"(existing waypoint at seq {existing_seq_after})")
+            
+            if not moved:
+                # Need to add a new waypoint after the pickup
+                drop_node = find_node(dr['lat'], dr['lng'])
+                if drop_node is not None:
+                    new_dist, _ = calc_insertion_cost_after(pickup_route, drop_node, pu['seq'])
+                    new_wp = pickup_route['waypoint_count'] + 1
+                    
+                    if new_dist <= max_distance_per_vehicle and new_wp <= max_waypoints:
+                        new_stop = dict(drop_visit)
+                        new_stop['sequence'] = pu['seq'] + 0.5  # Fractional; rebuilt later
+                        pickup_route['stops'].append(new_stop)
+                        drop_route['stops'] = [s for s in drop_route['stops']
+                                               if s.get('visitId') != drop_visit['visitId']]
+                        moved = True
+                        logger.info(f"  ✅ Order {oid}: Added DROP to {pu['truck']} "
+                                    f"(new waypoint after pickup, +{(new_dist - pickup_route.get('estimated_km', 0) * 1000) / 1000:.1f}km)")
+            
+            if not moved:
+                # ── Strategy B: Move PICKUP to drop's truck ──
+                existing_seq_before = None
+                for s in drop_route['stops']:
+                    if (abs(s['lat'] - pu['lat']) < 0.0001 and
+                        abs(s['lng'] - pu['lng']) < 0.0001 and
+                        s['sequence'] < dr['seq']):
+                        existing_seq_before = s['sequence']
+                        break
+                
+                if existing_seq_before is not None:
+                    new_stop = dict(pickup_visit)
+                    new_stop['sequence'] = existing_seq_before
+                    drop_route['stops'].append(new_stop)
+                    pickup_route['stops'] = [s for s in pickup_route['stops']
+                                             if s.get('visitId') != pickup_visit['visitId']]
+                    moved = True
+                    logger.info(f"  ✅ Order {oid}: Moved PICKUP to {dr['truck']} "
+                                f"(existing waypoint at seq {existing_seq_before})")
+                else:
+                    pickup_node = find_node(pu['lat'], pu['lng'])
+                    if pickup_node is not None:
+                        new_dist, _ = calc_insertion_cost_before(drop_route, pickup_node, dr['seq'])
+                        new_wp = drop_route['waypoint_count'] + 1
+                        
+                        if new_dist <= max_distance_per_vehicle and new_wp <= max_waypoints:
+                            new_stop = dict(pickup_visit)
+                            new_stop['sequence'] = dr['seq'] - 0.5  # Fractional; rebuilt later
+                            drop_route['stops'].append(new_stop)
+                            pickup_route['stops'] = [s for s in pickup_route['stops']
+                                                     if s.get('visitId') != pickup_visit['visitId']]
+                            moved = True
+                            logger.info(f"  ✅ Order {oid}: Added PICKUP to {dr['truck']} "
+                                        f"(new waypoint before drop)")
+            
+            if not moved:
+                # ── Strategy C: Can't fix — move both to unassigned ──
+                pickup_route['stops'] = [s for s in pickup_route['stops']
+                                         if s.get('visitId') != pickup_visit['visitId']]
+                drop_route['stops'] = [s for s in drop_route['stops']
+                                       if s.get('visitId') != drop_visit['visitId']]
+                if pickup_visit['visitId'] not in seen_unassigned:
+                    unassigned.append({
+                        'visitId': pickup_visit['visitId'],
+                        'reason': 'cross_truck_violation_unfixable'
+                    })
+                    seen_unassigned.add(pickup_visit['visitId'])
+                if drop_visit['visitId'] not in seen_unassigned:
+                    unassigned.append({
+                        'visitId': drop_visit['visitId'],
+                        'reason': 'cross_truck_violation_unfixable'
+                    })
+                    seen_unassigned.add(drop_visit['visitId'])
+                logger.warning(f"  ⚠️ Order {oid}: Can't fix cross-truck — both moved to unassigned")
+        
+        # ─── Phase 2: Fix ordering violations (DROP before PICKUP on same truck) ───
+        # Strategy: Remove DROP from current position, re-insert AFTER the PICKUP.
+        # If the truck already revisits the drop location after the pickup, reuse that waypoint.
+        # Otherwise add a revisit waypoint (if within constraints).
+        for oid, pu, dr in order_violations:
+            route = routes[pu['ridx']]
+            drop_visit = dr['stop']
+            
+            if drop_visit['visitId'] in seen_unassigned:
+                continue
+            
+            # Check if route already has a stop at drop location AFTER the pickup
+            existing_after = None
+            for s in route['stops']:
+                if (s.get('visitId') != drop_visit['visitId'] and
+                    abs(s['lat'] - dr['lat']) < 0.0001 and
+                    abs(s['lng'] - dr['lng']) < 0.0001 and
+                    s['sequence'] > pu['seq']):
+                    existing_after = s['sequence']
+                    break
+            
+            if existing_after is not None:
+                # Move drop to the existing later waypoint at same location
+                route['stops'] = [s for s in route['stops']
+                                  if s.get('visitId') != drop_visit['visitId']]
+                new_stop = dict(drop_visit)
+                new_stop['sequence'] = existing_after
+                route['stops'].append(new_stop)
+                logger.info(f"  ✅ Order {oid}: Moved DROP to seq {existing_after} "
+                            f"(existing waypoint after pickup)")
+            else:
+                # Need to add a revisit to the drop location after the pickup
+                drop_node = find_node(dr['lat'], dr['lng'])
+                if drop_node is not None:
+                    # Calculate cost with the extra revisit
+                    # First remove the drop, then calc insertion after pickup
+                    temp_stops = [s for s in route['stops']
+                                  if s.get('visitId') != drop_visit['visitId']]
+                    temp_route = dict(route)
+                    temp_route['stops'] = temp_stops
+                    new_dist, _ = calc_insertion_cost_after(temp_route, drop_node, pu['seq'])
+                    new_wp = len(set(s['sequence'] for s in temp_stops
+                                     if s['sequence'] != dr['seq'] or
+                                     any(s2['sequence'] == dr['seq'] and
+                                         s2.get('visitId') != drop_visit['visitId']
+                                         for s2 in temp_stops))) + 1
+                    # Simpler: just count current waypoints + 1 for the revisit
+                    current_wp = route['waypoint_count']
+                    # Check if removing the drop empties its original waypoint
+                    others_at_drop_loc = [s for s in route['stops']
+                                          if s.get('visitId') != drop_visit['visitId'] and
+                                          abs(s['lat'] - dr['lat']) < 0.0001 and
+                                          abs(s['lng'] - dr['lng']) < 0.0001]
+                    wp_freed = 0 if others_at_drop_loc else 1
+                    new_wp_count = current_wp - wp_freed + 1  # -freed +revisit
+                    
+                    if new_dist <= max_distance_per_vehicle and new_wp_count <= max_waypoints:
+                        route['stops'] = [s for s in route['stops']
+                                          if s.get('visitId') != drop_visit['visitId']]
+                        new_stop = dict(drop_visit)
+                        new_stop['sequence'] = pu['seq'] + 0.5  # Fractional; rebuilt later
+                        route['stops'].append(new_stop)
+                        logger.info(f"  ✅ Order {oid}: Added DROP revisit after pickup "
+                                    f"(wp: {current_wp} → {new_wp_count})")
+                    else:
+                        # Can't add revisit — move drop to unassigned
+                        route['stops'] = [s for s in route['stops']
+                                          if s.get('visitId') != drop_visit['visitId']]
+                        if drop_visit['visitId'] not in seen_unassigned:
+                            unassigned.append({
+                                'visitId': drop_visit['visitId'],
+                                'reason': 'ordering_violation_exceeds_constraints'
+                            })
+                            seen_unassigned.add(drop_visit['visitId'])
+                        logger.warning(f"  ⚠️ Order {oid}: Can't fix ordering (exceeds constraints) "
+                                       f"— DROP moved to unassigned")
+                else:
+                    # Can't find location node — move to unassigned
+                    route['stops'] = [s for s in route['stops']
+                                      if s.get('visitId') != drop_visit['visitId']]
+                    if drop_visit['visitId'] not in seen_unassigned:
+                        unassigned.append({
+                            'visitId': drop_visit['visitId'],
+                            'reason': 'ordering_violation_unfixable'
+                        })
+                        seen_unassigned.add(drop_visit['visitId'])
+                    logger.warning(f"  ⚠️ Order {oid}: Location not found — DROP moved to unassigned")
+        
+        # ─── Rebuild all routes after this pass ───
+        for route in routes:
+            rebuild_route_stats(route)
+    
+    # Remove empty routes
+    routes = [r for r in routes if r.get('stops')]
+    
+    # Final re-validation
+    final_errors = validate_routes(routes)
+    
+    if final_errors:
+        logger.warning(f"⚠️ {len(final_errors)} validation errors remain after post-processing:")
+        for error in final_errors:
+            logger.warning(f"  {error}")
+    else:
+        logger.info(f"✅ Post-processing complete: All validation errors resolved")
+    
+    result['routes'] = routes
+    result['unassigned_visits'] = unassigned
+    result['validation_errors'] = final_errors if final_errors else None
+    
+    return result
 
 
 @auto_routing_bp.route("/optimize", methods=["POST"])
@@ -1461,6 +1898,20 @@ def optimize_routes():
                 "error": "Could not find a solution for the given constraints",
                 "suggestion": "Try increasing max_km or number of trucks"
             }), 400
+        
+        # Post-processing: Fix any pickup-drop validation errors
+        if result.get('validation_errors'):
+            logger.info(f"🔧 Attempting to fix {len(result['validation_errors'])} validation errors...")
+            result = fix_validation_errors(
+                result=result,
+                distance_matrix=distance_matrix,
+                duration_matrix=duration_matrix,
+                locations=locations,
+                start_index=start_index,
+                end_index=end_index,
+                max_distance_per_vehicle=max_distance_meters,
+                max_waypoints=max_stops
+            )
         
         # Add filtered-out visits to unassigned visits
         if filtered_excluded_visits:
