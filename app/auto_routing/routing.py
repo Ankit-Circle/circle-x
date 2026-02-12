@@ -254,23 +254,30 @@ def filter_visits_by_priority(
                 f"{len(warning_visits)} warning (SLA 3), "
                 f"{len(normal_visits)} normal (SLA > 3)")
     
-    # Build selected visits list - prioritize by tier
+    # Build selected visits list - ABSOLUTE priority for SLA-critical visits
     selected_visits = []
     
-    # ALWAYS include all critical (breached) visits first
+    # ALWAYS include ALL critical (breached) visits - NO LIMIT
+    # These MUST be completed regardless of capacity constraints
     selected_visits.extend(critical_visits)
-    logger.info(f"✅ Added {len(critical_visits)} BREACHED visits (must complete today)")
+    logger.info(f"🚨 Added ALL {len(critical_visits)} BREACHED visits (absolute priority, no limit)")
     
-    # Add urgent visits (about to breach)
-    remaining = max_visits - len(selected_visits)
-    if remaining > 0:
-        urgent_visits.sort(key=lambda x: x['sla_days'])
-        to_add = urgent_visits[:remaining]
-        selected_visits.extend(to_add)
-        logger.info(f"✅ Added {len(to_add)} urgent visits (SLA 1-2 days)")
+    # ALWAYS include ALL urgent visits (1-2 days) - NO LIMIT
+    # These are about to breach and must be prioritized
+    urgent_visits.sort(key=lambda x: x['sla_days'])
+    selected_visits.extend(urgent_visits)
+    logger.info(f"⚠️  Added ALL {len(urgent_visits)} urgent visits (SLA 1-2 days, no limit)")
     
-    # Add warning visits
-    remaining = max_visits - len(selected_visits)
+    # Now apply max_visits limit to warning and normal visits
+    # Only limit non-critical visits
+    critical_and_urgent_count = len(critical_visits) + len(urgent_visits)
+    remaining = max(0, max_visits - critical_and_urgent_count)
+    
+    if critical_and_urgent_count > max_visits:
+        logger.warning(f"⚠️  SLA-critical visits ({critical_and_urgent_count}) exceed max_visits ({max_visits}). "
+                      f"Including all critical visits anyway - SLA takes priority!")
+    
+    # Add warning visits (up to remaining capacity)
     if remaining > 0:
         warning_visits.sort(key=lambda x: x['sla_days'])
         to_add = warning_visits[:remaining]
@@ -680,9 +687,12 @@ def solve_vrp(
     #   - Solver opens new truck rather than drop a visit (penalty > fixed cost)
     #   - SLA-breached visits get extreme penalties (practically never dropped)
     
-    base_penalty = max_distance_per_vehicle * 20
+    # ─── ENHANCED SLA PRIORITIZATION ───
+    # DRAMATICALLY increased penalties to ensure SLA-critical visits are NEVER dropped
+    # Base penalty is now 50x max distance (was 20x) for even stronger prioritization
+    base_penalty = max_distance_per_vehicle * 50
     
-    logger.info(f"Adding disjunctions — base penalty: {base_penalty} "
+    logger.info(f"🎯 SLA-PRIORITIZED routing — base penalty: {base_penalty} "
                 f"(vehicle fixed cost: {vehicle_fixed_cost})")
     
     breached_count = 0
@@ -696,17 +706,22 @@ def solve_vrp(
         
         priority = priorities[node] if node < len(priorities) else 5
         
-        # Penalty tiers — all >> vehicle_fixed_cost so solver uses trucks over dropping
+        # MASSIVELY INCREASED penalty tiers to prioritize SLA visits
+        # These penalties ensure SLA visits are virtually guaranteed to be routed
         if priority >= 15:
-            node_penalty = base_penalty * 10   # SLA BREACHED — never drop
+            # SLA BREACHED (≤0 days) — EXTREME penalty, practically impossible to drop
+            node_penalty = base_penalty * 20   # Was 10x, now 20x
             breached_count += 1
         elif priority >= 8:
-            node_penalty = base_penalty * 5    # Urgent (SLA 1-2 days)
+            # Urgent (SLA 1-2 days) — Very high penalty
+            node_penalty = base_penalty * 10   # Was 5x, now 10x
             urgent_count += 1
         elif priority >= 7:
-            node_penalty = base_penalty * 3    # Warning (SLA 3 days)
+            # Warning (SLA 3 days) — High penalty
+            node_penalty = base_penalty * 5    # Was 3x, now 5x
         else:
-            node_penalty = base_penalty * 2    # Normal
+            # Normal (SLA > 3 days) — Standard penalty
+            node_penalty = base_penalty * 2    # Unchanged
         
         # Paired nodes (pickup-drop) get extra penalty to keep pairs together
         if node in paired_nodes:
@@ -715,8 +730,9 @@ def solve_vrp(
         
         routing.AddDisjunction([manager.NodeToIndex(node)], node_penalty)
     
-    logger.info(f"✅ Added disjunctions for {len(locations) - 2} visit nodes")
-    logger.info(f"   {breached_count} BREACHED, {urgent_count} urgent, {paired_count} in pairs")
+    logger.info(f"✅ Added SLA-prioritized disjunctions for {len(locations) - 2} visit nodes")
+    logger.info(f"   🚨 {breached_count} BREACHED (extreme priority), "
+                f"⚠️  {urgent_count} urgent, 📍 {paired_count} in pairs")
     
     # Add pickup and delivery constraints for complete pairs
     # AddPickupAndDelivery enforces: same vehicle + pickup before drop
@@ -755,16 +771,17 @@ def solve_vrp(
         routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH
     )
     
-    # Dynamic time limit — give solver enough time to explore multi-vehicle solutions
+    # Dynamic time limit — INCREASED for SLA-prioritized routing
+    # More time allows solver to find better solutions that satisfy SLA constraints
     num_nodes = len(locations)
     if num_nodes <= 10:
-        time_limit = 10
+        time_limit = 15   # Was 10, now 15
     elif num_nodes <= 20:
-        time_limit = 15
+        time_limit = 25   # Was 15, now 25
     elif num_nodes <= 35:
-        time_limit = 25
+        time_limit = 40   # Was 25, now 40
     else:
-        time_limit = 40  # Large problems need more time for proper truck packing
+        time_limit = 60   # Was 40, now 60 - critical for SLA optimization
     
     search_parameters.time_limit.seconds = time_limit
     search_parameters.log_search = False
@@ -1813,22 +1830,42 @@ def optimize_routes():
         matrix_snap = log_memory("Distance matrix BUILT", api_snap)
         logger.info(f"⏱️  Distance matrix: {len(locations)}x{len(locations)} built in {matrix_elapsed:.2f}s")
         
-        # Create priority list (inverse of SLA days - lower SLA = higher priority)
+        # Create ENHANCED priority list - MUCH stronger SLA prioritization
+        # Lower SLA days = exponentially higher priority
         priorities = [5]  # Start point - neutral priority
         for visit in combined_visits:
             sla_days = visit.get("sla_days", 5)
             
+            # ENHANCED priority calculation with stronger differentiation
             if sla_days <= 0:
-                priority = 15 + abs(sla_days)
-            elif sla_days <= 2:
-                priority = 10 - sla_days
+                # Breached SLA: EXTREME priority (20+)
+                # More days overdue = even higher priority
+                priority = 25 + abs(sla_days) * 2  # Was 15, now 25+
+            elif sla_days == 1:
+                # 1 day left: CRITICAL priority
+                priority = 18  # Was ~9, now 18
+            elif sla_days == 2:
+                # 2 days left: URGENT priority
+                priority = 12  # Was ~8, now 12
             elif sla_days == 3:
-                priority = 7
+                # 3 days left: WARNING priority
+                priority = 8   # Was 7, now 8
+            elif sla_days <= 5:
+                # 4-5 days: NORMAL priority
+                priority = 5
             else:
-                priority = max(0, 6 - (sla_days - 4))
+                # 6+ days: LOW priority
+                priority = max(1, 6 - sla_days)
             
             priorities.append(priority)
         priorities.append(5)  # End point - neutral priority
+        
+        logger.info(f"🎯 SLA Priority distribution: "
+                    f"BREACHED={sum(1 for p in priorities if p >= 25)}, "
+                    f"CRITICAL={sum(1 for p in priorities if 15 <= p < 25)}, "
+                    f"URGENT={sum(1 for p in priorities if 10 <= p < 15)}, "
+                    f"WARNING={sum(1 for p in priorities if 8 <= p < 10)}, "
+                    f"NORMAL={sum(1 for p in priorities if 5 <= p < 8)}")
         
         # Prepare combined_order_info aligned with locations (add None for start/end)
         aligned_order_info = [None] + combined_order_info + [None]
