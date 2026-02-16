@@ -3,6 +3,7 @@ import os
 import sys
 import time
 import tracemalloc
+import json
 from flask import Blueprint, request, jsonify
 from ortools.constraint_solver import routing_enums_pb2
 from ortools.constraint_solver import pywrapcp
@@ -612,6 +613,10 @@ def solve_vrp(
                             order_map[order_id]['pickup'] = node
                         elif visit_type.lower() in ['drop', 'delivery']:
                             order_map[order_id]['drop'] = node
+                        elif visit_type.lower() in ['returned_from', 'returned_to']:
+                            # Returned visits don't have pickup-drop constraints
+                            # They are standalone mandatory visits
+                            pass
         
         # Step 2: Collect candidate pairs, sorted by priority (breached first)
         candidate_pairs = []
@@ -687,17 +692,19 @@ def solve_vrp(
     #   - Solver opens new truck rather than drop a visit (penalty > fixed cost)
     #   - SLA-breached visits get extreme penalties (practically never dropped)
     
-    # ─── ENHANCED SLA PRIORITIZATION ───
+    # ─── ENHANCED SLA PRIORITIZATION + MANDATORY VISITS ───
     # DRAMATICALLY increased penalties to ensure SLA-critical visits are NEVER dropped
     # Base penalty is now 50x max distance (was 20x) for even stronger prioritization
+    # MANDATORY visits (returned_from, returned_to) get 1000x penalty - virtually impossible to drop
     base_penalty = max_distance_per_vehicle * 50
     
-    logger.info(f"🎯 SLA-PRIORITIZED routing — base penalty: {base_penalty} "
+    logger.info(f"🎯 SLA-PRIORITIZED + MANDATORY routing — base penalty: {base_penalty} "
                 f"(vehicle fixed cost: {vehicle_fixed_cost})")
     
     breached_count = 0
     urgent_count = 0
     paired_count = 0
+    mandatory_count = 0
     
     for node in range(len(locations)):
         # Skip start and end nodes
@@ -706,6 +713,26 @@ def solve_vrp(
         
         priority = priorities[node] if node < len(priorities) else 5
         
+        # Check if this node contains a mandatory visit type (returned_from, returned_to)
+        is_mandatory = False
+        if combined_order_info and node < len(combined_order_info) and combined_order_info[node]:
+            info = combined_order_info[node]
+            visit_types_at_node = info.get('visit_types', [])
+            for vtype in visit_types_at_node:
+                if vtype and vtype.lower() in ['returned_from', 'returned_to']:
+                    is_mandatory = True
+                    break
+        
+        # MANDATORY visits (returned_from, returned_to) are NOT added to disjunctions
+        # This means the solver CANNOT drop them - they MUST be scheduled in a route
+        # No disjunction = no option to leave unassigned = truly mandatory
+        if is_mandatory:
+            mandatory_count += 1
+            logger.info(f"🔒 Node {node} marked as MANDATORY (returned_from/returned_to) - MUST be scheduled")
+            # Skip adding disjunction for this node - it's mandatory!
+            continue
+        
+        # For all other visits, add disjunctions with SLA-based penalties
         # MASSIVELY INCREASED penalty tiers to prioritize SLA visits
         # These penalties ensure SLA visits are virtually guaranteed to be routed
         if priority >= 15:
@@ -730,8 +757,9 @@ def solve_vrp(
         
         routing.AddDisjunction([manager.NodeToIndex(node)], node_penalty)
     
-    logger.info(f"✅ Added SLA-prioritized disjunctions for {len(locations) - 2} visit nodes")
-    logger.info(f"   🚨 {breached_count} BREACHED (extreme priority), "
+    logger.info(f"✅ Added SLA-prioritized + MANDATORY disjunctions for {len(locations) - 2} visit nodes")
+    logger.info(f"   🔒 {mandatory_count} MANDATORY (returned_from/returned_to), "
+                f"🚨 {breached_count} BREACHED (extreme priority), "
                 f"⚠️  {urgent_count} urgent, 📍 {paired_count} in pairs")
     
     # Add pickup and delivery constraints for complete pairs
@@ -1101,10 +1129,21 @@ def extract_solution(
                 # Could be due to capacity or optimization
                 reason = "optimization_constraint"
             
-            unassigned_visits.append({
-                "visitId": location['visitId'],
-                "reason": reason
-            })
+            # If this is a combined location with multiple visits, add ALL of them to unassigned
+            if visit_groups and i < len(visit_groups) and visit_groups[i]:
+                visit_ids_at_location = visit_groups[i]
+                logger.info(f"📍 Combined location {i} unassigned - adding ALL {len(visit_ids_at_location)} visits: {visit_ids_at_location}")
+                for visit_id in visit_ids_at_location:
+                    unassigned_visits.append({
+                        "visitId": visit_id,
+                        "reason": reason
+                    })
+            else:
+                # Single visit at this location
+                unassigned_visits.append({
+                    "visitId": location['visitId'],
+                    "reason": reason
+                })
     
     # Post-process: Ensure pickup-drop pairs are complete
     # If one part of a pair is assigned and other is not, move the assigned one to unassigned
@@ -1143,29 +1182,58 @@ def extract_solution(
                     # Pickup is in route, drop is not - this is acceptable
                     # Keep pickup in route, add drop to unassigned for rescheduling
                     logger.info(f"📦 Order {pair['order_id']}: PICKUP in route, DROP added to unassigned for rescheduling")
-                    if pair['drop_node'] < len(locations) and 'visitId' in locations[pair['drop_node']]:
-                        unassigned_visits.append({
-                            "visitId": locations[pair['drop_node']]['visitId'],
-                            "reason": "drop_rescheduled_pickup_in_route"
-                        })
+                    drop_node_idx = pair['drop_node']
+                    if drop_node_idx < len(locations) and 'visitId' in locations[drop_node_idx]:
+                        # If drop node is a combined location, add ALL visits at that location
+                        if visit_groups and drop_node_idx < len(visit_groups) and visit_groups[drop_node_idx]:
+                            for visit_id in visit_groups[drop_node_idx]:
+                                unassigned_visits.append({
+                                    "visitId": visit_id,
+                                    "reason": "drop_rescheduled_pickup_in_route"
+                                })
+                        else:
+                            unassigned_visits.append({
+                                "visitId": locations[drop_node_idx]['visitId'],
+                                "reason": "drop_rescheduled_pickup_in_route"
+                            })
                 
                 elif pair['drop_assigned'] and not pair['pickup_assigned']:
                     # Drop is in route but pickup is not - this is invalid!
                     # Remove drop from route, add BOTH to unassigned
-                    logger.warning(f"⚠️ Order {pair['order_id']}: DROP without PICKUP - removing drop, adding both to unassigned")
+                    logger.warning(f"⚠️  Order {pair['order_id']}: DROP without PICKUP - removing drop, adding both to unassigned")
                     nodes_to_remove.add(pair['drop_node'])
                     
-                    # Add both to unassigned
-                    if pair['pickup_node'] < len(locations) and 'visitId' in locations[pair['pickup_node']]:
-                        unassigned_visits.append({
-                            "visitId": locations[pair['pickup_node']]['visitId'],
-                            "reason": "incomplete_pair_no_pickup"
-                        })
-                    if pair['drop_node'] < len(locations) and 'visitId' in locations[pair['drop_node']]:
-                        unassigned_visits.append({
-                            "visitId": locations[pair['drop_node']]['visitId'],
-                            "reason": "incomplete_pair_no_pickup"
-                        })
+                    # Add both pickup and drop to unassigned (handle combined locations)
+                    pickup_node_idx = pair['pickup_node']
+                    drop_node_idx = pair['drop_node']
+                    
+                    # Add pickup visits
+                    if pickup_node_idx < len(locations) and 'visitId' in locations[pickup_node_idx]:
+                        if visit_groups and pickup_node_idx < len(visit_groups) and visit_groups[pickup_node_idx]:
+                            for visit_id in visit_groups[pickup_node_idx]:
+                                unassigned_visits.append({
+                                    "visitId": visit_id,
+                                    "reason": "incomplete_pair_no_pickup"
+                                })
+                        else:
+                            unassigned_visits.append({
+                                "visitId": locations[pickup_node_idx]['visitId'],
+                                "reason": "incomplete_pair_no_pickup"
+                            })
+                    
+                    # Add drop visits
+                    if drop_node_idx < len(locations) and 'visitId' in locations[drop_node_idx]:
+                        if visit_groups and drop_node_idx < len(visit_groups) and visit_groups[drop_node_idx]:
+                            for visit_id in visit_groups[drop_node_idx]:
+                                unassigned_visits.append({
+                                    "visitId": visit_id,
+                                    "reason": "incomplete_pair_no_pickup"
+                                })
+                        else:
+                            unassigned_visits.append({
+                                "visitId": locations[drop_node_idx]['visitId'],
+                                "reason": "incomplete_pair_no_pickup"
+                            })
             
             # Remove invalid drops from routes
             if nodes_to_remove:
@@ -1649,7 +1717,8 @@ def optimize_routes():
                 "lng": 77.60, 
                 "sla_days": 0,
                 "order_id": "ORD123",       // Optional
-                "visit_type": "pickup",     // Optional: "pickup" or "drop"
+                "visit_type": "pickup",     // Optional: "pickup", "drop", "returned_from", "returned_to"
+                                             // Note: "returned_from" and "returned_to" are MANDATORY
                 "time_window_start": 60,    // Optional: earliest arrival (min from shift start)
                 "time_window_end": 300      // Optional: latest arrival (min from shift start)
             },
@@ -1659,7 +1728,7 @@ def optimize_routes():
                 "lng": 77.61, 
                 "sla_days": 3,
                 "order_id": "ORD123",       // Optional
-                "visit_type": "drop"        // Optional: "pickup" or "drop"
+                "visit_type": "drop"        // Optional: "pickup", "drop", "returned_from", "returned_to"
             }
         ]
     }
@@ -1697,6 +1766,12 @@ def optimize_routes():
         api_snap = log_memory("API START")
         
         data = request.get_json()
+        
+        # ─── LOG INPUT ───
+        logger.info("="*80)
+        logger.info("📥 API REQUEST INPUT:")
+        logger.info(json.dumps(data, indent=2))
+        logger.info("="*80)
         
         # Validate input
         if not data:
@@ -1745,12 +1820,23 @@ def optimize_routes():
                      f"{len(visits)} visits")
         
         # Extract order_ids and visit_types from original visits
+        # Also track mandatory visits that MUST be scheduled
         original_order_ids = []
         original_visit_types = []
+        mandatory_visit_ids = set()  # Track visits that MUST be in final routes
         
         for visit in visits:
             original_order_ids.append(visit.get("order_id"))
-            original_visit_types.append(visit.get("visit_type"))
+            visit_type = visit.get("visit_type")
+            original_visit_types.append(visit_type)
+            
+            # Track mandatory visits
+            if visit_type and visit_type.lower() in ['returned_from', 'returned_to']:
+                mandatory_visit_ids.add(visit['visitId'])
+                logger.info(f"🔒 Mandatory visit detected: {visit['visitId']} (type: {visit_type})")
+        
+        if mandatory_visit_ids:
+            logger.info(f"📋 Total mandatory visits to schedule: {len(mandatory_visit_ids)}")
         
         # STEP 1: Filter visits by priority if dataset is large
         # This prevents solver from hanging on large datasets
@@ -1988,6 +2074,15 @@ def optimize_routes():
         logger.info(f"⏱️  TIMING SUMMARY:")
         logger.info(f"   Total API time:   {total_elapsed:.2f}s")
         logger.info(f"{'='*60}")
+        
+        # ─── LOG OUTPUT ───
+        logger.info("="*80)
+        logger.info("📤 API RESPONSE OUTPUT:")
+        logger.info(f"Number of routes: {len(result['routes'])}")
+        logger.info(f"Number of unassigned visits: {len(result['unassigned_visits'])}")
+        logger.info("Full response:")
+        logger.info(json.dumps(result, indent=2))
+        logger.info("="*80)
         
         return jsonify(result), 200
         
