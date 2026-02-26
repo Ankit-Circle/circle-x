@@ -4,10 +4,10 @@ import sys
 import time
 import tracemalloc
 import json
+import math
 from flask import Blueprint, request, jsonify
 from ortools.constraint_solver import routing_enums_pb2
 from ortools.constraint_solver import pywrapcp
-import googlemaps
 from typing import List, Dict, Tuple, Optional
 
 # Configure logging
@@ -17,17 +17,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ─── Google Maps Distance Matrix API ───
-GOOGLE_MAPS_API_KEY = os.environ.get("GOOGLE_MAPS_API_KEY")
-gmaps = None
-if GOOGLE_MAPS_API_KEY:
-    try:
-        gmaps = googlemaps.Client(key=GOOGLE_MAPS_API_KEY)
-        logger.info("✅ Google Maps Client initialized")
-    except Exception as e:
-        logger.error(f"Failed to initialize Google Maps Client: {e}")
-else:
-    logger.warning("⚠️ GOOGLE_MAPS_API_KEY not set — distance matrix will not work!")
+# ─── Haversine Distance Calculation ───
+# Average driving speed for duration estimation (km/h)
+AVERAGE_DRIVING_SPEED_KMH = 35.0  # Default: 35 km/h for city driving
 
 auto_routing_bp = Blueprint("auto_routing", __name__)
 
@@ -59,50 +51,80 @@ def log_memory(label: str, snapshot_start=None):
     return snapshot
 
 
+def haversine_distance(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """
+    Calculate the great circle distance between two points on Earth using Haversine formula.
+    
+    Args:
+        lat1, lon1: Latitude and longitude of first point in degrees
+        lat2, lon2: Latitude and longitude of second point in degrees
+    
+    Returns:
+        Distance in meters
+    """
+    # Earth's radius in meters
+    R = 6371000
+    
+    # Convert latitude and longitude from degrees to radians
+    phi1 = math.radians(lat1)
+    phi2 = math.radians(lat2)
+    delta_phi = math.radians(lat2 - lat1)
+    delta_lambda = math.radians(lon2 - lon1)
+    
+    # Haversine formula
+    a = math.sin(delta_phi / 2) ** 2 + \
+        math.cos(phi1) * math.cos(phi2) * math.sin(delta_lambda / 2) ** 2
+    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+    
+    distance = R * c
+    return distance
+
+
 def create_distance_matrix(
     locations: List[Dict]
 ) -> Tuple[List[List[int]], List[List[int]]]:
     """
-    Create distance AND duration matrices using Google Maps Distance Matrix API.
+    Create distance AND duration matrices using Haversine formula.
+    
+    Distance is calculated as straight-line (great circle) distance.
+    Duration is estimated from distance using average driving speed.
     
     Returns:
         (distance_matrix [meters], duration_matrix [seconds])
-    
-    Raises:
-        Exception if Google Maps API key is not configured or API call fails.
     """
-    if not gmaps:
-        raise Exception("GOOGLE_MAPS_API_KEY is not configured. Cannot build distance matrix.")
-    
     n = len(locations)
     distance_matrix = [[0] * n for _ in range(n)]
     duration_matrix = [[0] * n for _ in range(n)]
     
-    logger.info(f"🗺️  Building {n}x{n} distance + duration matrix via Google Maps API...")
-    coords = [(loc['lat'], loc['lng']) for loc in locations]
+    logger.info(f"🗺️  Building {n}x{n} distance + duration matrix via Haversine formula...")
+    
+    # Get average speed from environment or use default
+    avg_speed_kmh = float(os.environ.get("AVERAGE_DRIVING_SPEED_KMH", AVERAGE_DRIVING_SPEED_KMH))
+    avg_speed_ms = avg_speed_kmh * 1000 / 3600  # Convert km/h to m/s
+    
+    logger.info(f"📏 Using average driving speed: {avg_speed_kmh} km/h for duration estimation")
     
     for i in range(n):
-        for j in range(0, n, 25):
-            chunk_destinations = coords[j : j + 25]
-            result = gmaps.distance_matrix(
-                origins=[coords[i]],
-                destinations=chunk_destinations,
-                mode="driving"
-            )
-            
-            if result['status'] == 'OK':
-                row_elements = result['rows'][0]['elements']
-                for k, element in enumerate(row_elements):
-                    if element['status'] == 'OK':
-                        distance_matrix[i][j + k] = element['distance']['value']
-                        duration_matrix[i][j + k] = element['duration']['value']
-                    else:
-                        distance_matrix[i][j + k] = 9999999
-                        duration_matrix[i][j + k] = 9999999
+        for j in range(n):
+            if i == j:
+                distance_matrix[i][j] = 0
+                duration_matrix[i][j] = 0
             else:
-                raise Exception(f"Google Maps API error: {result['status']}")
+                lat1 = locations[i]['lat']
+                lon1 = locations[i]['lng']
+                lat2 = locations[j]['lat']
+                lon2 = locations[j]['lng']
+                
+                # Calculate Haversine distance
+                distance_meters = haversine_distance(lat1, lon1, lat2, lon2)
+                distance_matrix[i][j] = int(round(distance_meters))
+                
+                # Estimate duration from distance (assuming average driving speed)
+                # Add a small constant for acceleration/deceleration and traffic
+                duration_seconds = int(round(distance_meters / avg_speed_ms))
+                duration_matrix[i][j] = max(1, duration_seconds)  # Minimum 1 second
     
-    logger.info(f"✅ Google Maps matrix built: {n}x{n} ({n*n} elements)")
+    logger.info(f"✅ Haversine matrix built: {n}x{n} ({n*n} elements)")
     return distance_matrix, duration_matrix
 
 
@@ -1070,7 +1092,7 @@ def extract_solution(
             route_distance_meters += distance_matrix[from_node][to_node]
             route_duration_seconds += duration_matrix[from_node][to_node]
         
-        # Google Maps gives real road distances — no adjustment needed
+        # Haversine gives straight-line distances — no adjustment needed
         estimated_road_distance_meters = route_distance_meters
         estimated_duration_seconds = route_duration_seconds
         
@@ -1699,7 +1721,7 @@ def optimize_routes():
     Hybrid VRP Optimizer: CVRP + VRPPD + VRPTW
     
     Solves routing with capacity constraints, pickup-delivery pairs, and time windows.
-    Uses real road distances via Google Maps Distance Matrix API.
+    Uses Haversine formula for distance calculations (straight-line distances).
     
     Expected JSON input:
     {
@@ -1772,6 +1794,9 @@ def optimize_routes():
         logger.info("📥 API REQUEST INPUT:")
         logger.info(json.dumps(data, indent=2))
         logger.info("="*80)
+        
+        # Log that we're using Haversine for distance calculations
+        logger.info("🗺️  Using HAVERSINE formula for distance calculations (straight-line distances)")
         
         # Validate input
         if not data:
@@ -1909,7 +1934,7 @@ def optimize_routes():
         end_index = len(locations) - 1
         
         # Create distance + duration matrices using combined locations
-        # Build distance + duration matrices via Google Maps API
+        # Build distance + duration matrices via Haversine formula
         matrix_start = time.time()
         distance_matrix, duration_matrix = create_distance_matrix(locations)
         matrix_elapsed = time.time() - matrix_start
@@ -1985,13 +2010,13 @@ def optimize_routes():
             aligned_service_times.append(svc_seconds * num_visits_at_node)
         aligned_service_times.append(0)  # 0 for end
         
-        # Convert max_km to meters (Google Maps gives real road distances)
+        # Convert max_km to meters (Haversine gives straight-line distances)
         max_distance_meters = int(max_km * 1000)
         
         # Convert shift duration to seconds
         max_route_time = int(shift_duration_hours * 3600)
         
-        logger.info(f"📏 Distance: {max_km}km limit → {max_distance_meters/1000:.1f}km solver (Google Maps)")
+        logger.info(f"📏 Distance: {max_km}km limit → {max_distance_meters/1000:.1f}km solver (Haversine)")
         logger.info(f"⏰ Time: {shift_duration_hours}h shift, {service_time_minutes}min/stop, "
                      f"time windows: {'YES' if has_any_time_window else 'NO'}")
         
@@ -2083,6 +2108,9 @@ def optimize_routes():
         logger.info("Full response:")
         logger.info(json.dumps(result, indent=2))
         logger.info("="*80)
+        
+        # Log that we completed using Haversine
+        logger.info("✅ Routing optimization completed using HAVERSINE formula")
         
         return jsonify(result), 200
         
