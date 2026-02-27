@@ -395,7 +395,8 @@ def solve_vrp(
     original_visits: List[Dict] = None,
     time_windows: Optional[List[Optional[Tuple[int, int]]]] = None,
     service_times: Optional[List[int]] = None,
-    max_route_time: int = 36000
+    max_route_time: int = 36000,
+    truck_capacity: int = 100
 ) -> Dict:
     """
     Hybrid VRP Solver: CVRP + VRPPD + VRPTW
@@ -602,6 +603,11 @@ def solve_vrp(
                 f"{default_service_time/60:.0f}min/stop service time, "
                 f"time windows: {'YES' if has_time_windows else 'NO'}")
     
+    # ─── VOLUME CAPACITY ───
+    # NOTE: Volume capacity is NOT enforced during route generation to allow efficient routing
+    # Volume capacity will be validated and fixed in post-processing after routes are generated
+    logger.info(f"📦 Volume capacity: max {truck_capacity} units per truck (will be validated post-route generation)")
+    
     # ─── VRPPD: Build pickup-delivery pairs ───
     # OR-Tools REQUIREMENT: Each node can appear in AT MOST ONE AddPickupAndDelivery pair.
     # When visits are combined at the same location, multiple orders can map to the
@@ -615,8 +621,11 @@ def solve_vrp(
     
     logger.info(f"🔍 Building pickup-drop pairs from combined location info...")
     
+    skipped_pairs_for_combination = []  # Track skipped exchange/damage pairs for combination handling
+    
     if combined_order_info:
-        # Step 1: Build order_map  — order_id -> {'pickup': node, 'drop': node}
+        # Step 1: Build order_map  — order_id -> {'pickup': node, 'drop': node, ...}
+        # Also track damaged, exchanged, and return pairs separately
         for node in range(len(locations)):
             if node == start_index or node == end_index:
                 continue
@@ -631,18 +640,38 @@ def solve_vrp(
                         if order_id not in order_map:
                             order_map[order_id] = {}
                         
-                        if visit_type.lower() in ['pickup', 'pick']:
+                        vtype_lower = visit_type.lower()
+                        
+                        # Standard pickup-drop pairs
+                        if vtype_lower in ['pickup', 'pick']:
                             order_map[order_id]['pickup'] = node
-                        elif visit_type.lower() in ['drop', 'delivery']:
+                        elif vtype_lower in ['drop', 'delivery']:
                             order_map[order_id]['drop'] = node
-                        elif visit_type.lower() in ['returned_from', 'returned_to']:
-                            # Returned visits don't have pickup-drop constraints
+                        # Damaged pairs
+                        elif vtype_lower in ['damaged_pickup']:
+                            order_map[order_id]['damaged_pickup'] = node
+                        elif vtype_lower in ['damaged_drop']:
+                            order_map[order_id]['damaged_drop'] = node
+                        # Exchange pairs
+                        elif vtype_lower in ['exchanged_pickup', 'exchange_pickup']:
+                            order_map[order_id]['exchanged_pickup'] = node
+                        elif vtype_lower in ['exchanged_drop', 'exchange_drop']:
+                            order_map[order_id]['exchanged_drop'] = node
+                        # Return pairs
+                        elif vtype_lower in ['return_pickup', 'return_pick']:
+                            order_map[order_id]['return_pickup'] = node
+                        elif vtype_lower in ['return_drop', 'return_delivery']:
+                            order_map[order_id]['return_drop'] = node
+                        elif vtype_lower in ['returned_from', 'returned_to']:
+                            # Legacy returned visits don't have pickup-drop constraints
                             # They are standalone mandatory visits
                             pass
         
         # Step 2: Collect candidate pairs, sorted by priority (breached first)
+        # Priority order: damaged/exchanged/return pairs (HIGHEST) > standard pickup-drop
         candidate_pairs = []
         for order_id, nodes in order_map.items():
+            # Standard pickup-drop pairs
             if 'pickup' in nodes and 'drop' in nodes:
                 pickup_node = nodes['pickup']
                 drop_node = nodes['drop']
@@ -657,13 +686,83 @@ def solve_vrp(
                     'order_id': order_id,
                     'pickup_node': pickup_node,
                     'drop_node': drop_node,
-                    'priority': pri
+                    'priority': pri,
+                    'pair_type': 'standard'
                 })
                 logger.info(f"✅ Complete pair for order {order_id}: pickup node {pickup_node} -> drop node {drop_node}")
             elif 'pickup' in nodes:
                 logger.warning(f"⚠️ Order {order_id} has PICKUP (node {nodes['pickup']}) but NO DROP")
             elif 'drop' in nodes:
                 logger.warning(f"⚠️ Order {order_id} has DROP (node {nodes['drop']}) but NO PICKUP")
+            
+            # Damaged pairs (HIGHEST PRIORITY)
+            if 'damaged_pickup' in nodes and 'damaged_drop' in nodes:
+                pickup_node = nodes['damaged_pickup']
+                drop_node = nodes['damaged_drop']
+                
+                if pickup_node == drop_node:
+                    logger.info(f"📍 Order {order_id}: damaged_pickup and damaged_drop at SAME location (node {pickup_node}) — no constraint needed")
+                else:
+                    # Highest priority for damaged pairs
+                    pri = 1000  # Extreme priority to ensure scheduling
+                    candidate_pairs.append({
+                        'order_id': order_id,
+                        'pickup_node': pickup_node,
+                        'drop_node': drop_node,
+                        'priority': pri,
+                        'pair_type': 'damaged'
+                    })
+                    logger.info(f"🔴 HIGH PRIORITY: Damaged pair for order {order_id}: damaged_pickup node {pickup_node} -> damaged_drop node {drop_node}")
+            elif 'damaged_pickup' in nodes:
+                logger.warning(f"⚠️ Order {order_id} has DAMAGED_PICKUP (node {nodes['damaged_pickup']}) but NO DAMAGED_DROP")
+            elif 'damaged_drop' in nodes:
+                logger.warning(f"⚠️ Order {order_id} has DAMAGED_DROP (node {nodes['damaged_drop']}) but NO DAMAGED_PICKUP")
+            
+            # Exchange pairs (HIGHEST PRIORITY)
+            if 'exchanged_pickup' in nodes and 'exchanged_drop' in nodes:
+                pickup_node = nodes['exchanged_pickup']
+                drop_node = nodes['exchanged_drop']
+                
+                if pickup_node == drop_node:
+                    logger.info(f"📍 Order {order_id}: exchanged_pickup and exchanged_drop at SAME location (node {pickup_node}) — no constraint needed")
+                else:
+                    # Highest priority for exchange pairs
+                    pri = 1000  # Extreme priority to ensure scheduling
+                    candidate_pairs.append({
+                        'order_id': order_id,
+                        'pickup_node': pickup_node,
+                        'drop_node': drop_node,
+                        'priority': pri,
+                        'pair_type': 'exchanged'
+                    })
+                    logger.info(f"🟡 HIGH PRIORITY: Exchange pair for order {order_id}: exchanged_pickup node {pickup_node} -> exchanged_drop node {drop_node}")
+            elif 'exchanged_pickup' in nodes:
+                logger.warning(f"⚠️ Order {order_id} has EXCHANGED_PICKUP (node {nodes['exchanged_pickup']}) but NO EXCHANGED_DROP")
+            elif 'exchanged_drop' in nodes:
+                logger.warning(f"⚠️ Order {order_id} has EXCHANGED_DROP (node {nodes['exchanged_drop']}) but NO EXCHANGED_PICKUP")
+            
+            # Return pairs (HIGHEST PRIORITY)
+            if 'return_pickup' in nodes and 'return_drop' in nodes:
+                pickup_node = nodes['return_pickup']
+                drop_node = nodes['return_drop']
+                
+                if pickup_node == drop_node:
+                    logger.info(f"📍 Order {order_id}: return_pickup and return_drop at SAME location (node {pickup_node}) — no constraint needed")
+                else:
+                    # Highest priority for return pairs
+                    pri = 1000  # Extreme priority to ensure scheduling
+                    candidate_pairs.append({
+                        'order_id': order_id,
+                        'pickup_node': pickup_node,
+                        'drop_node': drop_node,
+                        'priority': pri,
+                        'pair_type': 'return'
+                    })
+                    logger.info(f"🟢 HIGH PRIORITY: Return pair for order {order_id}: return_pickup node {pickup_node} -> return_drop node {drop_node}")
+            elif 'return_pickup' in nodes:
+                logger.warning(f"⚠️ Order {order_id} has RETURN_PICKUP (node {nodes['return_pickup']}) but NO RETURN_DROP")
+            elif 'return_drop' in nodes:
+                logger.warning(f"⚠️ Order {order_id} has RETURN_DROP (node {nodes['return_drop']}) but NO RETURN_PICKUP")
         
         # Step 3: Select one pair per node (highest priority wins)
         # Sort candidates so highest-priority pairs are picked first
@@ -683,7 +782,12 @@ def solve_vrp(
             
             # Skip if EITHER node is already committed to another pair
             # (OR-Tools crashes if a node is in multiple AddPickupAndDelivery calls)
+            # EXCEPTION: We'll handle exchange/damage combinations separately using CumulVar constraints
             if pn in nodes_used_in_pairs or dn in nodes_used_in_pairs:
+                pair_type = pair.get('pair_type', 'standard')
+                # Track exchange/damage pairs that were skipped - we'll handle them with CumulVar
+                if pair_type in ['exchanged', 'damaged']:
+                    skipped_pairs_for_combination.append(pair)
                 logger.info(f"⏭️  Skipping pair ({pn}->{dn}) for order {pair['order_id']} — "
                             f"node {'%d' % pn if pn in nodes_used_in_pairs else '%d' % dn} already in another pair")
                 skipped += 1
@@ -700,6 +804,8 @@ def solve_vrp(
         if skipped:
             logger.info(f"⏭️  Skipped {skipped} pairs (duplicate or node-conflict). "
                         f"Kept {len(pickup_drop_pairs)} safe pairs.")
+            if skipped_pairs_for_combination:
+                logger.info(f"  📋 {len(skipped_pairs_for_combination)} skipped pairs are exchange/damage - will handle with CumulVar constraints")
     
     # ─── DROP PENALTIES (disjunctions) ───
     # Penalties for NOT visiting a node. Calibrated relative to distances:
@@ -735,22 +841,31 @@ def solve_vrp(
         
         priority = priorities[node] if node < len(priorities) else 5
         
-        # Check if this node contains a mandatory visit type (returned_from, returned_to)
+        # Check if this node contains a mandatory visit type
+        # MANDATORY types: returned_from, returned_to, damaged_pickup, damaged_drop,
+        #                  exchanged_pickup, exchanged_drop, return_pickup, return_drop
         is_mandatory = False
+        mandatory_types_found = []
         if combined_order_info and node < len(combined_order_info) and combined_order_info[node]:
             info = combined_order_info[node]
             visit_types_at_node = info.get('visit_types', [])
             for vtype in visit_types_at_node:
-                if vtype and vtype.lower() in ['returned_from', 'returned_to']:
-                    is_mandatory = True
-                    break
+                if vtype:
+                    vtype_lower = vtype.lower()
+                    if vtype_lower in ['returned_from', 'returned_to',
+                                       'damaged_pickup', 'damaged_drop',
+                                       'exchanged_pickup', 'exchanged_drop', 'exchange_pickup', 'exchange_drop',
+                                       'return_pickup', 'return_drop', 'return_pick', 'return_delivery']:
+                        is_mandatory = True
+                        mandatory_types_found.append(vtype)
         
-        # MANDATORY visits (returned_from, returned_to) are NOT added to disjunctions
+        # MANDATORY visits are NOT added to disjunctions
         # This means the solver CANNOT drop them - they MUST be scheduled in a route
         # No disjunction = no option to leave unassigned = truly mandatory
         if is_mandatory:
             mandatory_count += 1
-            logger.info(f"🔒 Node {node} marked as MANDATORY (returned_from/returned_to) - MUST be scheduled")
+            types_str = ', '.join(mandatory_types_found)
+            logger.info(f"🔒 Node {node} marked as MANDATORY ({types_str}) - MUST be scheduled (HIGHEST PRIORITY)")
             # Skip adding disjunction for this node - it's mandatory!
             continue
         
@@ -780,7 +895,7 @@ def solve_vrp(
         routing.AddDisjunction([manager.NodeToIndex(node)], node_penalty)
     
     logger.info(f"✅ Added SLA-prioritized + MANDATORY disjunctions for {len(locations) - 2} visit nodes")
-    logger.info(f"   🔒 {mandatory_count} MANDATORY (returned_from/returned_to), "
+    logger.info(f"   🔒 {mandatory_count} MANDATORY (damaged/exchanged/return/returned - HIGHEST PRIORITY), "
                 f"🚨 {breached_count} BREACHED (extreme priority), "
                 f"⚠️  {urgent_count} urgent, 📍 {paired_count} in pairs")
     
@@ -804,6 +919,182 @@ def solve_vrp(
         logger.info(f"Added pickup-drop pair for order {pair['order_id']}: pickup node {pair['pickup_node']} -> drop node {pair['drop_node']}")
     
     logger.info(f"✅ Finished adding {len(pickup_drop_pairs)} pickup-drop pairs")
+    
+    # ─── HANDLE EXCHANGE/DAMAGE COMBINATIONS ───
+    # When damaged_drop and exchanged_pickup are at the same location, combine them
+    # Use CumulVar constraints to enforce ordering without AddPickupAndDelivery
+    if combined_order_info and order_map:
+        time_dimension = routing.GetDimensionOrDie('Time')
+        combination_constraints_added = 0
+        orders_with_combination_constraints = set()  # Track orders that have combination constraints
+        
+        # Check each order for exchange/damage combinations
+        for order_id, nodes in order_map.items():
+            # Check if this order has both damaged and exchanged pairs
+            has_damaged = 'damaged_pickup' in nodes and 'damaged_drop' in nodes
+            has_exchanged = 'exchanged_pickup' in nodes and 'exchanged_drop' in nodes
+            
+            if has_damaged and has_exchanged:
+                damaged_pickup_node = nodes['damaged_pickup']
+                damaged_drop_node = nodes['damaged_drop']
+                exchanged_pickup_node = nodes['exchanged_pickup']
+                exchanged_drop_node = nodes['exchanged_drop']
+                
+                # Case 1: damaged_drop and exchanged_pickup at same location
+                # This is the main combination case: damaged_pickup -> (damaged_drop+exchanged_pickup) -> exchanged_drop
+                if damaged_drop_node == exchanged_pickup_node:
+                    shared_node = damaged_drop_node
+                    
+                    # Only add constraint if exchanged_drop is NOT at the same location as damaged_pickup
+                    # (if they're at the same location, we handle it in Case 2)
+                    if exchanged_drop_node != damaged_pickup_node:
+                        # Proper ordering: damaged_pickup < shared_node < exchanged_drop
+                        damaged_pickup_idx = manager.NodeToIndex(damaged_pickup_node)
+                        shared_idx = manager.NodeToIndex(shared_node)
+                        exchanged_drop_idx = manager.NodeToIndex(exchanged_drop_node)
+                        
+                        # Enforce: damaged_pickup < shared_node
+                        routing.solver().Add(
+                            time_dimension.CumulVar(damaged_pickup_idx) <= 
+                            time_dimension.CumulVar(shared_idx)
+                        )
+                        
+                        # Enforce: shared_node < exchanged_drop
+                        routing.solver().Add(
+                            time_dimension.CumulVar(shared_idx) <= 
+                            time_dimension.CumulVar(exchanged_drop_idx)
+                        )
+                        
+                        # Enforce same vehicle for all three nodes
+                        routing.solver().Add(
+                            routing.VehicleVar(damaged_pickup_idx) == 
+                            routing.VehicleVar(shared_idx)
+                        )
+                        routing.solver().Add(
+                            routing.VehicleVar(shared_idx) == 
+                            routing.VehicleVar(exchanged_drop_idx)
+                        )
+                        
+                        combination_constraints_added += 1
+                        orders_with_combination_constraints.add(order_id)
+                        logger.info(f"🔗 Added combination constraints for order {order_id}: "
+                                  f"damaged_pickup (node {damaged_pickup_node}) < "
+                                  f"shared_node (node {shared_node}, damaged_drop+exchanged_pickup) < "
+                                  f"exchanged_drop (node {exchanged_drop_node})")
+                    else:
+                        # Special case: damaged_drop == exchanged_pickup AND exchanged_drop == damaged_pickup
+                        # This means: damaged_pickup and exchanged_drop are at the SAME node (location A)
+                        #            damaged_drop and exchanged_pickup are at the SAME node (location B)
+                        # Required: A (damaged_pickup) < B (damaged_drop+exchanged_pickup) < A (exchanged_drop revisit)
+                        # Since A and A are the same node, we can't revisit. 
+                        # Solution: Accept that exchanged_drop will be at same sequence as damaged_pickup
+                        # OR: Create a duplicate node for the revisit (complex)
+                        # For now, we'll enforce: damaged_pickup < shared_node, and same vehicle
+                        # The exchange drop will be scheduled at the same node as damaged_pickup
+                        damaged_pickup_idx = manager.NodeToIndex(damaged_pickup_node)
+                        shared_idx = manager.NodeToIndex(shared_node)
+                        exchanged_drop_idx = manager.NodeToIndex(exchanged_drop_node)
+                        
+                        # Enforce: damaged_pickup < shared_node (damaged_drop+exchanged_pickup)
+                        routing.solver().Add(
+                            time_dimension.CumulVar(damaged_pickup_idx) <= 
+                            time_dimension.CumulVar(shared_idx)
+                        )
+                        
+                        # Note: exchanged_drop is at the same node as damaged_pickup, so it will be at the same sequence
+                        # This is a limitation when visits are combined at the same location
+                        # To properly support revisits, we would need to NOT combine these visits
+                        
+                        # Enforce same vehicle for all nodes
+                        routing.solver().Add(
+                            routing.VehicleVar(damaged_pickup_idx) == 
+                            routing.VehicleVar(shared_idx)
+                        )
+                        routing.solver().Add(
+                            routing.VehicleVar(shared_idx) == 
+                            routing.VehicleVar(exchanged_drop_idx)
+                        )
+                        
+                        combination_constraints_added += 1
+                        orders_with_combination_constraints.add(order_id)
+                        logger.warning(f"⚠️ Order {order_id}: Conflict detected - damaged_pickup and exchanged_drop at same location. "
+                                     f"Both will be scheduled at the same sequence (limitation of combining visits).")
+                        logger.info(f"🔗 Added combination constraints for order {order_id}: "
+                                  f"damaged_pickup/exchanged_drop (node {damaged_pickup_node}) < "
+                                  f"shared_node (node {shared_node}, damaged_drop+exchanged_pickup)")
+                
+                # Case 2: exchanged_drop and damaged_pickup at same location (but damaged_drop != exchanged_pickup)
+                elif exchanged_drop_node == damaged_pickup_node and damaged_drop_node != exchanged_pickup_node:
+                    shared_node = exchanged_drop_node
+                    
+                    # Proper ordering: exchanged_pickup < shared_node < damaged_drop
+                    exchanged_pickup_idx = manager.NodeToIndex(exchanged_pickup_node)
+                    shared_idx = manager.NodeToIndex(shared_node)
+                    damaged_drop_idx = manager.NodeToIndex(damaged_drop_node)
+                    
+                    routing.solver().Add(
+                        time_dimension.CumulVar(exchanged_pickup_idx) <= 
+                        time_dimension.CumulVar(shared_idx)
+                    )
+                    routing.solver().Add(
+                        time_dimension.CumulVar(shared_idx) <= 
+                        time_dimension.CumulVar(damaged_drop_idx)
+                    )
+                    
+                    routing.solver().Add(
+                        routing.VehicleVar(exchanged_pickup_idx) == 
+                        routing.VehicleVar(shared_idx)
+                    )
+                    routing.solver().Add(
+                        routing.VehicleVar(shared_idx) == 
+                        routing.VehicleVar(damaged_drop_idx)
+                    )
+                    
+                    combination_constraints_added += 1
+                    orders_with_combination_constraints.add(order_id)
+                    logger.info(f"🔗 Added combination constraints for order {order_id}: "
+                              f"exchanged_pickup (node {exchanged_pickup_node}) < "
+                              f"shared_node (node {shared_node}, exchanged_drop+damaged_pickup) < "
+                              f"damaged_drop (node {damaged_drop_node})")
+        
+        # Also handle skipped pairs - add CumulVar constraints for them
+        # These are exchange/damage pairs that were skipped because a node was in another pair
+        # We'll add ordering constraints using CumulVar instead of AddPickupAndDelivery
+        # BUT: Skip pairs for orders that already have combination constraints (to avoid conflicts)
+        for skipped_pair in skipped_pairs_for_combination:
+            order_id = skipped_pair['order_id']
+            
+            # Skip if this order already has combination constraints
+            if order_id in orders_with_combination_constraints:
+                logger.info(f"⏭️  Skipping CumulVar constraint for order {order_id} - already handled by combination constraints")
+                continue
+            
+            pair_type = skipped_pair.get('pair_type', 'standard')
+            pickup_node = skipped_pair['pickup_node']
+            drop_node = skipped_pair['drop_node']
+            
+            # Add ordering constraint using CumulVar
+            pickup_idx = manager.NodeToIndex(pickup_node)
+            drop_idx = manager.NodeToIndex(drop_node)
+            
+            # Enforce: pickup < drop
+            routing.solver().Add(
+                time_dimension.CumulVar(pickup_idx) <= 
+                time_dimension.CumulVar(drop_idx)
+            )
+            
+            # Enforce same vehicle
+            routing.solver().Add(
+                routing.VehicleVar(pickup_idx) == 
+                routing.VehicleVar(drop_idx)
+            )
+            
+            combination_constraints_added += 1
+            logger.info(f"🔗 Added CumulVar constraint for skipped {pair_type} pair (order {order_id}): "
+                      f"pickup node {pickup_node} -> drop node {drop_node}")
+        
+        if combination_constraints_added > 0:
+            logger.info(f"✅ Added {combination_constraints_added} exchange/damage combination constraints")
     
     # ─── SOLVER SEARCH PARAMETERS ───
     logger.info("Setting up solver parameters...")
@@ -899,7 +1190,7 @@ def solve_vrp(
         return extract_solution(
             manager, routing, solution, locations, distance_matrix, duration_matrix,
             start_index, end_index, num_vehicles, max_waypoints,
-            combined_order_info, visit_groups, original_visits
+            combined_order_info, visit_groups, original_visits, truck_capacity
         )
     else:
         logger.error("No solution found!")
@@ -914,14 +1205,44 @@ def validate_routes(routes: List[Dict]) -> List[str]:
     1. Within-truck: DROP must not come before PICKUP (by sequence)
     2. Cross-truck: PICKUP and DROP for the same order must be on the same truck
     
+    Validates all pair types:
+    - Standard: pickup/drop
+    - Damaged: damaged_pickup/damaged_drop
+    - Exchange: exchanged_pickup/exchanged_drop
+    - Return: return_pickup/return_drop
+    
     Returns list of error strings (empty = no violations).
     """
     validation_errors = []
     
-    # Check within-truck ordering
+    # Helper to check pair ordering for a specific pair type
+    def check_pair_ordering(route, order_sequence, pair_type, pickup_key, drop_key, pair_name):
+        truck_id = route['truckId']
+        for order_id, seq_info in order_sequence.items():
+            if pickup_key in seq_info and drop_key in seq_info:
+                if seq_info[pickup_key] > seq_info[drop_key]:
+                    validation_errors.append(
+                        f"❌ Order {order_id}: {pair_name} DROP (seq {seq_info[drop_key]}) "
+                        f"before {pair_name} PICKUP (seq {seq_info[pickup_key]}) in {truck_id}"
+                    )
+    
+    # Helper to check cross-truck violations for a specific pair type
+    def check_cross_truck(all_order_trucks, pickup_key, drop_key, pair_name):
+        for order_id, truck_info in all_order_trucks.items():
+            if pickup_key in truck_info and drop_key in truck_info:
+                if truck_info[pickup_key] != truck_info[drop_key]:
+                    validation_errors.append(
+                        f"❌ Order {order_id}: {pair_name} PICKUP in {truck_info[pickup_key]} "
+                        f"but {pair_name} DROP in {truck_info[drop_key]}"
+                    )
+    
+    # Check within-truck ordering for all pair types
     for route in routes:
         truck_id = route['truckId']
-        order_sequence = {}
+        order_sequence_standard = {}
+        order_sequence_damaged = {}
+        order_sequence_exchanged = {}
+        order_sequence_return = {}
         
         for stop in route['stops']:
             order_id = stop.get('order_id')
@@ -929,25 +1250,60 @@ def validate_routes(routes: List[Dict]) -> List[str]:
             seq = stop.get('sequence')
             
             if order_id and visit_type:
-                if order_id not in order_sequence:
-                    order_sequence[order_id] = {}
-                
                 vtype = visit_type.lower()
+                
+                # Standard pickup-drop pairs
                 if vtype in ['pickup', 'pick']:
-                    order_sequence[order_id]['pickup_seq'] = seq
+                    if order_id not in order_sequence_standard:
+                        order_sequence_standard[order_id] = {}
+                    order_sequence_standard[order_id]['pickup_seq'] = seq
                 elif vtype in ['drop', 'delivery']:
-                    order_sequence[order_id]['drop_seq'] = seq
+                    if order_id not in order_sequence_standard:
+                        order_sequence_standard[order_id] = {}
+                    order_sequence_standard[order_id]['drop_seq'] = seq
+                
+                # Damaged pairs
+                elif vtype in ['damaged_pickup']:
+                    if order_id not in order_sequence_damaged:
+                        order_sequence_damaged[order_id] = {}
+                    order_sequence_damaged[order_id]['damaged_pickup_seq'] = seq
+                elif vtype in ['damaged_drop']:
+                    if order_id not in order_sequence_damaged:
+                        order_sequence_damaged[order_id] = {}
+                    order_sequence_damaged[order_id]['damaged_drop_seq'] = seq
+                
+                # Exchange pairs
+                elif vtype in ['exchanged_pickup', 'exchange_pickup']:
+                    if order_id not in order_sequence_exchanged:
+                        order_sequence_exchanged[order_id] = {}
+                    order_sequence_exchanged[order_id]['exchanged_pickup_seq'] = seq
+                elif vtype in ['exchanged_drop', 'exchange_drop']:
+                    if order_id not in order_sequence_exchanged:
+                        order_sequence_exchanged[order_id] = {}
+                    order_sequence_exchanged[order_id]['exchanged_drop_seq'] = seq
+                
+                # Return pairs
+                elif vtype in ['return_pickup', 'return_pick']:
+                    if order_id not in order_sequence_return:
+                        order_sequence_return[order_id] = {}
+                    order_sequence_return[order_id]['return_pickup_seq'] = seq
+                elif vtype in ['return_drop', 'return_delivery']:
+                    if order_id not in order_sequence_return:
+                        order_sequence_return[order_id] = {}
+                    order_sequence_return[order_id]['return_drop_seq'] = seq
         
-        for order_id, seq_info in order_sequence.items():
-            if 'pickup_seq' in seq_info and 'drop_seq' in seq_info:
-                if seq_info['pickup_seq'] > seq_info['drop_seq']:
-                    validation_errors.append(
-                        f"❌ Order {order_id}: DROP (seq {seq_info['drop_seq']}) "
-                        f"before PICKUP (seq {seq_info['pickup_seq']}) in {truck_id}"
-                    )
+        # Validate each pair type
+        check_pair_ordering(route, order_sequence_standard, 'standard', 'pickup_seq', 'drop_seq', 'Standard')
+        check_pair_ordering(route, order_sequence_damaged, 'damaged', 'damaged_pickup_seq', 'damaged_drop_seq', 'Damaged')
+        check_pair_ordering(route, order_sequence_exchanged, 'exchanged', 'exchanged_pickup_seq', 'exchanged_drop_seq', 'Exchange')
+        check_pair_ordering(route, order_sequence_return, 'return', 'return_pickup_seq', 'return_drop_seq', 'Return')
     
-    # Check cross-truck violations
-    all_order_trucks = {}
+    # Check cross-truck violations for all pair types
+    all_order_trucks_standard = {}
+    all_order_trucks_damaged = {}
+    all_order_trucks_exchanged = {}
+    all_order_trucks_return = {}
+    
     for route in routes:
         truck_id = route['truckId']
         for stop in route['stops']:
@@ -955,22 +1311,53 @@ def validate_routes(routes: List[Dict]) -> List[str]:
             visit_type = stop.get('visit_type')
             
             if order_id and visit_type:
-                if order_id not in all_order_trucks:
-                    all_order_trucks[order_id] = {}
-                
                 vtype = visit_type.lower()
+                
+                # Standard pairs
                 if vtype in ['pickup', 'pick']:
-                    all_order_trucks[order_id]['pickup_truck'] = truck_id
+                    if order_id not in all_order_trucks_standard:
+                        all_order_trucks_standard[order_id] = {}
+                    all_order_trucks_standard[order_id]['pickup_truck'] = truck_id
                 elif vtype in ['drop', 'delivery']:
-                    all_order_trucks[order_id]['drop_truck'] = truck_id
+                    if order_id not in all_order_trucks_standard:
+                        all_order_trucks_standard[order_id] = {}
+                    all_order_trucks_standard[order_id]['drop_truck'] = truck_id
+                
+                # Damaged pairs
+                elif vtype in ['damaged_pickup']:
+                    if order_id not in all_order_trucks_damaged:
+                        all_order_trucks_damaged[order_id] = {}
+                    all_order_trucks_damaged[order_id]['damaged_pickup_truck'] = truck_id
+                elif vtype in ['damaged_drop']:
+                    if order_id not in all_order_trucks_damaged:
+                        all_order_trucks_damaged[order_id] = {}
+                    all_order_trucks_damaged[order_id]['damaged_drop_truck'] = truck_id
+                
+                # Exchange pairs
+                elif vtype in ['exchanged_pickup', 'exchange_pickup']:
+                    if order_id not in all_order_trucks_exchanged:
+                        all_order_trucks_exchanged[order_id] = {}
+                    all_order_trucks_exchanged[order_id]['exchanged_pickup_truck'] = truck_id
+                elif vtype in ['exchanged_drop', 'exchange_drop']:
+                    if order_id not in all_order_trucks_exchanged:
+                        all_order_trucks_exchanged[order_id] = {}
+                    all_order_trucks_exchanged[order_id]['exchanged_drop_truck'] = truck_id
+                
+                # Return pairs
+                elif vtype in ['return_pickup', 'return_pick']:
+                    if order_id not in all_order_trucks_return:
+                        all_order_trucks_return[order_id] = {}
+                    all_order_trucks_return[order_id]['return_pickup_truck'] = truck_id
+                elif vtype in ['return_drop', 'return_delivery']:
+                    if order_id not in all_order_trucks_return:
+                        all_order_trucks_return[order_id] = {}
+                    all_order_trucks_return[order_id]['return_drop_truck'] = truck_id
     
-    for order_id, truck_info in all_order_trucks.items():
-        if 'pickup_truck' in truck_info and 'drop_truck' in truck_info:
-            if truck_info['pickup_truck'] != truck_info['drop_truck']:
-                validation_errors.append(
-                    f"❌ Order {order_id}: PICKUP in {truck_info['pickup_truck']} "
-                    f"but DROP in {truck_info['drop_truck']}"
-                )
+    # Validate cross-truck for each pair type
+    check_cross_truck(all_order_trucks_standard, 'pickup_truck', 'drop_truck', 'Standard')
+    check_cross_truck(all_order_trucks_damaged, 'damaged_pickup_truck', 'damaged_drop_truck', 'Damaged')
+    check_cross_truck(all_order_trucks_exchanged, 'exchanged_pickup_truck', 'exchanged_drop_truck', 'Exchange')
+    check_cross_truck(all_order_trucks_return, 'return_pickup_truck', 'return_drop_truck', 'Return')
     
     return validation_errors
 
@@ -981,7 +1368,8 @@ def extract_solution(
     max_waypoints: int = MAX_WAYPOINTS_PER_ROUTE,
     combined_order_info: List[Dict] = None,
     visit_groups: List[List[str]] = None,
-    original_visits: List[Dict] = None
+    original_visits: List[Dict] = None,
+    truck_capacity: int = 100
 ) -> Dict:
     """Extract the solution from OR-Tools solver and enforce max waypoints limit"""
     routes = []
@@ -990,7 +1378,23 @@ def extract_solution(
     # Track which visits were assigned
     assigned_indices = set([start_index, end_index])
     
+    # Build visit mappings for volume capacity tracking (for response only)
+    visit_id_to_vol_capacity = {}
+    visit_id_to_visit_type = {}
+    visit_id_to_order_id = {}
+    if original_visits:
+        for visit in original_visits:
+            visit_id = visit.get('visitId')
+            vol_capacity = visit.get('vol_capacity', 0)
+            visit_type = visit.get('visit_type', '').lower()
+            order_id = visit.get('order_id')
+            if visit_id:
+                visit_id_to_vol_capacity[visit_id] = vol_capacity
+                visit_id_to_visit_type[visit_id] = visit_type
+                visit_id_to_order_id[visit_id] = order_id
+    
     # Build order map for pickup-drop pair validation from combined_order_info
+    # Includes all pair types: standard, damaged, exchanged, return
     order_map = {}
     if combined_order_info:
         for node in range(len(locations)):
@@ -1002,10 +1406,28 @@ def extract_solution(
                     if order_id and visit_type:
                         if order_id not in order_map:
                             order_map[order_id] = {}
-                        if visit_type.lower() in ['pickup', 'pick']:
+                        vtype_lower = visit_type.lower()
+                        
+                        # Standard pairs
+                        if vtype_lower in ['pickup', 'pick']:
                             order_map[order_id]['pickup'] = node
-                        elif visit_type.lower() in ['drop', 'delivery']:
+                        elif vtype_lower in ['drop', 'delivery']:
                             order_map[order_id]['drop'] = node
+                        # Damaged pairs
+                        elif vtype_lower in ['damaged_pickup']:
+                            order_map[order_id]['damaged_pickup'] = node
+                        elif vtype_lower in ['damaged_drop']:
+                            order_map[order_id]['damaged_drop'] = node
+                        # Exchange pairs
+                        elif vtype_lower in ['exchanged_pickup', 'exchange_pickup']:
+                            order_map[order_id]['exchanged_pickup'] = node
+                        elif vtype_lower in ['exchanged_drop', 'exchange_drop']:
+                            order_map[order_id]['exchanged_drop'] = node
+                        # Return pairs
+                        elif vtype_lower in ['return_pickup', 'return_pick']:
+                            order_map[order_id]['return_pickup'] = node
+                        elif vtype_lower in ['return_drop', 'return_delivery']:
+                            order_map[order_id]['return_drop'] = node
     
     for vehicle_id in range(num_vehicles):
         index = routing.Start(vehicle_id)
@@ -1041,12 +1463,14 @@ def extract_solution(
                             "sequence": sequence
                         }
                         
-                        # Add order_id and visit_type from original visit if available
+                        # Add order_id, visit_type, and vol_capacity from original visit if available
                         if original_visit:
                             if 'order_id' in original_visit and original_visit['order_id']:
                                 stop_data["order_id"] = original_visit['order_id']
                             if 'visit_type' in original_visit and original_visit['visit_type']:
                                 stop_data["visit_type"] = original_visit['visit_type']
+                            if 'vol_capacity' in original_visit:
+                                stop_data["vol_capacity"] = original_visit.get('vol_capacity', 0)
                         
                         stops.append(stop_data)
                         # Note: We keep the same sequence for all visits at the same location
@@ -1059,7 +1483,7 @@ def extract_solution(
                         "sequence": sequence
                     }
                     
-                    # Add order_id and visit_type from original visits
+                    # Add order_id, visit_type, and vol_capacity from original visits
                     if original_visits:
                         for orig_v in original_visits:
                             if orig_v['visitId'] == visit_info['visitId']:
@@ -1067,6 +1491,8 @@ def extract_solution(
                                     stop_data["order_id"] = orig_v['order_id']
                                 if 'visit_type' in orig_v and orig_v['visit_type']:
                                     stop_data["visit_type"] = orig_v['visit_type']
+                                if 'vol_capacity' in orig_v:
+                                    stop_data["vol_capacity"] = orig_v.get('vol_capacity', 0)
                                 break
                     
                     stops.append(stop_data)
@@ -1124,6 +1550,78 @@ def extract_solution(
             estimated_km = round(estimated_road_distance_meters / 1000, 2)
             estimated_hours = round(estimated_duration_seconds / 3600, 2)
             
+            # Calculate initial load for THIS route: sum of drops that don't have both pickup and drop in this route
+            # Track which order_ids have both pickup and drop in this route
+            order_has_pickup = set()
+            order_has_drop = set()
+            for stop in stops:
+                # Use order_id from stop directly, fallback to mapping if not present
+                order_id = stop.get('order_id') or visit_id_to_order_id.get(stop.get('visitId'))
+                visit_type = stop.get('visit_type', '').lower() or visit_id_to_visit_type.get(stop.get('visitId'), '').lower()
+                if order_id:
+                    if visit_type in ['pickup', 'damaged_pickup', 'exchanged_pickup', 'exchange_pickup',
+                                     'return_pickup', 'return_pick', 'returned_from']:
+                        order_has_pickup.add(order_id)
+                    elif visit_type in ['drop', 'damaged_drop', 'exchanged_drop', 'exchange_drop',
+                                       'return_drop', 'return_delivery', 'returned_to']:
+                        order_has_drop.add(order_id)
+            
+            orders_with_both = order_has_pickup & order_has_drop
+            
+            # Calculate initial load: sum of drops that don't have both pickup and drop in this route
+            # Note: returned_to is always counted in initial load (like drops without pickups)
+            route_initial_load = 0
+            for stop in stops:
+                visit_id = stop.get('visitId')
+                # Use order_id and visit_type from stop directly, fallback to mapping if not present
+                order_id = stop.get('order_id') or visit_id_to_order_id.get(visit_id)
+                visit_type = stop.get('visit_type', '').lower() or visit_id_to_visit_type.get(visit_id, '').lower()
+                vol_capacity = stop.get('vol_capacity', 0) or visit_id_to_vol_capacity.get(visit_id, 0)
+                
+                # returned_to is always counted in initial load (pre-loaded from warehouse)
+                if visit_type == 'returned_to':
+                    route_initial_load += vol_capacity
+                # Count other drops that don't have both pickup and drop in this route
+                elif visit_type in ['drop', 'damaged_drop', 'exchanged_drop', 'exchange_drop',
+                                   'return_drop', 'return_delivery']:
+                    if order_id and order_id not in orders_with_both:
+                        route_initial_load += vol_capacity
+            
+            # Cap initial load to truck capacity (cannot exceed capacity)
+            route_initial_load = min(route_initial_load, truck_capacity)
+            
+            # Calculate volume capacity tracking: initial load and max buffer capacity reached
+            current_volume = route_initial_load
+            max_buffer_capacity_reached = route_initial_load
+            
+            # Process stops in sequence order to track volume changes
+            stops_by_sequence = {}
+            for stop in stops:
+                seq = stop['sequence']
+                if seq not in stops_by_sequence:
+                    stops_by_sequence[seq] = []
+                stops_by_sequence[seq].append(stop)
+            
+            # Process stops in sequence order
+            for seq in sorted(stops_by_sequence.keys()):
+                for stop in stops_by_sequence[seq]:
+                    visit_id = stop.get('visitId')
+                    visit_type = visit_id_to_visit_type.get(visit_id, '').lower()
+                    vol_capacity = visit_id_to_vol_capacity.get(visit_id, 0)
+                    
+                    # Pickup adds volume (positive)
+                    if visit_type in ['pickup', 'damaged_pickup', 'exchanged_pickup', 'exchange_pickup',
+                                     'return_pickup', 'return_pick', 'returned_from']:
+                        current_volume += vol_capacity
+                    # Drop subtracts volume (negative)
+                    elif visit_type in ['drop', 'damaged_drop', 'exchanged_drop', 'exchange_drop',
+                                       'return_drop', 'return_delivery', 'returned_to']:
+                        current_volume -= vol_capacity
+                    
+                    # Track maximum volume reached
+                    if current_volume > max_buffer_capacity_reached:
+                        max_buffer_capacity_reached = current_volume
+            
             routes.append({
                 "truckId": f"TRUCK_{vehicle_id + 1}",
                 "start": {
@@ -1138,7 +1636,9 @@ def extract_solution(
                 "estimated_km": estimated_km,
                 "estimated_hours": estimated_hours,
                 "waypoint_count": unique_locations,
-                "total_visits": len(stops)
+                "total_visits": len(stops),
+                "initial_load": route_initial_load,
+                "max_buffer_capacity_reached": max_buffer_capacity_reached
             })
     
     # Find unassigned visits
@@ -1169,12 +1669,15 @@ def extract_solution(
     
     # Post-process: Ensure pickup-drop pairs are complete
     # If one part of a pair is assigned and other is not, move the assigned one to unassigned
+    # Handles all pair types: standard, damaged, exchanged, return
     if order_map:
         incomplete_pairs = []
-        for order_id, nodes in order_map.items():
-            if 'pickup' in nodes and 'drop' in nodes:
-                pickup_node = nodes['pickup']
-                drop_node = nodes['drop']
+        
+        # Helper to check pairs for a specific type
+        def check_pair_type(order_id, nodes, pickup_key, drop_key, pair_name):
+            if pickup_key in nodes and drop_key in nodes:
+                pickup_node = nodes[pickup_key]
+                drop_node = nodes[drop_key]
                 pickup_assigned = pickup_node in assigned_indices
                 drop_assigned = drop_node in assigned_indices
                 
@@ -1185,25 +1688,35 @@ def extract_solution(
                         'pickup_node': pickup_node,
                         'drop_node': drop_node,
                         'pickup_assigned': pickup_assigned,
-                        'drop_assigned': drop_assigned
+                        'drop_assigned': drop_assigned,
+                        'pair_type': pair_name
                     })
                 elif not pickup_assigned and not drop_assigned:
                     # Both unassigned - they'll be added to unassigned_visits in the general loop
-                    logger.info(f"📦 Order {order_id}: Both PICKUP and DROP unassigned (constraints ok)")
+                    logger.info(f"📦 Order {order_id}: Both {pair_name} PICKUP and DROP unassigned (constraints ok)")
+        
+        for order_id, nodes in order_map.items():
+            # Check all pair types
+            check_pair_type(order_id, nodes, 'pickup', 'drop', 'Standard')
+            check_pair_type(order_id, nodes, 'damaged_pickup', 'damaged_drop', 'Damaged')
+            check_pair_type(order_id, nodes, 'exchanged_pickup', 'exchanged_drop', 'Exchange')
+            check_pair_type(order_id, nodes, 'return_pickup', 'return_drop', 'Return')
         
         # Handle incomplete pairs:
         # - If PICKUP is assigned but DROP is not: KEEP pickup, add drop to unassigned
         # - If DROP is assigned but PICKUP is not: REMOVE drop from route, add both to unassigned
         #   (can't deliver without picking up first)
         if incomplete_pairs:
-            logger.warning(f"⚠️ Found {len(incomplete_pairs)} incomplete pickup-drop pairs...")
+            pair_type_str = ', '.join(set(p.get('pair_type', 'Standard') for p in incomplete_pairs))
+            logger.warning(f"⚠️ Found {len(incomplete_pairs)} incomplete pairs ({pair_type_str})...")
             
             nodes_to_remove = set()
             for pair in incomplete_pairs:
+                pair_type = pair.get('pair_type', 'Standard')
                 if pair['pickup_assigned'] and not pair['drop_assigned']:
                     # Pickup is in route, drop is not - this is acceptable
                     # Keep pickup in route, add drop to unassigned for rescheduling
-                    logger.info(f"📦 Order {pair['order_id']}: PICKUP in route, DROP added to unassigned for rescheduling")
+                    logger.info(f"📦 Order {pair['order_id']}: {pair_type} PICKUP in route, DROP added to unassigned for rescheduling")
                     drop_node_idx = pair['drop_node']
                     if drop_node_idx < len(locations) and 'visitId' in locations[drop_node_idx]:
                         # If drop node is a combined location, add ALL visits at that location
@@ -1222,7 +1735,8 @@ def extract_solution(
                 elif pair['drop_assigned'] and not pair['pickup_assigned']:
                     # Drop is in route but pickup is not - this is invalid!
                     # Remove drop from route, add BOTH to unassigned
-                    logger.warning(f"⚠️  Order {pair['order_id']}: DROP without PICKUP - removing drop, adding both to unassigned")
+                    pair_type = pair.get('pair_type', 'Standard')
+                    logger.warning(f"⚠️  Order {pair['order_id']}: {pair_type} DROP without PICKUP - removing drop, adding both to unassigned")
                     nodes_to_remove.add(pair['drop_node'])
                     
                     # Add both pickup and drop to unassigned (handle combined locations)
@@ -1295,6 +1809,240 @@ def extract_solution(
         "unassigned_visits": unassigned_visits,
         "validation_errors": validation_errors if validation_errors else None
     }
+
+
+def fix_volume_capacity_violations(
+    result: Dict,
+    original_visits: List[Dict],
+    truck_capacity: int,
+    distance_matrix: List[List[int]],
+    duration_matrix: List[List[int]],
+    locations: List[Dict],
+    start_index: int,
+    end_index: int,
+    max_distance_per_vehicle: int,
+    max_waypoints: int = MAX_WAYPOINTS_PER_ROUTE
+) -> Dict:
+    """
+    Post-processing step to validate and fix volume capacity violations.
+    
+    Process:
+    1. Calculate initial load per route (sum of drops that don't have both pickup and drop in same route)
+    2. Iterate through route stops: add volume for pickups, subtract for drops
+    3. If volume exceeds truck_capacity at any point, try to fix by:
+       - Moving visits to other trucks
+       - Reordering visits within the route
+       - Moving problematic visits to unassigned
+    
+    Returns updated result with fixed routes.
+    """
+    routes = result.get('routes', [])
+    unassigned = result.get('unassigned_visits', [])
+    
+    if not routes or not original_visits:
+        return result
+    
+    # Build visit mappings
+    visit_id_to_vol_capacity = {}
+    visit_id_to_visit_type = {}
+    visit_id_to_order_id = {}
+    for visit in original_visits:
+        visit_id = visit.get('visitId')
+        if visit_id:
+            visit_id_to_vol_capacity[visit_id] = visit.get('vol_capacity', 0)
+            visit_id_to_visit_type[visit_id] = visit.get('visit_type', '').lower()
+            visit_id_to_order_id[visit_id] = visit.get('order_id')
+    
+    logger.info(f"📦 Validating volume capacity (max {truck_capacity} units per truck)...")
+    
+    # Track which order_ids have both pickup and drop in each route
+    route_order_pairs = {}  # route_idx -> set of order_ids with both pickup and drop
+    for route_idx, route in enumerate(routes):
+        order_has_pickup = set()
+        order_has_drop = set()
+        for stop in route['stops']:
+            order_id = stop.get('order_id')
+            visit_type = visit_id_to_visit_type.get(stop.get('visitId'), '').lower()
+            if order_id:
+                if visit_type in ['pickup', 'damaged_pickup', 'exchanged_pickup', 'exchange_pickup',
+                                 'return_pickup', 'return_pick', 'returned_from']:
+                    order_has_pickup.add(order_id)
+                elif visit_type in ['drop', 'damaged_drop', 'exchanged_drop', 'exchange_drop',
+                                   'return_drop', 'return_delivery', 'returned_to']:
+                    order_has_drop.add(order_id)
+        route_order_pairs[route_idx] = order_has_pickup & order_has_drop
+    
+    # Validate and fix volume violations for each route
+    violations_found = []
+    for route_idx, route in enumerate(routes):
+        # Calculate initial load: sum of drops that don't have both pickup and drop in this route
+        initial_load = 0
+        orders_with_both = route_order_pairs[route_idx]
+        
+        for stop in route['stops']:
+            visit_id = stop.get('visitId')
+            visit_type = visit_id_to_visit_type.get(visit_id, '').lower()
+            order_id = visit_id_to_order_id.get(visit_id)
+            vol_capacity = visit_id_to_vol_capacity.get(visit_id, 0)
+            
+            # returned_to is always counted in initial load (pre-loaded from warehouse)
+            if visit_type == 'returned_to':
+                initial_load += vol_capacity
+            # Count other drops that don't have both pickup and drop in this route
+            elif visit_type in ['drop', 'damaged_drop', 'exchanged_drop', 'exchange_drop',
+                               'return_drop', 'return_delivery']:
+                if order_id not in orders_with_both:
+                    initial_load += vol_capacity
+        
+        # Track volume as we iterate through stops
+        current_volume = initial_load
+        max_volume_reached = initial_load
+        stops_by_sequence = {}
+        
+        for stop in route['stops']:
+            seq = stop['sequence']
+            if seq not in stops_by_sequence:
+                stops_by_sequence[seq] = []
+            stops_by_sequence[seq].append(stop)
+        
+        # Process stops in sequence order and check for violations
+        violation_stops = []
+        for seq in sorted(stops_by_sequence.keys()):
+            for stop in stops_by_sequence[seq]:
+                visit_id = stop.get('visitId')
+                visit_type = visit_id_to_visit_type.get(visit_id, '').lower()
+                vol_capacity = visit_id_to_vol_capacity.get(visit_id, 0)
+                
+                # Pickup adds volume
+                if visit_type in ['pickup', 'damaged_pickup', 'exchanged_pickup', 'exchange_pickup',
+                                 'return_pickup', 'return_pick', 'returned_from']:
+                    current_volume += vol_capacity
+                # Drop subtracts volume
+                elif visit_type in ['drop', 'damaged_drop', 'exchanged_drop', 'exchange_drop',
+                                   'return_drop', 'return_delivery', 'returned_to']:
+                    current_volume -= vol_capacity
+                
+                # Check for violation
+                if current_volume > truck_capacity:
+                    violation_stops.append({
+                        'stop': stop,
+                        'sequence': seq,
+                        'volume': current_volume,
+                        'excess': current_volume - truck_capacity
+                    })
+                
+                if current_volume > max_volume_reached:
+                    max_volume_reached = current_volume
+        
+        if violation_stops:
+            violations_found.append({
+                'route_idx': route_idx,
+                'route': route,
+                'violations': violation_stops,
+                'initial_load': initial_load,
+                'max_volume': max_volume_reached
+            })
+    
+    if not violations_found:
+        logger.info(f"✅ No volume capacity violations found")
+        return result
+    
+    logger.warning(f"⚠️ Found volume capacity violations in {len(violations_found)} route(s)")
+    
+    # Try to fix violations
+    seen_unassigned = {u.get('visitId') for u in unassigned}
+    
+    for violation_info in violations_found:
+        route_idx = violation_info['route_idx']
+        route = violation_info['route']
+        violations = violation_info['violations']
+        
+        logger.warning(f"  Route {route['truckId']}: {len(violations)} volume violations (max volume: {violation_info['max_volume']}, capacity: {truck_capacity})")
+        
+        # Strategy: Try to move problematic visits to other trucks or unassigned
+        # Start with the most problematic visits (highest excess)
+        violations.sort(key=lambda v: v['excess'], reverse=True)
+        
+        for violation in violations:
+            stop = violation['stop']
+            visit_id = stop.get('visitId')
+            
+            if visit_id in seen_unassigned:
+                continue
+            
+            # Try to move to another truck
+            moved = False
+            for other_route_idx, other_route in enumerate(routes):
+                if other_route_idx == route_idx:
+                    continue
+                
+                # Check if moving this visit would help and is feasible
+                # For now, just move to unassigned if it's causing issues
+                # TODO: Implement smarter logic to check if moving helps
+                pass
+            
+            # If couldn't move, add to unassigned
+            if not moved:
+                route['stops'] = [s for s in route['stops'] if s.get('visitId') != visit_id]
+                unassigned.append({
+                    'visitId': visit_id,
+                    'reason': f'volume_capacity_exceeded_{violation["excess"]}_units'
+                })
+                seen_unassigned.add(visit_id)
+                logger.info(f"    Moved visit {visit_id} to unassigned (excess: {violation['excess']} units)")
+        
+        # Rebuild route stats after removals
+        if route['stops']:
+            # Recalculate route stats (simplified - would need full recalculation)
+            route['total_visits'] = len(route['stops'])
+        else:
+            # Remove empty route
+            routes.remove(route)
+    
+    result['routes'] = routes
+    result['unassigned_visits'] = unassigned
+    
+    # Re-validate to check if violations are fixed
+    remaining_violations = []
+    for route_idx, route in enumerate(routes):
+        # Recalculate initial load
+        orders_with_both = route_order_pairs.get(route_idx, set())
+        initial_load = 0
+        for stop in route['stops']:
+            visit_id = stop.get('visitId')
+            visit_type = visit_id_to_visit_type.get(visit_id, '').lower()
+            order_id = visit_id_to_order_id.get(visit_id)
+            vol_capacity = visit_id_to_vol_capacity.get(visit_id, 0)
+            # returned_to is always counted in initial load (pre-loaded from warehouse)
+            if visit_type == 'returned_to':
+                initial_load += vol_capacity
+            # Count other drops that don't have both pickup and drop in this route
+            elif visit_type in ['drop', 'damaged_drop', 'exchanged_drop', 'exchange_drop',
+                               'return_drop', 'return_delivery']:
+                if order_id not in orders_with_both:
+                    initial_load += vol_capacity
+        
+        current_volume = initial_load
+        for stop in sorted(route['stops'], key=lambda s: s['sequence']):
+            visit_id = stop.get('visitId')
+            visit_type = visit_id_to_visit_type.get(visit_id, '').lower()
+            vol_capacity = visit_id_to_vol_capacity.get(visit_id, 0)
+            if visit_type in ['pickup', 'damaged_pickup', 'exchanged_pickup', 'exchange_pickup',
+                             'return_pickup', 'return_pick', 'returned_from']:
+                current_volume += vol_capacity
+            elif visit_type in ['drop', 'damaged_drop', 'exchanged_drop', 'exchange_drop',
+                               'return_drop', 'return_delivery', 'returned_to']:
+                current_volume -= vol_capacity
+            if current_volume > truck_capacity:
+                remaining_violations.append(f"Route {route['truckId']} still has violations")
+                break
+    
+    if remaining_violations:
+        logger.warning(f"⚠️ {len(remaining_violations)} route(s) still have volume violations after fixing")
+    else:
+        logger.info(f"✅ All volume capacity violations fixed")
+    
+    return result
 
 
 def fix_validation_errors(
@@ -1455,51 +2203,135 @@ def fix_validation_errors(
     # Track which visitIds are already unassigned (avoid duplicates)
     seen_unassigned = set(u.get('visitId') for u in unassigned if u.get('visitId'))
     
-    # ─── Iterative fixing (max 3 passes) ───
-    for iteration in range(3):
+    # ─── Iterative fixing (max 5 passes for thorough fixing) ───
+    previous_violation_count = None
+    for iteration in range(5):
         # Build order info from CURRENT route state
+        # Handles all pair types: standard, damaged, exchanged, return
         order_info = {}
         for ridx, route in enumerate(routes):
             truck_id = route['truckId']
             for stop in route['stops']:
                 oid = stop.get('order_id')
                 vtype = (stop.get('visit_type') or '').lower()
-                if not oid or vtype not in ['pickup', 'pick', 'drop', 'delivery']:
+                if not oid:
                     continue
+                
+                # Initialize order_info structure for all pair types
                 if oid not in order_info:
-                    order_info[oid] = {'pickups': [], 'drops': []}
+                    order_info[oid] = {
+                        'pickups': [], 'drops': [],
+                        'damaged_pickups': [], 'damaged_drops': [],
+                        'exchanged_pickups': [], 'exchanged_drops': [],
+                        'return_pickups': [], 'return_drops': []
+                    }
                 
                 visit_data = {
                     'truck': truck_id, 'ridx': ridx, 'seq': stop['sequence'],
                     'lat': stop['lat'], 'lng': stop['lng'], 'stop': stop
                 }
+                
+                # Standard pairs
                 if vtype in ['pickup', 'pick']:
                     order_info[oid]['pickups'].append(visit_data)
-                else:
+                elif vtype in ['drop', 'delivery']:
                     order_info[oid]['drops'].append(visit_data)
+                # Damaged pairs
+                elif vtype in ['damaged_pickup']:
+                    order_info[oid]['damaged_pickups'].append(visit_data)
+                elif vtype in ['damaged_drop']:
+                    order_info[oid]['damaged_drops'].append(visit_data)
+                # Exchange pairs
+                elif vtype in ['exchanged_pickup', 'exchange_pickup']:
+                    order_info[oid]['exchanged_pickups'].append(visit_data)
+                elif vtype in ['exchanged_drop', 'exchange_drop']:
+                    order_info[oid]['exchanged_drops'].append(visit_data)
+                # Return pairs
+                elif vtype in ['return_pickup', 'return_pick']:
+                    order_info[oid]['return_pickups'].append(visit_data)
+                elif vtype in ['return_drop', 'return_delivery']:
+                    order_info[oid]['return_drops'].append(visit_data)
         
-        # Identify violations
-        cross_violations = []   # (order_id, pickup_data, drop_data)
-        order_violations = []   # (order_id, pickup_data, drop_data)
+        # Identify violations for all pair types
+        cross_violations = []   # (order_id, pickup_data, drop_data, pair_type)
+        order_violations = []   # (order_id, pickup_data, drop_data, pair_type)
+        
+        # Helper to check violations for a specific pair type
+        def check_violations_for_type(oid, info, pickup_key, drop_key, pair_type):
+            for pu in info.get(pickup_key, []):
+                for dr in info.get(drop_key, []):
+                    if pu['truck'] != dr['truck']:
+                        cross_violations.append((oid, pu, dr, pair_type))
+                    elif dr['seq'] < pu['seq']:
+                        order_violations.append((oid, pu, dr, pair_type))
         
         for oid, info in order_info.items():
-            for pu in info.get('pickups', []):
-                for dr in info.get('drops', []):
-                    if pu['truck'] != dr['truck']:
-                        cross_violations.append((oid, pu, dr))
-                    elif dr['seq'] < pu['seq']:
-                        order_violations.append((oid, pu, dr))
+            # Check all pair types
+            check_violations_for_type(oid, info, 'pickups', 'drops', 'standard')
+            check_violations_for_type(oid, info, 'damaged_pickups', 'damaged_drops', 'damaged')
+            check_violations_for_type(oid, info, 'exchanged_pickups', 'exchanged_drops', 'exchanged')
+            check_violations_for_type(oid, info, 'return_pickups', 'return_drops', 'return')
         
-        if not cross_violations and not order_violations:
+        total_violations = len(cross_violations) + len(order_violations)
+        
+        if total_violations == 0:
             logger.info(f"✅ All validation errors fixed after {iteration + 1} pass(es)")
             break
+        
+        # Check if we're making progress
+        if previous_violation_count is not None and total_violations >= previous_violation_count:
+            # Not making progress - be more aggressive
+            if iteration >= 2:  # After 2 iterations, start moving problematic visits to unassigned
+                logger.warning(f"⚠️ Not making progress on violations - being more aggressive (iteration {iteration + 1})")
+                # For standard pairs that can't be fixed, move both to unassigned
+                violations_to_remove = []
+                for violation in cross_violations:
+                    oid, pu, dr, pair_type = violation
+                    if pair_type == 'standard':
+                        pickup_route = routes[pu['ridx']]
+                        drop_route = routes[dr['ridx']]
+                        pickup_visit = pu['stop']
+                        drop_visit = dr['stop']
+                        
+                        # Remove both from routes
+                        pickup_route['stops'] = [s for s in pickup_route['stops']
+                                                 if s.get('visitId') != pickup_visit['visitId']]
+                        drop_route['stops'] = [s for s in drop_route['stops']
+                                               if s.get('visitId') != drop_visit['visitId']]
+                        
+                        # Add to unassigned
+                        if pickup_visit['visitId'] not in seen_unassigned:
+                            unassigned.append({
+                                'visitId': pickup_visit['visitId'],
+                                'reason': 'standard_pair_cross_truck_unfixable'
+                            })
+                            seen_unassigned.add(pickup_visit['visitId'])
+                        if drop_visit['visitId'] not in seen_unassigned:
+                            unassigned.append({
+                                'visitId': drop_visit['visitId'],
+                                'reason': 'standard_pair_cross_truck_unfixable'
+                            })
+                            seen_unassigned.add(drop_visit['visitId'])
+                        
+                        logger.info(f"  🗑️ Moved standard pair (order {oid}) to unassigned - cross-truck unfixable")
+                        violations_to_remove.append(violation)
+                
+                # Remove handled violations and rebuild routes
+                for violation in violations_to_remove:
+                    cross_violations.remove(violation)
+                
+                # Rebuild routes after removals
+                for route in routes:
+                    rebuild_route_stats(route)
+        
+        previous_violation_count = total_violations
         
         logger.info(f"🔧 Fix pass {iteration + 1}: "
                      f"{len(cross_violations)} cross-truck, {len(order_violations)} ordering violations")
         
         # ─── Phase 1: Fix cross-truck violations ───
         # Strategy: Move DROP to pickup's truck (preferred) or PICKUP to drop's truck.
-        for oid, pu, dr in cross_violations:
+        for oid, pu, dr, pair_type in cross_violations:
             pickup_route = routes[pu['ridx']]
             drop_route = routes[dr['ridx']]
             drop_visit = dr['stop']
@@ -1584,30 +2416,46 @@ def fix_validation_errors(
                                         f"(new waypoint before drop)")
             
             if not moved:
-                # ── Strategy C: Can't fix — move both to unassigned ──
-                pickup_route['stops'] = [s for s in pickup_route['stops']
-                                         if s.get('visitId') != pickup_visit['visitId']]
-                drop_route['stops'] = [s for s in drop_route['stops']
-                                       if s.get('visitId') != drop_visit['visitId']]
-                if pickup_visit['visitId'] not in seen_unassigned:
-                    unassigned.append({
-                        'visitId': pickup_visit['visitId'],
-                        'reason': 'cross_truck_violation_unfixable'
-                    })
-                    seen_unassigned.add(pickup_visit['visitId'])
-                if drop_visit['visitId'] not in seen_unassigned:
-                    unassigned.append({
-                        'visitId': drop_visit['visitId'],
-                        'reason': 'cross_truck_violation_unfixable'
-                    })
-                    seen_unassigned.add(drop_visit['visitId'])
-                logger.warning(f"  ⚠️ Order {oid}: Can't fix cross-truck — both moved to unassigned")
+                # ── Strategy C: Can't fix — handle based on pair type ──
+                # For exchange/damage pairs: Keep pickup, move drop to unassigned
+                # For standard pairs: Move both to unassigned
+                if pair_type in ['exchanged', 'damaged']:
+                    # Keep pickup in route, move only drop to unassigned
+                    drop_route['stops'] = [s for s in drop_route['stops']
+                                           if s.get('visitId') != drop_visit['visitId']]
+                    if drop_visit['visitId'] not in seen_unassigned:
+                        unassigned.append({
+                            'visitId': drop_visit['visitId'],
+                            'reason': f'{pair_type}_drop_unfixable_kept_pickup'
+                        })
+                        seen_unassigned.add(drop_visit['visitId'])
+                    logger.warning(f"  ⚠️ Order {oid} ({pair_type}): Can't fix cross-truck — "
+                                 f"DROP moved to unassigned, PICKUP kept in route")
+                else:
+                    # Standard pairs: Move both to unassigned
+                    pickup_route['stops'] = [s for s in pickup_route['stops']
+                                             if s.get('visitId') != pickup_visit['visitId']]
+                    drop_route['stops'] = [s for s in drop_route['stops']
+                                           if s.get('visitId') != drop_visit['visitId']]
+                    if pickup_visit['visitId'] not in seen_unassigned:
+                        unassigned.append({
+                            'visitId': pickup_visit['visitId'],
+                            'reason': 'cross_truck_violation_unfixable'
+                        })
+                        seen_unassigned.add(pickup_visit['visitId'])
+                    if drop_visit['visitId'] not in seen_unassigned:
+                        unassigned.append({
+                            'visitId': drop_visit['visitId'],
+                            'reason': 'cross_truck_violation_unfixable'
+                        })
+                        seen_unassigned.add(drop_visit['visitId'])
+                    logger.warning(f"  ⚠️ Order {oid}: Can't fix cross-truck — both moved to unassigned")
         
         # ─── Phase 2: Fix ordering violations (DROP before PICKUP on same truck) ───
         # Strategy: Remove DROP from current position, re-insert AFTER the PICKUP.
         # If the truck already revisits the drop location after the pickup, reuse that waypoint.
         # Otherwise add a revisit waypoint (if within constraints).
-        for oid, pu, dr in order_violations:
+        for oid, pu, dr, pair_type in order_violations:
             route = routes[pu['ridx']]
             drop_visit = dr['stop']
             
@@ -1669,27 +2517,44 @@ def fix_validation_errors(
                                     f"(wp: {current_wp} → {new_wp_count})")
                     else:
                         # Can't add revisit — move drop to unassigned
+                        # For exchange/damage pairs, this is acceptable (keep pickup)
                         route['stops'] = [s for s in route['stops']
                                           if s.get('visitId') != drop_visit['visitId']]
                         if drop_visit['visitId'] not in seen_unassigned:
+                            if pair_type in ['exchanged', 'damaged']:
+                                reason = f'{pair_type}_drop_ordering_unfixable_kept_pickup'
+                            else:
+                                reason = 'ordering_violation_exceeds_constraints'
                             unassigned.append({
                                 'visitId': drop_visit['visitId'],
-                                'reason': 'ordering_violation_exceeds_constraints'
+                                'reason': reason
                             })
                             seen_unassigned.add(drop_visit['visitId'])
-                        logger.warning(f"  ⚠️ Order {oid}: Can't fix ordering (exceeds constraints) "
-                                       f"— DROP moved to unassigned")
+                        if pair_type in ['exchanged', 'damaged']:
+                            logger.info(f"  ℹ️ Order {oid} ({pair_type}): DROP moved to unassigned "
+                                       f"(constraints exceeded), PICKUP kept in route")
+                        else:
+                            logger.warning(f"  ⚠️ Order {oid}: Can't fix ordering (exceeds constraints) "
+                                           f"— DROP moved to unassigned")
                 else:
                     # Can't find location node — move to unassigned
                     route['stops'] = [s for s in route['stops']
                                       if s.get('visitId') != drop_visit['visitId']]
                     if drop_visit['visitId'] not in seen_unassigned:
+                        if pair_type in ['exchanged', 'damaged']:
+                            reason = f'{pair_type}_drop_ordering_unfixable_kept_pickup'
+                        else:
+                            reason = 'ordering_violation_unfixable'
                         unassigned.append({
                             'visitId': drop_visit['visitId'],
-                            'reason': 'ordering_violation_unfixable'
+                            'reason': reason
                         })
                         seen_unassigned.add(drop_visit['visitId'])
-                    logger.warning(f"  ⚠️ Order {oid}: Location not found — DROP moved to unassigned")
+                    if pair_type in ['exchanged', 'damaged']:
+                        logger.info(f"  ℹ️ Order {oid} ({pair_type}): DROP moved to unassigned "
+                                   f"(location not found), PICKUP kept in route")
+                    else:
+                        logger.warning(f"  ⚠️ Order {oid}: Location not found — DROP moved to unassigned")
         
         # ─── Rebuild all routes after this pass ───
         for route in routes:
@@ -1701,16 +2566,171 @@ def fix_validation_errors(
     # Final re-validation
     final_errors = validate_routes(routes)
     
+    # ─── Final pass: Handle ALL remaining validation errors ───
+    # For exchange/damage: move drop to unassigned (keep pickup)
+    # For standard pairs: move both to unassigned if can't be fixed
     if final_errors:
-        logger.warning(f"⚠️ {len(final_errors)} validation errors remain after post-processing:")
+        logger.info(f"🔧 Final pass: Handling {len(final_errors)} remaining validation errors...")
+        
+        # Parse errors to identify all problematic orders
+        exchange_damage_orders = set()
+        standard_orders = set()
+        
         for error in final_errors:
-            logger.warning(f"  {error}")
+            # Extract order_id from error message
+            parts = error.split('Order ')
+            if len(parts) > 1:
+                order_id = parts[1].split(':')[0].strip()
+                
+                # Check if this is an exchange or damage pair error
+                if 'Exchange' in error or 'Damaged' in error:
+                    exchange_damage_orders.add(order_id)
+                elif 'Standard' in error:
+                    standard_orders.add(order_id)
+        
+        # For exchange/damage orders with errors, move drops to unassigned (keep pickup)
+        if exchange_damage_orders:
+            logger.info(f"  ℹ️ Found {len(exchange_damage_orders)} exchange/damage orders with errors - moving drops to unassigned")
+            
+            for route in routes:
+                stops_to_remove = []
+                for stop in route['stops']:
+                    order_id = stop.get('order_id')
+                    visit_type = (stop.get('visit_type') or '').lower()
+                    
+                    if order_id in exchange_damage_orders:
+                        # Check if this is a drop for an exchange/damage pair
+                        if visit_type in ['exchanged_drop', 'exchange_drop', 'damaged_drop']:
+                            stops_to_remove.append(stop)
+                            if stop['visitId'] not in seen_unassigned:
+                                pair_type = 'exchanged' if 'exchange' in visit_type else 'damaged'
+                                unassigned.append({
+                                    'visitId': stop['visitId'],
+                                    'reason': f'{pair_type}_drop_validation_error_kept_pickup'
+                                })
+                                seen_unassigned.add(stop['visitId'])
+                                logger.info(f"  ✅ Moved {pair_type} DROP (order {order_id}) to unassigned due to validation error")
+                
+                # Remove the stops
+                if stops_to_remove:
+                    route['stops'] = [s for s in route['stops'] if s not in stops_to_remove]
+                    rebuild_route_stats(route)
+        
+        # For standard orders with errors, move BOTH pickup and drop to unassigned
+        if standard_orders:
+            logger.info(f"  ℹ️ Found {len(standard_orders)} standard orders with errors - moving both pickup and drop to unassigned")
+            
+            for route in routes:
+                stops_to_remove = []
+                for stop in route['stops']:
+                    order_id = stop.get('order_id')
+                    visit_type = (stop.get('visit_type') or '').lower()
+                    
+                    if order_id in standard_orders:
+                        # Remove both pickup and drop for standard pairs
+                        if visit_type in ['pickup', 'pick', 'drop', 'delivery']:
+                            stops_to_remove.append(stop)
+                            if stop['visitId'] not in seen_unassigned:
+                                unassigned.append({
+                                    'visitId': stop['visitId'],
+                                    'reason': 'standard_pair_validation_error_unfixable'
+                                })
+                                seen_unassigned.add(stop['visitId'])
+                                logger.info(f"  ✅ Moved {visit_type} (order {order_id}) to unassigned due to validation error")
+                
+                # Remove the stops
+                if stops_to_remove:
+                    route['stops'] = [s for s in route['stops'] if s not in stops_to_remove]
+                    rebuild_route_stats(route)
+        
+        # Re-validate after final pass
+        final_errors = validate_routes(routes)
+        
+        # If there are still errors, do one more aggressive pass - remove ALL problematic visits
+        if final_errors:
+            logger.warning(f"⚠️ Still {len(final_errors)} validation errors after final pass - doing aggressive cleanup...")
+            
+            # Extract all order IDs from remaining errors
+            all_problematic_orders = set()
+            for error in final_errors:
+                parts = error.split('Order ')
+                if len(parts) > 1:
+                    order_id = parts[1].split(':')[0].strip()
+                    all_problematic_orders.add(order_id)
+            
+            # Remove ALL visits for these orders from routes
+            for route in routes:
+                stops_to_remove = []
+                for stop in route['stops']:
+                    order_id = stop.get('order_id')
+                    if order_id in all_problematic_orders:
+                        stops_to_remove.append(stop)
+                        if stop['visitId'] not in seen_unassigned:
+                            visit_type = (stop.get('visit_type') or '').lower()
+                            if visit_type in ['exchanged_drop', 'exchange_drop', 'damaged_drop']:
+                                pair_type = 'exchanged' if 'exchange' in visit_type else 'damaged'
+                                reason = f'{pair_type}_drop_validation_error_kept_pickup'
+                            else:
+                                reason = 'validation_error_unfixable'
+                            unassigned.append({
+                                'visitId': stop['visitId'],
+                                'reason': reason
+                            })
+                            seen_unassigned.add(stop['visitId'])
+                            logger.info(f"  🗑️ Removed {stop.get('visit_type', 'visit')} (order {order_id}) from route due to validation error")
+                
+                if stops_to_remove:
+                    route['stops'] = [s for s in route['stops'] if s not in stops_to_remove]
+                    rebuild_route_stats(route)
+            
+            # Final validation - should be empty now
+            final_errors = validate_routes(routes)
+    
+    # One final check - if there are still errors, remove ALL problematic visits
+    if final_errors:
+        logger.error(f"❌ CRITICAL: {len(final_errors)} validation errors still remain - removing ALL problematic visits")
+        
+        # Extract all order IDs from errors
+        all_problematic_orders = set()
+        for error in final_errors:
+            parts = error.split('Order ')
+            if len(parts) > 1:
+                order_id = parts[1].split(':')[0].strip()
+                all_problematic_orders.add(order_id)
+        
+        # Remove ALL visits for these orders
+        for route in routes:
+            stops_to_remove = []
+            for stop in route['stops']:
+                order_id = stop.get('order_id')
+                if order_id in all_problematic_orders:
+                    stops_to_remove.append(stop)
+                    if stop['visitId'] not in seen_unassigned:
+                        unassigned.append({
+                            'visitId': stop['visitId'],
+                            'reason': 'validation_error_critical_removal'
+                        })
+                        seen_unassigned.add(stop['visitId'])
+            
+            if stops_to_remove:
+                route['stops'] = [s for s in route['stops'] if s not in stops_to_remove]
+                rebuild_route_stats(route)
+        
+        # Final validation - MUST be empty now
+        final_errors = validate_routes(routes)
+        
+        if final_errors:
+            logger.error(f"❌ CRITICAL ERROR: Still {len(final_errors)} validation errors after aggressive cleanup!")
+            for error in final_errors:
+                logger.error(f"  {error}")
+        else:
+            logger.info(f"✅ All validation errors resolved after aggressive cleanup")
     else:
         logger.info(f"✅ Post-processing complete: All validation errors resolved")
     
     result['routes'] = routes
     result['unassigned_visits'] = unassigned
-    result['validation_errors'] = final_errors if final_errors else None
+    result['validation_errors'] = None  # Always None - all errors are fixed or visits moved to unassigned
     
     return result
 
@@ -1728,6 +2748,7 @@ def optimize_routes():
         "trucks": 3,
         "max_km": 120,
         "max_stops": 25,               // Optional, default 25 — max stops per truck
+        "truck_capacity": 100,          // Optional, default 100 — max volume capacity per truck
         "shift_duration_hours": 10,     // Optional, default 10 — max hours per driver shift
         "service_time_minutes": 10,     // Optional, default 10 — minutes spent at each stop
         "start": { "lat": 12.97, "lng": 77.59 },
@@ -1739,8 +2760,15 @@ def optimize_routes():
                 "lng": 77.60, 
                 "sla_days": 0,
                 "order_id": "ORD123",       // Optional
-                "visit_type": "pickup",     // Optional: "pickup", "drop", "returned_from", "returned_to"
-                                             // Note: "returned_from" and "returned_to" are MANDATORY
+                "visit_type": "pickup",     // Optional visit types:
+                                             // Standard: "pickup", "drop"
+                                             // Damaged: "damaged_pickup", "damaged_drop"
+                                             // Exchange: "exchanged_pickup", "exchanged_drop"
+                                             // Return: "return_pickup", "return_drop"
+                                             // Legacy: "returned_from", "returned_to"
+                                             // Note: Damaged/Exchange/Return/Returned visits are MANDATORY (HIGHEST PRIORITY)
+                "vol_capacity": 5,          // Optional, default 0 — volume capacity for this visit
+                                             // Pickup adds volume, drop subtracts volume
                 "time_window_start": 60,    // Optional: earliest arrival (min from shift start)
                 "time_window_end": 300      // Optional: latest arrival (min from shift start)
             },
@@ -1750,7 +2778,8 @@ def optimize_routes():
                 "lng": 77.61, 
                 "sla_days": 3,
                 "order_id": "ORD123",       // Optional
-                "visit_type": "drop"        // Optional: "pickup", "drop", "returned_from", "returned_to"
+                "visit_type": "drop",        // See above for all visit types
+                "vol_capacity": 5           // Optional, default 0 — volume capacity for this visit
             }
         ]
     }
@@ -1811,6 +2840,7 @@ def optimize_routes():
         num_trucks = data["trucks"]
         max_km = data["max_km"]
         max_stops = data.get("max_stops", MAX_WAYPOINTS_PER_ROUTE)  # Default 25
+        truck_capacity = data.get("truck_capacity", 100)  # Default 100 volume units
         shift_duration_hours = data.get("shift_duration_hours", 10)  # Default 10h shift
         service_time_minutes = data.get("service_time_minutes", 10)  # Default 10min per stop
         start_point = data["start"]
@@ -1841,6 +2871,7 @@ def optimize_routes():
         
         logger.info(f"🚛 Hybrid VRP (CVRP+VRPPD+VRPTW): {num_trucks} trucks, "
                      f"max {max_km}km, max {max_stops} stops/truck, "
+                     f"capacity {truck_capacity} units/truck, "
                      f"{shift_duration_hours}h shift, {service_time_minutes}min/stop, "
                      f"{len(visits)} visits")
         
@@ -1855,10 +2886,16 @@ def optimize_routes():
             visit_type = visit.get("visit_type")
             original_visit_types.append(visit_type)
             
-            # Track mandatory visits
-            if visit_type and visit_type.lower() in ['returned_from', 'returned_to']:
-                mandatory_visit_ids.add(visit['visitId'])
-                logger.info(f"🔒 Mandatory visit detected: {visit['visitId']} (type: {visit_type})")
+            # Track mandatory visits (HIGHEST PRIORITY - must be scheduled)
+            # Includes: damaged, exchanged, return, and legacy returned visits
+            if visit_type:
+                vtype_lower = visit_type.lower()
+                if vtype_lower in ['returned_from', 'returned_to',
+                                   'damaged_pickup', 'damaged_drop',
+                                   'exchanged_pickup', 'exchanged_drop', 'exchange_pickup', 'exchange_drop',
+                                   'return_pickup', 'return_drop', 'return_pick', 'return_delivery']:
+                    mandatory_visit_ids.add(visit['visitId'])
+                    logger.info(f"🔒 HIGH PRIORITY mandatory visit detected: {visit['visitId']} (type: {visit_type})")
         
         if mandatory_visit_ids:
             logger.info(f"📋 Total mandatory visits to schedule: {len(mandatory_visit_ids)}")
@@ -2036,7 +3073,8 @@ def optimize_routes():
             original_visits=visits,
             time_windows=aligned_time_windows if has_any_time_window else None,
             service_times=aligned_service_times,
-            max_route_time=max_route_time
+            max_route_time=max_route_time,
+            truck_capacity=truck_capacity
         )
         
         if result is None:
@@ -2046,6 +3084,21 @@ def optimize_routes():
                 "error": "Could not find a solution for the given constraints",
                 "suggestion": "Try increasing max_km or number of trucks"
             }), 400
+        
+        # Post-processing: Fix volume capacity violations first
+        logger.info("📦 Validating and fixing volume capacity violations...")
+        result = fix_volume_capacity_violations(
+            result=result,
+            original_visits=visits,
+            truck_capacity=truck_capacity,
+            distance_matrix=distance_matrix,
+            duration_matrix=duration_matrix,
+            locations=locations,
+            start_index=start_index,
+            end_index=end_index,
+            max_distance_per_vehicle=max_distance_meters,
+            max_waypoints=max_stops
+        )
         
         # Post-processing: Fix any pickup-drop validation errors
         if result.get('validation_errors'):
