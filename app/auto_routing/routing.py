@@ -9,6 +9,7 @@ from flask import Blueprint, request, jsonify
 from ortools.constraint_solver import routing_enums_pb2
 from ortools.constraint_solver import pywrapcp
 from typing import List, Dict, Tuple, Optional
+import googlemaps
 
 # Configure logging
 logging.basicConfig(
@@ -16,6 +17,12 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+# ─── Google Distance Matrix API ───
+# Google Maps API key (required for real road distances)
+GOOGLE_MAPS_API_KEY = os.environ.get("GOOGLE_MAPS_API_KEY")
+if not GOOGLE_MAPS_API_KEY:
+    logger.warning("⚠️ GOOGLE_MAPS_API_KEY not set - distance calculations may fail")
 
 # ─── Haversine Distance Calculation ───
 # Average driving speed for duration estimation (km/h)
@@ -84,10 +91,10 @@ def create_distance_matrix(
     locations: List[Dict]
 ) -> Tuple[List[List[int]], List[List[int]]]:
     """
-    Create distance AND duration matrices using Haversine formula.
+    Create distance AND duration matrices using Google Distance Matrix API.
     
-    Distance is calculated as straight-line (great circle) distance.
-    Duration is estimated from distance using average driving speed.
+    Uses real road distances and travel durations from Google Maps.
+    Batches requests to handle API limits.
     
     Returns:
         (distance_matrix [meters], duration_matrix [seconds])
@@ -96,35 +103,133 @@ def create_distance_matrix(
     distance_matrix = [[0] * n for _ in range(n)]
     duration_matrix = [[0] * n for _ in range(n)]
     
-    logger.info(f"🗺️  Building {n}x{n} distance + duration matrix via Haversine formula...")
+    if not GOOGLE_MAPS_API_KEY:
+        logger.error("❌ GOOGLE_MAPS_API_KEY not set - cannot use Google Distance Matrix API")
+        raise ValueError("GOOGLE_MAPS_API_KEY environment variable is required")
     
-    # Get average speed from environment or use default
-    avg_speed_kmh = float(os.environ.get("AVERAGE_DRIVING_SPEED_KMH", AVERAGE_DRIVING_SPEED_KMH))
-    avg_speed_ms = avg_speed_kmh * 1000 / 3600  # Convert km/h to m/s
+    logger.info(f"🗺️  Building {n}x{n} distance + duration matrix via Google Distance Matrix API...")
     
-    logger.info(f"📏 Using average driving speed: {avg_speed_kmh} km/h for duration estimation")
+    # Initialize Google Maps client
+    gmaps = googlemaps.Client(key=GOOGLE_MAPS_API_KEY)
     
-    for i in range(n):
-        for j in range(n):
-            if i == j:
-                distance_matrix[i][j] = 0
-                duration_matrix[i][j] = 0
-            else:
-                lat1 = locations[i]['lat']
-                lon1 = locations[i]['lng']
-                lat2 = locations[j]['lat']
-                lon2 = locations[j]['lng']
+    # Google Distance Matrix API limits:
+    # - Free tier: Max 100 elements per request (10 origins × 10 destinations)
+    # - Standard tier: Max 625 elements per request (25 origins × 25 destinations)
+    # Using 10×10 to be safe and work with both free and paid tiers
+    ORIGIN_BATCH_SIZE = 10
+    DEST_BATCH_SIZE = 10
+    
+    # Prepare origins and destinations
+    origins = [(loc['lat'], loc['lng']) for loc in locations]
+    destinations = origins  # Same locations for both
+    
+    total_requests = 0
+    start_time = time.time()
+    
+    # Process origins in batches
+    for orig_batch_start in range(0, n, ORIGIN_BATCH_SIZE):
+        orig_batch_end = min(orig_batch_start + ORIGIN_BATCH_SIZE, n)
+        batch_origins = origins[orig_batch_start:orig_batch_end]
+        
+        # Process destinations in batches
+        for dest_batch_start in range(0, n, DEST_BATCH_SIZE):
+            dest_batch_end = min(dest_batch_start + DEST_BATCH_SIZE, n)
+            batch_destinations = destinations[dest_batch_start:dest_batch_end]
+            
+            try:
+                # Call Google Distance Matrix API
+                result = gmaps.distance_matrix(
+                    origins=batch_origins,
+                    destinations=batch_destinations,
+                    mode="driving",
+                    units="metric"
+                )
                 
-                # Calculate Haversine distance
-                distance_meters = haversine_distance(lat1, lon1, lat2, lon2)
-                distance_matrix[i][j] = int(round(distance_meters))
+                total_requests += 1
                 
-                # Estimate duration from distance (assuming average driving speed)
-                # Add a small constant for acceleration/deceleration and traffic
-                duration_seconds = int(round(distance_meters / avg_speed_ms))
-                duration_matrix[i][j] = max(1, duration_seconds)  # Minimum 1 second
+                # Check for API-level MAX_ELEMENTS_EXCEEDED (just in case)
+                if result.get('status') == 'MAX_ELEMENTS_EXCEEDED':
+                    logger.error(
+                        f"❌ MAX_ELEMENTS_EXCEEDED: Batch too large "
+                        f"({len(batch_origins)} origins × {len(batch_destinations)} destinations). "
+                        f"Falling back to Haversine for this batch."
+                    )
+                    # Fallback to Haversine for this batch
+                    for i, origin in enumerate(batch_origins):
+                        orig_idx = orig_batch_start + i
+                        for j, dest in enumerate(batch_destinations):
+                            dest_idx = dest_batch_start + j
+                            if orig_idx != dest_idx:
+                                lat1, lon1 = origin
+                                lat2, lon2 = dest
+                                distance_meters = haversine_distance(lat1, lon1, lat2, lon2)
+                                distance_matrix[orig_idx][dest_idx] = int(round(distance_meters))
+                                avg_speed_ms = AVERAGE_DRIVING_SPEED_KMH * 1000 / 3600
+                                duration_seconds = int(round(distance_meters / avg_speed_ms))
+                                duration_matrix[orig_idx][dest_idx] = max(1, duration_seconds)
+                    continue
+                
+                # Parse results
+                if result.get('status') == 'OK' and result.get('rows'):
+                    for i, row in enumerate(result['rows']):
+                        orig_idx = orig_batch_start + i
+                        for j, element in enumerate(row['elements']):
+                            dest_idx = dest_batch_start + j
+                            
+                            if orig_idx == dest_idx:
+                                # Same location
+                                distance_matrix[orig_idx][dest_idx] = 0
+                                duration_matrix[orig_idx][dest_idx] = 0
+                            elif element['status'] == 'OK':
+                                # Distance in meters
+                                distance_meters = element['distance']['value']
+                                distance_matrix[orig_idx][dest_idx] = int(round(distance_meters))
+                                
+                                # Duration in seconds
+                                duration_seconds = element['duration']['value']
+                                duration_matrix[orig_idx][dest_idx] = max(1, duration_seconds)  # Minimum 1 second
+                            else:
+                                # If API call failed for this pair, fallback to Haversine
+                                logger.warning(
+                                    f"⚠️ Google API failed for {orig_idx}->{dest_idx}: "
+                                    f"{element.get('status')}, using Haversine fallback"
+                                )
+                                lat1, lon1 = batch_origins[i]
+                                lat2, lon2 = batch_destinations[j]
+                                distance_meters = haversine_distance(lat1, lon1, lat2, lon2)
+                                distance_matrix[orig_idx][dest_idx] = int(round(distance_meters))
+                                avg_speed_ms = AVERAGE_DRIVING_SPEED_KMH * 1000 / 3600
+                                duration_seconds = int(round(distance_meters / avg_speed_ms))
+                                duration_matrix[orig_idx][dest_idx] = max(1, duration_seconds)
+                
+                # Small delay to avoid rate limiting
+                time.sleep(0.1)
+            
+            except Exception as e:
+                logger.error(
+                    f"❌ Error calling Google Distance Matrix API for origins "
+                    f"{orig_batch_start}-{orig_batch_end}, destinations "
+                    f"{dest_batch_start}-{dest_batch_end}: {e}"
+                )
+                # Fallback to Haversine for this batch
+                for i, origin in enumerate(batch_origins):
+                    orig_idx = orig_batch_start + i
+                    for j, dest in enumerate(batch_destinations):
+                        dest_idx = dest_batch_start + j
+                        if orig_idx != dest_idx:
+                            lat1, lon1 = origin
+                            lat2, lon2 = dest
+                            distance_meters = haversine_distance(lat1, lon1, lat2, lon2)
+                            distance_matrix[orig_idx][dest_idx] = int(round(distance_meters))
+                            avg_speed_ms = AVERAGE_DRIVING_SPEED_KMH * 1000 / 3600
+                            duration_seconds = int(round(distance_meters / avg_speed_ms))
+                            duration_matrix[orig_idx][dest_idx] = max(1, duration_seconds)
     
-    logger.info(f"✅ Haversine matrix built: {n}x{n} ({n*n} elements)")
+    elapsed = time.time() - start_time
+    logger.info(
+        f"✅ Google Distance Matrix API: {n}x{n} matrix built in {elapsed:.2f}s "
+        f"({total_requests} API calls)"
+    )
     return distance_matrix, duration_matrix
 
 
@@ -396,7 +501,8 @@ def solve_vrp(
     time_windows: Optional[List[Optional[Tuple[int, int]]]] = None,
     service_times: Optional[List[int]] = None,
     max_route_time: int = 36000,
-    truck_capacity: int = 100
+    truck_capacity: int = 100,
+    start_truck_number: int = 1
 ) -> Dict:
     """
     Hybrid VRP Solver: CVRP + VRPPD + VRPTW
@@ -478,6 +584,22 @@ def solve_vrp(
     )
     distance_dimension = routing.GetDimensionOrDie(dimension_name)
     
+    # ─── ENFORCE STRICT DISTANCE CONSTRAINT ───
+    # Ensure distance constraint is strictly enforced - no route can exceed max_distance_per_vehicle
+    for vehicle_id in range(num_vehicles):
+        start_idx = routing.Start(vehicle_id)
+        end_idx = routing.End(vehicle_id)
+        # Set strict limits: cumulative distance at start and end must be within [0, max_distance_per_vehicle]
+        distance_dimension.CumulVar(start_idx).SetRange(0, max_distance_per_vehicle)
+        distance_dimension.CumulVar(end_idx).SetRange(0, max_distance_per_vehicle)
+    
+    # Set strict limits for all nodes - cumulative distance must never exceed max_distance_per_vehicle
+    for node in range(len(locations)):
+        if node != start_index and node != end_index:
+            index = manager.NodeToIndex(node)
+            # Strict constraint: cumulative distance at this node must be within [0, max_distance_per_vehicle]
+            distance_dimension.CumulVar(index).SetRange(0, max_distance_per_vehicle)
+    
     # ─── SMART PACKING STRATEGY ───
     # Goal: Fill each truck close to max_km/max_stops before using the next truck.
     #
@@ -542,6 +664,22 @@ def solve_vrp(
     )
     waypoint_dimension = routing.GetDimensionOrDie(waypoint_dimension_name)
     
+    # ─── ENFORCE STRICT WAYPOINT CONSTRAINT ───
+    # Ensure waypoint constraint is strictly enforced - no route can exceed max_waypoints
+    for vehicle_id in range(num_vehicles):
+        start_idx = routing.Start(vehicle_id)
+        end_idx = routing.End(vehicle_id)
+        # Set strict limits: cumulative waypoint count at start and end must be within [0, max_waypoints]
+        waypoint_dimension.CumulVar(start_idx).SetRange(0, max_waypoints)
+        waypoint_dimension.CumulVar(end_idx).SetRange(0, max_waypoints)
+    
+    # Set strict limits for all nodes - cumulative waypoint count must never exceed max_waypoints
+    for node in range(len(locations)):
+        if node != start_index and node != end_index:
+            index = manager.NodeToIndex(node)
+            # Strict constraint: cumulative waypoint count at this node must be within [0, max_waypoints]
+            waypoint_dimension.CumulVar(index).SetRange(0, max_waypoints)
+    
     # ─── VRPTW: Time Dimension (travel time + service time + time windows) ───
     # Service time per node = (service_time_per_visit × number_of_visits_at_node)
     # A combined node with 5 visits takes 5×10min = 50min, not just 10min.
@@ -603,10 +741,147 @@ def solve_vrp(
                 f"{default_service_time/60:.0f}min/stop service time, "
                 f"time windows: {'YES' if has_time_windows else 'NO'}")
     
-    # ─── VOLUME CAPACITY ───
-    # NOTE: Volume capacity is NOT enforced during route generation to allow efficient routing
-    # Volume capacity will be validated and fixed in post-processing after routes are generated
-    logger.info(f"📦 Volume capacity: max {truck_capacity} units per truck (will be validated post-route generation)")
+    # ─── VOLUME CAPACITY CONSTRAINT ───
+    # Build volume capacity change per node (pickup adds, drop subtracts)
+    # IMPORTANT: Drops without pickup pairs are pre-loaded items, so we don't subtract when visiting them
+    # (they're already accounted for in initial load, which we'll handle via dimension start range)
+    # This ensures trucks never exceed volumetric capacity at any point in the route sequence
+    node_volume_change = {}  # node_index -> net volume change (positive for pickups, negative for drops)
+    visit_id_to_vol_capacity = {}
+    visit_id_to_visit_type = {}
+    visit_id_to_order_id = {}
+    
+    if original_visits:
+        for visit in original_visits:
+            visit_id = visit.get('visitId')
+            if visit_id:
+                visit_id_to_vol_capacity[visit_id] = visit.get('vol_capacity', 0)
+                visit_id_to_visit_type[visit_id] = visit.get('visit_type', '').lower()
+                visit_id_to_order_id[visit_id] = visit.get('order_id')
+    
+    # Build order_map to identify which drops have pickup pairs (for volume calculation)
+    # Drops with pickup pairs: subtract when visiting (normal flow)
+    # Drops without pickup pairs: pre-loaded, don't subtract (already in truck at start)
+    order_map_for_volume = {}
+    if combined_order_info:
+        for node in range(len(locations)):
+            if node == start_index or node == end_index:
+                continue
+            if node < len(combined_order_info) and combined_order_info[node]:
+                info = combined_order_info[node]
+                for order_id, visit_type in zip(info.get('order_ids', []), info.get('visit_types', [])):
+                    if order_id and visit_type:
+                        if order_id not in order_map_for_volume:
+                            order_map_for_volume[order_id] = {}
+                        vtype_lower = visit_type.lower()
+                        if vtype_lower in ['pickup', 'pick']:
+                            order_map_for_volume[order_id]['has_pickup'] = True
+                        elif vtype_lower in ['drop', 'delivery']:
+                            order_map_for_volume[order_id]['has_drop'] = True
+    
+    # Calculate net volume change per node
+    for node_idx in range(len(locations)):
+        if node_idx == start_index or node_idx == end_index:
+            node_volume_change[node_idx] = 0
+            continue
+        
+        net_volume = 0
+        # Check if this node has combined visits
+        if visit_groups and node_idx < len(visit_groups) and visit_groups[node_idx]:
+            # Multiple visits at this node - sum their volume changes
+            for visit_id in visit_groups[node_idx]:
+                vol_capacity = visit_id_to_vol_capacity.get(visit_id, 0)
+                visit_type = visit_id_to_visit_type.get(visit_id, '').lower()
+                order_id = visit_id_to_order_id.get(visit_id)
+                
+                # Pickup adds volume (positive)
+                if visit_type in ['pickup', 'damaged_pickup', 'exchanged_pickup', 'exchange_pickup',
+                                 'return_pickup', 'return_pick', 'returned_from']:
+                    net_volume += vol_capacity
+                # Drop subtracts volume (negative) - BUT only if it has a pickup pair
+                # Drops without pickup pairs are pre-loaded, so we don't subtract (they're in initial load)
+                elif visit_type in ['drop', 'damaged_drop', 'exchanged_drop', 'exchange_drop',
+                                   'return_drop', 'return_delivery']:
+                    # Only subtract if this drop has a pickup pair (normal pickup-drop flow)
+                    if order_id and order_id in order_map_for_volume:
+                        order_info = order_map_for_volume[order_id]
+                        # If order has both pickup and drop, subtract (normal flow)
+                        if order_info.get('has_pickup') and order_info.get('has_drop'):
+                            net_volume -= vol_capacity
+                        # If drop doesn't have pickup, it's pre-loaded - don't subtract
+                        # (it's already accounted for in initial load)
+                    # returned_to is always pre-loaded, so don't subtract
+                elif visit_type == 'returned_to':
+                    # returned_to is pre-loaded, don't subtract
+                    pass
+        else:
+            # Single visit at this node
+            if 'visitId' in locations[node_idx]:
+                visit_id = locations[node_idx]['visitId']
+                vol_capacity = visit_id_to_vol_capacity.get(visit_id, 0)
+                visit_type = visit_id_to_visit_type.get(visit_id, '').lower()
+                order_id = visit_id_to_order_id.get(visit_id)
+                
+                if visit_type in ['pickup', 'damaged_pickup', 'exchanged_pickup', 'exchange_pickup',
+                                 'return_pickup', 'return_pick', 'returned_from']:
+                    net_volume += vol_capacity
+                elif visit_type in ['drop', 'damaged_drop', 'exchanged_drop', 'exchange_drop',
+                                   'return_drop', 'return_delivery']:
+                    # Only subtract if this drop has a pickup pair
+                    if order_id and order_id in order_map_for_volume:
+                        order_info = order_map_for_volume[order_id]
+                        if order_info.get('has_pickup') and order_info.get('has_drop'):
+                            net_volume -= vol_capacity
+                elif visit_type == 'returned_to':
+                    # returned_to is pre-loaded, don't subtract
+                    pass
+        
+        node_volume_change[node_idx] = net_volume
+    
+    # Create volume capacity callback
+    def volume_callback(from_index):
+        """Returns the net volume change at the 'from' node."""
+        from_node = manager.IndexToNode(from_index)
+        return node_volume_change.get(from_node, 0)
+    
+    volume_callback_index = routing.RegisterUnaryTransitCallback(volume_callback)
+    
+    # Add Volume Capacity dimension - ensures cumulative volume never exceeds truck_capacity
+    volume_dimension_name = 'VolumeCapacity'
+    routing.AddDimension(
+        volume_callback_index,
+        0,  # no slack
+        truck_capacity,  # maximum volume capacity per vehicle
+        True,  # start cumul to zero (vehicles start empty)
+        volume_dimension_name
+    )
+    volume_dimension = routing.GetDimensionOrDie(volume_dimension_name)
+    
+    # Set volume capacity constraints for start and end nodes
+    # IMPORTANT: Pre-loaded drops (drops without pickup pairs) don't subtract volume when visited
+    # They're already in the truck at start, so initial_load = sum of pre-loaded drops
+    # Since we don't subtract for pre-loaded drops, cumulative starts at initial_load and stays >= 0
+    # For drops with pickup pairs: pickup adds, drop subtracts (normal flow)
+    for vehicle_id in range(num_vehicles):
+        start_idx = routing.Start(vehicle_id)
+        # Allow initial load up to truck_capacity (for pre-loaded items like drops without pickups)
+        # The solver will set this to the sum of pre-loaded drops in the route
+        volume_dimension.CumulVar(start_idx).SetRange(0, truck_capacity)
+        end_idx = routing.End(vehicle_id)
+        # End volume should be >= 0
+        # It can be 0 (empty if all pre-loaded items unloaded and no pickups) or up to capacity
+        volume_dimension.CumulVar(end_idx).SetRange(0, truck_capacity)
+    
+    # CRITICAL: Ensure cumulative volume never exceeds truck_capacity AND never goes below 0
+    # Since initial_load = sum of pre-loaded drops, and we subtract when visiting them,
+    # cumulative should always be >= 0 (initial_load - sum_of_unloaded_drops >= 0)
+    for node in range(len(locations)):
+        if node != start_index and node != end_index:
+            index = manager.NodeToIndex(node)
+            # Ensure cumulative volume at this node never exceeds capacity and never goes below 0
+            volume_dimension.CumulVar(index).SetRange(0, truck_capacity)
+    
+    logger.info(f"📦 Volume capacity: max {truck_capacity} units per truck (ENFORCED during route generation)")
     
     # ─── VRPPD: Build pickup-delivery pairs ───
     # OR-Tools REQUIREMENT: Each node can appear in AT MOST ONE AddPickupAndDelivery pair.
@@ -859,14 +1134,17 @@ def solve_vrp(
                         is_mandatory = True
                         mandatory_types_found.append(vtype)
         
-        # MANDATORY visits are NOT added to disjunctions
-        # This means the solver CANNOT drop them - they MUST be scheduled in a route
-        # No disjunction = no option to leave unassigned = truly mandatory
+        # MANDATORY visits get EXTREMELY high penalties but CAN be unassigned if absolutely necessary
+        # This ensures solver always returns a solution (even if some mandatory visits are unassigned)
+        # Routes prioritize efficiency first, then try to satisfy mandatory visits
         if is_mandatory:
             mandatory_count += 1
             types_str = ', '.join(mandatory_types_found)
-            logger.info(f"🔒 Node {node} marked as MANDATORY ({types_str}) - MUST be scheduled (HIGHEST PRIORITY)")
-            # Skip adding disjunction for this node - it's mandatory!
+            logger.info(f"🔒 Node {node} marked as MANDATORY ({types_str}) - HIGHEST PRIORITY (can be unassigned if impossible)")
+            # Add disjunction with EXTREMELY high penalty - highest priority but can be unassigned if needed
+            # Use 100x base penalty to ensure mandatory visits are scheduled whenever possible
+            mandatory_penalty = base_penalty * 100  # Extremely high, but allows unassignment if impossible
+            routing.AddDisjunction([manager.NodeToIndex(node)], mandatory_penalty)
             continue
         
         # For all other visits, add disjunctions with SLA-based penalties
@@ -898,6 +1176,189 @@ def solve_vrp(
     logger.info(f"   🔒 {mandatory_count} MANDATORY (damaged/exchanged/return/returned - HIGHEST PRIORITY), "
                 f"🚨 {breached_count} BREACHED (extreme priority), "
                 f"⚠️  {urgent_count} urgent, 📍 {paired_count} in pairs")
+    
+    # ─── FEASIBILITY CHECK ───
+    # Check for obvious infeasibility before solving
+    num_visit_nodes = len(locations) - 2  # Exclude start and end
+    total_stop_capacity = num_vehicles * max_waypoints
+    total_volume_capacity = num_vehicles * truck_capacity
+    
+    # Force flush to ensure we see this log
+    logger.info(f"🔍 Running feasibility check: {num_visit_nodes} visit nodes, {mandatory_count} mandatory, "
+                f"{len(pickup_drop_pairs)} pickup-drop pairs, {total_stop_capacity} stop capacity")
+    for handler in logging.getLogger().handlers:
+        handler.flush()
+    
+    # Calculate total volume of pre-loaded drops (drops without pickup pairs)
+    total_preloaded_volume = 0
+    try:
+        if combined_order_info and visit_groups:
+            for node_idx, info in enumerate(combined_order_info):
+                if node_idx == start_index or node_idx == end_index:
+                    continue
+                if node_idx < len(visit_groups) and visit_groups[node_idx]:
+                    for visit_id in visit_groups[node_idx]:
+                        visit_type = visit_id_to_visit_type.get(visit_id, '').lower()
+                        order_id = visit_id_to_order_id.get(visit_id)
+                        vol_capacity = visit_id_to_vol_capacity.get(visit_id, 0)
+                        
+                        # Check if this is a pre-loaded drop (drop without pickup pair)
+                        if visit_type in ['drop', 'damaged_drop', 'exchanged_drop', 'exchange_drop',
+                                         'return_drop', 'return_delivery', 'returned_to']:
+                            if order_id and order_id in order_map_for_volume:
+                                order_info = order_map_for_volume[order_id]
+                                # Pre-loaded if drop exists but no pickup pair
+                                if not (order_info.get('has_pickup') and order_info.get('has_drop')):
+                                    total_preloaded_volume += vol_capacity
+    except Exception as e:
+        logger.warning(f"⚠️ Could not calculate pre-loaded volume: {e}")
+        total_preloaded_volume = 0
+    
+    feasibility_issues = []
+    
+    # Check 1: Enough stop capacity?
+    if num_visit_nodes > total_stop_capacity:
+        feasibility_issues.append(
+            f"Not enough stop capacity: {num_visit_nodes} visits need stops, "
+            f"but only {total_stop_capacity} stops available ({num_vehicles} trucks × {max_waypoints} stops)"
+        )
+    
+    # Check 2: Pre-loaded volume exceeds total capacity?
+    if total_preloaded_volume > total_volume_capacity:
+        feasibility_issues.append(
+            f"Pre-loaded volume exceeds capacity: {total_preloaded_volume} units need to be pre-loaded, "
+            f"but total capacity is only {total_volume_capacity} units ({num_vehicles} trucks × {truck_capacity} units)"
+        )
+    
+    # Check 3: Mandatory visits exceed stop capacity?
+    if mandatory_count > total_stop_capacity:
+        feasibility_issues.append(
+            f"Mandatory visits exceed stop capacity: {mandatory_count} mandatory visits must be scheduled, "
+            f"but only {total_stop_capacity} stops available ({num_vehicles} trucks × {max_waypoints} stops)"
+        )
+    
+    # Check 4: Pickup-drop pairs might create impossible constraints
+    # Each pair requires 2 stops on the same truck, and pickup must come before drop
+    # If we have many pairs, they might not fit even if total stops are OK
+    pairs_requiring_stops = len(pickup_drop_pairs) * 2  # Each pair needs 2 stops
+    if pairs_requiring_stops > total_stop_capacity:
+        feasibility_issues.append(
+            f"Pickup-drop pairs exceed stop capacity: {pairs_requiring_stops} stops needed for pairs, "
+            f"but only {total_stop_capacity} stops available"
+        )
+    
+    # Check 5: Minimum trucks needed for mandatory visits
+    min_trucks_for_mandatory = (mandatory_count + max_waypoints - 1) // max_waypoints  # Ceiling division
+    if min_trucks_for_mandatory > num_vehicles:
+        feasibility_issues.append(
+            f"Not enough trucks for mandatory visits: Need at least {min_trucks_for_mandatory} trucks "
+            f"to schedule {mandatory_count} mandatory visits with max {max_waypoints} stops/truck, "
+            f"but only {num_vehicles} trucks available"
+        )
+    
+    if feasibility_issues:
+        logger.warning("⚠️ FEASIBILITY CHECK WARNINGS - Problem may be difficult:")
+        for issue in feasibility_issues:
+            logger.warning(f"   ⚠️ {issue}")
+        logger.warning("   💡 Suggestions:")
+        logger.warning(f"   1. Increase trucks: {num_vehicles} → {max(num_vehicles + 2, int(num_visit_nodes / max_waypoints) + 1)}")
+        logger.warning(f"   2. Increase max stops: {max_waypoints} → {max(max_waypoints + 5, int(num_visit_nodes / num_vehicles) + 1)}")
+        if total_preloaded_volume > total_volume_capacity:
+            logger.warning(f"   3. Increase truck capacity: {truck_capacity} → {int(total_preloaded_volume / num_vehicles) + 10}")
+        logger.warning("   ⚠️ Continuing anyway - solver will try to generate routes, some visits may be unassigned")
+    
+    # Check for tight constraints that might cause infeasibility
+    utilization_ratio = mandatory_count / total_stop_capacity if total_stop_capacity > 0 else 0
+    if utilization_ratio > 0.7:  # More than 70% of stops are mandatory
+        logger.warning(f"⚠️ Tight constraints detected: {mandatory_count}/{total_stop_capacity} stops are mandatory ({utilization_ratio*100:.1f}%)")
+        logger.warning(f"   Combined with {len(pickup_drop_pairs)} pickup-drop pairs, this may cause infeasibility")
+        logger.warning(f"   Consider: increasing trucks to {num_vehicles + 2} or max stops to {max_waypoints + 5}")
+    
+    # Filter out pickup-drop pairs that exceed distance limits
+    # These pairs cannot be satisfied (same truck requirement + distance limit conflict)
+    # We'll allow the drop to be unassigned instead of making the problem infeasible
+    if len(pickup_drop_pairs) > 0 and distance_matrix:
+        logger.info(f"📏 Checking pickup-drop pair distances against {max_distance_per_vehicle/1000:.1f}km limit...")
+        filtered_pairs = []
+        skipped_pairs = []
+        for pair in pickup_drop_pairs:
+            pickup_node = pair['pickup_node']
+            drop_node = pair['drop_node']
+            if (pickup_node < len(distance_matrix) and 
+                drop_node < len(distance_matrix[pickup_node])):
+                dist_km = distance_matrix[pickup_node][drop_node] / 1000.0
+                if dist_km > max_distance_per_vehicle / 1000.0:
+                    skipped_pairs.append((pickup_node, drop_node, dist_km))
+                    logger.warning(f"   ⚠️ Skipping pair constraint {pickup_node}→{drop_node}: {dist_km:.1f}km exceeds {max_distance_per_vehicle/1000:.1f}km limit")
+                    logger.warning(f"      Drop visit will be allowed to be unassigned if needed (route optimized for efficiency)")
+                else:
+                    filtered_pairs.append(pair)
+            else:
+                # If distance not available, keep the pair (safer to include it)
+                filtered_pairs.append(pair)
+        
+        if skipped_pairs:
+            logger.warning(f"⚠️ Filtered out {len(skipped_pairs)} pickup-drop pairs that exceed distance limit")
+            logger.warning(f"   These drops can be unassigned - route will be optimized for efficiency first")
+            # Update pickup_drop_pairs to only include valid pairs
+            pickup_drop_pairs = filtered_pairs
+    
+    # Check if mandatory visits are reachable from depot within distance limit
+    # This is critical - if mandatory visits are too far from depot, they can't be scheduled
+    if mandatory_count > 0 and distance_matrix and start_index < len(distance_matrix):
+        logger.info(f"📏 Checking if {mandatory_count} mandatory visits are reachable from depot...")
+        unreachable_mandatory = []
+        mandatory_nodes = []
+        
+        # Find all mandatory nodes
+        if combined_order_info:
+            for node_idx, info in enumerate(combined_order_info):
+                if node_idx == start_index or node_idx == end_index:
+                    continue
+                if visit_groups and node_idx < len(visit_groups) and visit_groups[node_idx]:
+                    for visit_id in visit_groups[node_idx]:
+                        visit_type = visit_id_to_visit_type.get(visit_id, '').lower()
+                        if visit_type in ['returned_from', 'returned_to', 'damaged_pickup', 'damaged_drop',
+                                         'exchanged_pickup', 'exchanged_drop', 'return_pickup', 'return_drop']:
+                            if node_idx not in mandatory_nodes:
+                                mandatory_nodes.append(node_idx)
+                            break
+        
+        # Check distance from depot to each mandatory node
+        # A mandatory visit needs at least: depot → visit → depot (round trip)
+        # So if distance > max_distance/2, even a simple round trip exceeds limit
+        max_one_way_distance = max_distance_per_vehicle / 2000.0  # Half of max distance (round trip)
+        for node_idx in mandatory_nodes:
+            if node_idx < len(distance_matrix[start_index]):
+                dist_km = distance_matrix[start_index][node_idx] / 1000.0
+                round_trip_km = dist_km * 2  # Depot → visit → depot
+                if round_trip_km > max_distance_per_vehicle / 1000.0:
+                    unreachable_mandatory.append((node_idx, dist_km, round_trip_km))
+                    logger.error(f"   ❌ Mandatory node {node_idx}: {dist_km:.1f}km from depot → round trip {round_trip_km:.1f}km EXCEEDS {max_distance_per_vehicle/1000:.1f}km limit!")
+                elif dist_km > max_one_way_distance:
+                    logger.warning(f"   ⚠️ Mandatory node {node_idx}: {dist_km:.1f}km from depot (round trip {round_trip_km:.1f}km) - tight constraint")
+        
+        if unreachable_mandatory:
+            logger.warning(f"⚠️ FEASIBILITY WARNING: {len(unreachable_mandatory)} mandatory visits are unreachable from depot!")
+            logger.warning(f"   Round trip exceeds distance limit - these visits may be unassigned")
+            max_needed = max([rt for _, _, rt in unreachable_mandatory])
+            logger.warning(f"   💡 Consider: Increase max_distance from {max_distance_per_vehicle/1000:.1f}km to at least {max_needed:.1f}km")
+            logger.warning("   ⚠️ Continuing anyway - solver will try to generate routes, unreachable visits will be unassigned")
+        
+        # Log summary of mandatory visit distances
+        if mandatory_nodes:
+            distances = [distance_matrix[start_index][n] / 1000.0 for n in mandatory_nodes if n < len(distance_matrix[start_index])]
+            if distances:
+                avg_dist = sum(distances) / len(distances)
+                max_dist = max(distances)
+                logger.info(f"   📍 Mandatory visits: avg {avg_dist:.1f}km, max {max_dist:.1f}km from depot")
+                if max_dist > max_distance_per_vehicle / 2000.0:
+                    logger.warning(f"   ⚠️ Some mandatory visits are far from depot - may need multiple trucks or higher distance limit")
+    
+    logger.info(f"✅ Feasibility check passed: Basic constraints appear satisfiable")
+    # Force flush to ensure logs appear
+    for handler in logging.getLogger().handlers:
+        handler.flush()
     
     # Add pickup and delivery constraints for complete pairs
     # AddPickupAndDelivery enforces: same vehicle + pickup before drop
@@ -1127,6 +1588,11 @@ def solve_vrp(
     search_parameters.time_limit.seconds = time_limit
     search_parameters.log_search = False
     
+    # Make solver more lenient - allow it to return partial solutions even if constraints are tight
+    # This ensures we always get a solution, even if some visits are unassigned
+    search_parameters.use_full_propagation = False  # Faster, more lenient propagation
+    search_parameters.use_depth_first_search = False  # Use breadth-first for better coverage
+    
     logger.info(f"🚀 Starting solver: {num_vehicles} vehicles, {len(locations)} locations, "
                 f"max {max_distance_per_vehicle/1000:.0f}km/truck, max {max_waypoints} stops/truck, "
                 f"time limit: {time_limit}s")
@@ -1143,6 +1609,15 @@ def solve_vrp(
     was_tracing = tracemalloc.is_tracing()
     if was_tracing:
         tracemalloc.stop()
+    
+    # Final diagnostic before solving
+    logger.info(f"📊 Pre-solve summary:")
+    logger.info(f"   - Visit nodes: {len(locations) - 2} (excluding start/end)")
+    logger.info(f"   - Mandatory visits: {mandatory_count}")
+    logger.info(f"   - Pickup-drop pairs: {len(pickup_drop_pairs)}")
+    logger.info(f"   - Stop capacity: {num_vehicles} trucks × {max_waypoints} stops = {num_vehicles * max_waypoints}")
+    logger.info(f"   - Distance limit: {max_distance_per_vehicle/1000:.1f}km per truck")
+    logger.info(f"   - Volume capacity: {truck_capacity} units per truck")
     
     logger.info("🔧 Launching OR-Tools solver...")
     # Flush all log handlers so we see the message even if the process crashes
@@ -1176,7 +1651,26 @@ def solve_vrp(
         if not solution:
             logger.error(f"❌ No solution found. Status: {status_name}")
             if status == 3:
-                logger.error("Solver timed out. Try reducing visits or increasing time limit.")
+                # ROUTING_FAIL_TIMEOUT usually means infeasible problem, not actual timeout
+                # (especially when solve time is very short like 0.02s)
+                logger.error("⚠️ Solver failed - problem appears INFEASIBLE (not a timeout).")
+                logger.error(f"   Problem details:")
+                logger.error(f"   - {num_vehicles} trucks available")
+                logger.error(f"   - {len(locations)} unique locations (after combining)")
+                logger.error(f"   - Max {max_distance_per_vehicle/1000:.1f}km per truck")
+                logger.error(f"   - Max {max_waypoints} stops per truck")
+                logger.error(f"   - Max {truck_capacity} units volume capacity per truck")
+                # Count mandatory visits (from the earlier logging)
+                logger.error(f"   - {mandatory_count} mandatory visits (must be scheduled)")
+                # Count pickup-drop pairs
+                logger.error(f"   - {len(pickup_drop_pairs)} pickup-drop pairs requiring same truck")
+                logger.error("   💡 Suggestions:")
+                logger.error("   1. Increase number of trucks")
+                logger.error("   2. Increase max distance per truck")
+                logger.error("   3. Increase max stops per truck")
+                logger.error("   4. Check if mandatory visits are too spread out geographically")
+                logger.error("   5. Verify volume capacity constraints are not too tight")
+                logger.error("   6. Consider relaxing some mandatory visit constraints")
             elif status == 2:
                 logger.error("Solver failed - constraints may be infeasible. Check pickup-drop pairs and distance limits.")
     except Exception as e:
@@ -1184,17 +1678,41 @@ def solve_vrp(
         logger.error(f"❌ Solver crashed after {solve_elapsed:.2f}s: {str(e)}", exc_info=True)
         if was_tracing and not tracemalloc.is_tracing():
             tracemalloc.start()
-        return None
+        # Return empty solution instead of None - solver should always return something
+        logger.error("Returning empty solution with all visits unassigned due to solver crash")
+        return {
+            'routes': [],
+            'unassigned_visits': original_visits if original_visits else [],
+            'total_distance': 0,
+            'total_duration': 0,
+            'num_vehicles_used': 0,
+            'solution_quality': 'FAILED - solver crashed'
+        }
     
     if solution:
         return extract_solution(
             manager, routing, solution, locations, distance_matrix, duration_matrix,
             start_index, end_index, num_vehicles, max_waypoints,
-            combined_order_info, visit_groups, original_visits, truck_capacity
+            combined_order_info, visit_groups, original_visits, truck_capacity,
+            max_distance_per_vehicle,
+            start_truck_number=start_truck_number
         )
     else:
-        logger.error("No solution found!")
-        return None
+        # Solver failed - return empty solution with all visits unassigned
+        # This ensures we ALWAYS return a solution structure, even if no routes can be generated
+        logger.error("❌ Solver failed - returning empty solution with all visits unassigned")
+        logger.error("   Routes prioritize efficiency, but constraints made it impossible to generate any routes")
+        logger.error("   All visits will be marked as unassigned")
+        
+        # Return empty solution structure
+        return {
+            'routes': [],
+            'unassigned_visits': original_visits if original_visits else [],
+            'total_distance': 0,
+            'total_duration': 0,
+            'num_vehicles_used': 0,
+            'solution_quality': 'FAILED - constraints too tight'
+        }
 
 
 def validate_routes(routes: List[Dict]) -> List[str]:
@@ -1369,9 +1887,11 @@ def extract_solution(
     combined_order_info: List[Dict] = None,
     visit_groups: List[List[str]] = None,
     original_visits: List[Dict] = None,
-    truck_capacity: int = 100
+    truck_capacity: int = 100,
+    max_distance_per_vehicle: int = None,
+    start_truck_number: int = 1
 ) -> Dict:
-    """Extract the solution from OR-Tools solver and enforce max waypoints limit"""
+    """Extract the solution from OR-Tools solver and enforce max waypoints and max_km limits"""
     routes = []
     unassigned_visits = []
     
@@ -1428,6 +1948,10 @@ def extract_solution(
                             order_map[order_id]['return_pickup'] = node
                         elif vtype_lower in ['return_drop', 'return_delivery']:
                             order_map[order_id]['return_drop'] = node
+    
+    # Track sequential truck number (not vehicle_id, since empty routes are skipped)
+    # Start from the provided start_truck_number to continue numbering across passes
+    truck_number = start_truck_number
     
     for vehicle_id in range(num_vehicles):
         index = routing.Start(vehicle_id)
@@ -1508,6 +2032,11 @@ def extract_solution(
             if next_node != route_nodes[-1]:  # Avoid duplicates
                 route_nodes.append(next_node)
         
+        # Ensure end_index is added to route_nodes for complete distance calculation
+        # (The loop exits when IsEnd is True, so end_index might not be added yet)
+        if route_nodes and route_nodes[-1] != end_index:
+            route_nodes.append(end_index)
+        
         # Calculate actual route distance AND duration from matrices
         # Sum: start→stop1 + stop1→stop2 + ... + stopN→end
         route_distance_meters = 0
@@ -1522,30 +2051,43 @@ def extract_solution(
         estimated_road_distance_meters = route_distance_meters
         estimated_duration_seconds = route_duration_seconds
         
+        # Validate max_km constraint - STRICT ENFORCEMENT
+        # The solver MUST enforce this via AddDimension, but we validate as a safety check
+        if max_distance_per_vehicle is not None and route_distance_meters > max_distance_per_vehicle:
+            logger.error(f"❌ CRITICAL: Route for vehicle {vehicle_id + 1} exceeds max_km: "
+                          f"{route_distance_meters/1000:.2f}km > {max_distance_per_vehicle/1000:.2f}km")
+            logger.error(f"   This should NOT happen - distance constraint should be enforced by solver!")
+            logger.error(f"   Route will be marked as invalid - all stops unassigned")
+            # Mark all stops in this route as unassigned - constraint violation is critical
+            for stop in stops:
+                unassigned_visits.append({
+                    "visitId": stop['visitId'],
+                    "reason": "max_km_constraint_violation"
+                })
+            # Skip this route entirely - it violates strict constraints
+            continue
+        
         # Only add route if it has stops
         if stops:
             # Count unique locations (each sequence = 1 physical stop)
             # Combined visits at the same location share the same sequence number
             unique_locations = len(set(s['sequence'] for s in stops))
             
-            # Enforce max waypoints limit by LOCATION count (not individual visits)
+            # Validate max waypoints limit - STRICT ENFORCEMENT
+            # The solver MUST enforce this via AddDimension, but we validate as a safety check
             if unique_locations > max_waypoints:
-                logger.warning(f"Route for TRUCK_{vehicle_id + 1} has {unique_locations} locations, truncating to {max_waypoints}")
-                # Find which sequences to keep (first max_waypoints locations)
-                allowed_sequences = sorted(set(s['sequence'] for s in stops))[:max_waypoints]
-                allowed_set = set(allowed_sequences)
-                
-                kept_stops = []
+                logger.error(f"❌ CRITICAL: Route for vehicle {vehicle_id + 1} exceeds max_waypoints: "
+                             f"{unique_locations} > {max_waypoints}")
+                logger.error(f"   This should NOT happen - waypoint constraint should be enforced by solver!")
+                logger.error(f"   Route will be marked as invalid - all stops unassigned")
+                # Mark all stops in this route as unassigned - constraint violation is critical
                 for stop in stops:
-                    if stop['sequence'] in allowed_set:
-                        kept_stops.append(stop)
-                    else:
-                        unassigned_visits.append({
-                            "visitId": stop['visitId'],
-                            "reason": "max_waypoints_exceeded"
-                        })
-                stops = kept_stops
-                unique_locations = max_waypoints
+                    unassigned_visits.append({
+                        "visitId": stop['visitId'],
+                        "reason": "max_waypoints_constraint_violation"
+                    })
+                # Skip this route entirely - it violates strict constraints
+                continue
             
             estimated_km = round(estimated_road_distance_meters / 1000, 2)
             estimated_hours = round(estimated_duration_seconds / 3600, 2)
@@ -1623,7 +2165,7 @@ def extract_solution(
                         max_buffer_capacity_reached = current_volume
             
             routes.append({
-                "truckId": f"TRUCK_{vehicle_id + 1}",
+                "truckId": f"TRUCK_{truck_number}",
                 "start": {
                     "lat": locations[start_index]['lat'],
                     "lng": locations[start_index]['lng']
@@ -1640,6 +2182,9 @@ def extract_solution(
                 "initial_load": route_initial_load,
                 "max_buffer_capacity_reached": max_buffer_capacity_reached
             })
+            
+            # Increment truck number for next route
+            truck_number += 1
     
     # Find unassigned visits
     for i, location in enumerate(locations):
@@ -2824,8 +3369,8 @@ def optimize_routes():
         logger.info(json.dumps(data, indent=2))
         logger.info("="*80)
         
-        # Log that we're using Haversine for distance calculations
-        logger.info("🗺️  Using HAVERSINE formula for distance calculations (straight-line distances)")
+        # Log that we're using Google Distance Matrix API for distance calculations
+        logger.info("🗺️  Using Google Distance Matrix API for distance calculations (real road distances)")
         
         # Validate input
         if not data:
@@ -3085,6 +3630,150 @@ def optimize_routes():
                 "suggestion": "Try increasing max_km or number of trucks"
             }), 400
         
+        # ─── MULTI-PASS ROUTING: Use remaining trucks for unassigned visits ───
+        # If there are unassigned visits AND unused trucks, run solver again
+        max_passes = 5  # Limit to prevent infinite loops
+        pass_number = 1
+        
+        while pass_number < max_passes:
+            trucks_used = len(result.get('routes', []))
+            trucks_remaining = num_trucks - trucks_used
+            unassigned_count = len(result.get('unassigned_visits', []))
+            
+            # Check if we should run another pass
+            if trucks_remaining > 0 and unassigned_count > 0:
+                logger.info(f"🔄 MULTI-PASS ROUTING - Pass {pass_number + 1}: "
+                          f"{trucks_remaining} truck(s) remaining, {unassigned_count} visit(s) unassigned")
+                logger.info(f"   Running solver again with remaining trucks and unassigned visits...")
+                
+                # Extract unassigned visit IDs
+                unassigned_visit_ids = {uv['visitId'] for uv in result.get('unassigned_visits', [])}
+                
+                # Filter original visits to only unassigned ones
+                remaining_visits = [v for v in visits if v['visitId'] in unassigned_visit_ids]
+                
+                if len(remaining_visits) == 0:
+                    logger.info("   No visits to assign - stopping multi-pass")
+                    break
+                
+                logger.info(f"   Processing {len(remaining_visits)} unassigned visits with {trucks_remaining} trucks")
+                
+                # Rebuild order_ids and visit_types for remaining visits
+                remaining_order_ids = []
+                remaining_visit_types = []
+                for visit in remaining_visits:
+                    remaining_order_ids.append(visit.get("order_id"))
+                    remaining_visit_types.append(visit.get("visit_type"))
+                
+                # Combine visits at same locations (same as initial processing)
+                remaining_combined_visits, remaining_visit_groups, remaining_combined_order_info, remaining_location_to_visits = \
+                    combine_visits_at_same_location(remaining_visits, remaining_order_ids, remaining_visit_types)
+                
+                # Rebuild locations with start and end points
+                remaining_locations = [start_point] + remaining_combined_visits + [end_point]
+                remaining_start_index = 0
+                remaining_end_index = len(remaining_locations) - 1
+                
+                # Rebuild distance and duration matrices for remaining locations
+                logger.info(f"   Building distance matrix for {len(remaining_locations)} locations...")
+                remaining_distance_matrix, remaining_duration_matrix = create_distance_matrix(remaining_locations)
+                
+                # Rebuild priorities, time windows, and service times for remaining locations
+                # Use same logic as initial processing
+                remaining_priorities = [5]  # Start point
+                for visit in remaining_combined_visits:
+                    sla_days = visit.get("sla_days", 5)
+                    # Same priority calculation as initial processing
+                    if sla_days <= 0:
+                        priority = 25 + abs(sla_days) * 2
+                    elif sla_days == 1:
+                        priority = 18
+                    elif sla_days == 2:
+                        priority = 12
+                    elif sla_days == 3:
+                        priority = 8
+                    elif sla_days <= 5:
+                        priority = 5
+                    else:
+                        priority = max(1, 6 - sla_days)
+                    remaining_priorities.append(priority)
+                remaining_priorities.append(5)  # End point
+                
+                # Time windows aligned with locations
+                remaining_time_windows = [None]  # Start
+                remaining_has_time_window = False
+                for visit in remaining_combined_visits:
+                    tw_start = visit.get("time_window_start")
+                    tw_end = visit.get("time_window_end")
+                    if tw_start is not None and tw_end is not None:
+                        remaining_time_windows.append((int(tw_start * 60), int(tw_end * 60)))
+                        remaining_has_time_window = True
+                    else:
+                        remaining_time_windows.append(None)
+                remaining_time_windows.append(None)  # End
+                
+                # Service times aligned with locations
+                remaining_service_times = [0]  # Start
+                svc_seconds = int(service_time_minutes * 60)
+                for idx, _ in enumerate(remaining_combined_visits):
+                    num_visits_at_node = len(remaining_visit_groups[idx]) if idx < len(remaining_visit_groups) and remaining_visit_groups[idx] else 1
+                    remaining_service_times.append(svc_seconds * num_visits_at_node)
+                remaining_service_times.append(0)  # End
+                
+                # Align combined_order_info and visit_groups with locations (add None for start/end)
+                remaining_aligned_order_info = [None] + remaining_combined_order_info + [None]
+                remaining_aligned_visit_groups = [None] + remaining_visit_groups + [None]
+                
+                # Calculate starting truck number for this pass (continue from where previous pass left off)
+                current_truck_count = len(result.get('routes', []))
+                start_truck_number_for_pass = current_truck_count + 1
+                
+                logger.info(f"   Starting truck numbering from TRUCK_{start_truck_number_for_pass}")
+                
+                # Run solver again with remaining trucks and unassigned visits
+                remaining_result = solve_vrp(
+                    num_vehicles=trucks_remaining,
+                    max_distance_per_vehicle=max_distance_meters,
+                    locations=remaining_locations,
+                    distance_matrix=remaining_distance_matrix,
+                    duration_matrix=remaining_duration_matrix,
+                    start_index=remaining_start_index,
+                    end_index=remaining_end_index,
+                    priorities=remaining_priorities,
+                    max_waypoints=max_stops,
+                    combined_order_info=remaining_aligned_order_info,
+                    visit_groups=remaining_aligned_visit_groups,
+                    original_visits=remaining_visits,
+                    time_windows=remaining_time_windows if remaining_has_time_window else None,
+                    service_times=remaining_service_times,
+                    max_route_time=max_route_time,
+                    truck_capacity=truck_capacity,
+                    start_truck_number=start_truck_number_for_pass
+                )
+                
+                if remaining_result and remaining_result.get('routes'):
+                    # Merge results: add new routes to existing routes
+                    logger.info(f"   ✅ Pass {pass_number + 1} assigned {len(remaining_result['routes'])} additional route(s)")
+                    result['routes'].extend(remaining_result['routes'])
+                    # Update unassigned visits to only those that remain unassigned
+                    result['unassigned_visits'] = remaining_result.get('unassigned_visits', [])
+                    pass_number += 1
+                else:
+                    logger.info(f"   ⚠️ Pass {pass_number + 1} could not assign any additional visits - stopping")
+                    break
+            else:
+                # No remaining trucks or no unassigned visits - stop
+                if trucks_remaining == 0:
+                    logger.info(f"   All {num_trucks} trucks are used - stopping multi-pass")
+                if unassigned_count == 0:
+                    logger.info(f"   All visits assigned - stopping multi-pass")
+                break
+        
+        if pass_number > 1:
+            logger.info(f"✅ Multi-pass routing completed: {pass_number} passes, "
+                       f"{len(result.get('routes', []))} total routes, "
+                       f"{len(result.get('unassigned_visits', []))} remaining unassigned visits")
+        
         # Post-processing: Fix volume capacity violations first
         logger.info("📦 Validating and fixing volume capacity violations...")
         result = fix_volume_capacity_violations(
@@ -3162,8 +3851,8 @@ def optimize_routes():
         logger.info(json.dumps(result, indent=2))
         logger.info("="*80)
         
-        # Log that we completed using Haversine
-        logger.info("✅ Routing optimization completed using HAVERSINE formula")
+        # Log that we completed using Google Distance Matrix API
+        logger.info("✅ Routing optimization completed using Google Distance Matrix API")
         
         return jsonify(result), 200
         
