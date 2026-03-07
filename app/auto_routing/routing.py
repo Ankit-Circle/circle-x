@@ -9,6 +9,7 @@ from flask import Blueprint, request, jsonify
 from ortools.constraint_solver import routing_enums_pb2
 from ortools.constraint_solver import pywrapcp
 from typing import List, Dict, Tuple, Optional
+import googlemaps
 
 # Configure logging
 logging.basicConfig(
@@ -84,10 +85,10 @@ def create_distance_matrix(
     locations: List[Dict]
 ) -> Tuple[List[List[int]], List[List[int]]]:
     """
-    Create distance AND duration matrices using Haversine formula.
+    Create distance AND duration matrices using Google Distance Matrix API.
     
-    Distance is calculated as straight-line (great circle) distance.
-    Duration is estimated from distance using average driving speed.
+    Distance is calculated as real road distance.
+    Duration is calculated as real travel time.
     
     Returns:
         (distance_matrix [meters], duration_matrix [seconds])
@@ -96,34 +97,89 @@ def create_distance_matrix(
     distance_matrix = [[0] * n for _ in range(n)]
     duration_matrix = [[0] * n for _ in range(n)]
     
-    logger.info(f"🗺️  Building {n}x{n} distance + duration matrix via Haversine formula...")
+    logger.info(f"🗺️  Building {n}x{n} distance + duration matrix via Google Distance Matrix API...")
     
-    # Get average speed from environment or use default
-    avg_speed_kmh = float(os.environ.get("AVERAGE_DRIVING_SPEED_KMH", AVERAGE_DRIVING_SPEED_KMH))
-    avg_speed_ms = avg_speed_kmh * 1000 / 3600  # Convert km/h to m/s
+    # Get Google Maps API key
+    api_key = os.environ.get("GOOGLE_MAPS_API_KEY")
+    if not api_key:
+        raise ValueError("GOOGLE_MAPS_API_KEY environment variable is required")
     
-    logger.info(f"📏 Using average driving speed: {avg_speed_kmh} km/h for duration estimation")
+    # Initialize Google Maps client
+    gmaps = googlemaps.Client(key=api_key)
     
+    # Google Distance Matrix API limit: 25 destinations per request
+    # We need to batch requests when n > 25
+    MAX_DESTINATIONS_PER_REQUEST = 25
+    
+    # Prepare origins and destinations as strings
+    origins = [f"{loc['lat']},{loc['lng']}" for loc in locations]
+    destinations = origins  # Same locations for both origins and destinations
+    
+    # Process in batches if needed
     for i in range(n):
-        for j in range(n):
-            if i == j:
-                distance_matrix[i][j] = 0
-                duration_matrix[i][j] = 0
-            else:
-                lat1 = locations[i]['lat']
-                lon1 = locations[i]['lng']
-                lat2 = locations[j]['lat']
-                lon2 = locations[j]['lng']
+        # For each origin, batch destinations
+        for dest_start in range(0, n, MAX_DESTINATIONS_PER_REQUEST):
+            dest_end = min(dest_start + MAX_DESTINATIONS_PER_REQUEST, n)
+            batch_destinations = destinations[dest_start:dest_end]
+            
+            try:
+                # Make API request
+                result = gmaps.distance_matrix(
+                    origins=[origins[i]],
+                    destinations=batch_destinations,
+                    mode="driving",
+                    units="metric"
+                )
                 
-                # Calculate Haversine distance
-                distance_meters = haversine_distance(lat1, lon1, lat2, lon2)
-                distance_matrix[i][j] = int(round(distance_meters))
+                # Parse results
+                if result['status'] == 'OK' and result['rows']:
+                    row = result['rows'][0]
+                    for j, element in enumerate(row['elements']):
+                        dest_idx = dest_start + j
+                        
+                        if element['status'] == 'OK':
+                            # Distance in meters
+                            distance_meters = element['distance']['value']
+                            distance_matrix[i][dest_idx] = int(round(distance_meters))
+                            
+                            # Duration in seconds
+                            duration_seconds = element['duration']['value']
+                            duration_matrix[i][dest_idx] = max(1, duration_seconds)  # Minimum 1 second
+                        else:
+                            # If API returns error, fallback to haversine
+                            logger.warning(f"⚠️ Google API error for {i}->{dest_idx}: {element['status']}, using Haversine fallback")
+                            lat1 = locations[i]['lat']
+                            lon1 = locations[i]['lng']
+                            lat2 = locations[dest_idx]['lat']
+                            lon2 = locations[dest_idx]['lng']
+                            distance_meters = haversine_distance(lat1, lon1, lat2, lon2)
+                            distance_matrix[i][dest_idx] = int(round(distance_meters))
+                            # Estimate duration from haversine distance
+                            avg_speed_kmh = float(os.environ.get("AVERAGE_DRIVING_SPEED_KMH", AVERAGE_DRIVING_SPEED_KMH))
+                            avg_speed_ms = avg_speed_kmh * 1000 / 3600
+                            duration_seconds = int(round(distance_meters / avg_speed_ms))
+                            duration_matrix[i][dest_idx] = max(1, duration_seconds)
                 
-                # Estimate duration from distance (assuming average driving speed)
-                duration_seconds = int(round(distance_meters / avg_speed_ms))
-                duration_matrix[i][j] = max(1, duration_seconds)  # Minimum 1 second
+                # Small delay to avoid rate limiting
+                time.sleep(0.1)
+                
+            except Exception as e:
+                logger.error(f"❌ Error calling Google Distance Matrix API for origin {i}: {e}")
+                # Fallback to haversine for this batch
+                for j in range(dest_start, dest_end):
+                    if i != j:
+                        lat1 = locations[i]['lat']
+                        lon1 = locations[i]['lng']
+                        lat2 = locations[j]['lat']
+                        lon2 = locations[j]['lng']
+                        distance_meters = haversine_distance(lat1, lon1, lat2, lon2)
+                        distance_matrix[i][j] = int(round(distance_meters))
+                        avg_speed_kmh = float(os.environ.get("AVERAGE_DRIVING_SPEED_KMH", AVERAGE_DRIVING_SPEED_KMH))
+                        avg_speed_ms = avg_speed_kmh * 1000 / 3600
+                        duration_seconds = int(round(distance_meters / avg_speed_ms))
+                        duration_matrix[i][j] = max(1, duration_seconds)
     
-    logger.info(f"✅ Haversine matrix built: {n}x{n} ({n*n} elements)")
+    logger.info(f"✅ Google Distance Matrix API matrix built: {n}x{n} ({n*n} elements)")
     return distance_matrix, duration_matrix
 
 
@@ -1941,7 +1997,7 @@ def extract_solution(
             route_distance_meters += distance_matrix[from_node][to_node]
             route_duration_seconds += duration_matrix[from_node][to_node]
         
-        # Haversine gives straight-line distances — no adjustment needed
+        # Google Distance Matrix API gives real road distances — no adjustment needed
         estimated_road_distance_meters = route_distance_meters
         estimated_duration_seconds = route_duration_seconds
         
@@ -3180,7 +3236,7 @@ def optimize_routes():
     Hybrid VRP Optimizer: CVRP + VRPPD + VRPTW
     
     Solves routing with capacity constraints, pickup-delivery pairs, and time windows.
-    Uses Haversine formula for distance calculations (straight-line distances).
+    Uses Google Distance Matrix API for distance calculations (real road distances).
     
     Expected JSON input:
     {
@@ -3263,8 +3319,8 @@ def optimize_routes():
         logger.info(json.dumps(data, indent=2))
         logger.info("="*80)
         
-        # Log that we're using Haversine for distance calculations
-        logger.info("🗺️  Using HAVERSINE formula for distance calculations (straight-line distances)")
+        # Log that we're using Google Distance Matrix API for distance calculations
+        logger.info("🗺️  Using Google Distance Matrix API for distance calculations (real road distances)")
         
         # Validate input
         if not data:
@@ -3410,7 +3466,7 @@ def optimize_routes():
         end_index = len(locations) - 1
         
         # Create distance + duration matrices using combined locations
-        # Build distance + duration matrices via Haversine formula
+        # Build distance + duration matrices via Google Distance Matrix API
         matrix_start = time.time()
         distance_matrix, duration_matrix = create_distance_matrix(locations)
         matrix_elapsed = time.time() - matrix_start
@@ -3486,13 +3542,13 @@ def optimize_routes():
             aligned_service_times.append(svc_seconds * num_visits_at_node)
         aligned_service_times.append(0)  # 0 for end
         
-        # Convert max_km to meters (Haversine gives straight-line distances)
+        # Convert max_km to meters (Google Distance Matrix API gives real road distances)
         max_distance_meters = int(max_km * 1000)
         
         # Convert shift duration to seconds
         max_route_time = int(shift_duration_hours * 3600)
         
-        logger.info(f"📏 Distance: {max_km}km limit → {max_distance_meters/1000:.1f}km solver (Haversine)")
+        logger.info(f"📏 Distance: {max_km}km limit → {max_distance_meters/1000:.1f}km solver (Google Distance Matrix API)")
         logger.info(f"⏰ Time: {shift_duration_hours}h shift, {service_time_minutes}min/stop, "
                      f"time windows: {'YES' if has_any_time_window else 'NO'}")
         
@@ -3568,9 +3624,74 @@ def optimize_routes():
                 remaining_start_index = 0
                 remaining_end_index = len(remaining_locations) - 1
                 
-                # Rebuild distance and duration matrices for remaining locations
-                logger.info(f"   Building distance matrix for {len(remaining_locations)} locations...")
-                remaining_distance_matrix, remaining_duration_matrix = create_distance_matrix(remaining_locations)
+                # REUSE existing distance matrix instead of recomputing
+                # Map remaining combined locations to original location indices
+                logger.info(f"   Reusing existing distance matrix for {len(remaining_locations)} locations (no new API calls)...")
+                
+                # Create mapping: remaining location index -> original location index
+                # Build a map of (lat, lng) -> original index for fast lookup
+                original_location_map = {}
+                for idx, loc in enumerate(locations):
+                    key = (round(loc['lat'], 6), round(loc['lng'], 6))
+                    original_location_map[key] = idx
+                
+                # Map remaining locations to original indices
+                remaining_to_original_indices = []
+                remaining_to_original_indices.append(0)  # Start point (index 0 in original)
+                need_full_compute = False
+                
+                for rem_visit in remaining_combined_visits:
+                    rem_lat = rem_visit['lat']
+                    rem_lng = rem_visit['lng']
+                    key = (round(rem_lat, 6), round(rem_lng, 6))
+                    
+                    if key in original_location_map:
+                        remaining_to_original_indices.append(original_location_map[key])
+                    else:
+                        # Location not found - this shouldn't happen since remaining visits are subset of original
+                        # But handle gracefully by searching with tolerance
+                        found_index = None
+                        for orig_idx, orig_visit in enumerate(combined_visits):
+                            orig_lat = orig_visit['lat']
+                            orig_lng = orig_visit['lng']
+                            if abs(rem_lat - orig_lat) < 0.0001 and abs(rem_lng - orig_lng) < 0.0001:
+                                found_index = orig_idx + 1  # +1 because start is at index 0
+                                break
+                        
+                        if found_index is not None:
+                            remaining_to_original_indices.append(found_index)
+                        else:
+                            # Fallback: compute full matrix if location truly not found (shouldn't happen)
+                            logger.warning(f"   ⚠️ Location ({rem_lat}, {rem_lng}) not found in original - computing full matrix")
+                            need_full_compute = True
+                            break
+                
+                if need_full_compute:
+                    # Compute full matrix as fallback (rare case)
+                    remaining_distance_matrix, remaining_duration_matrix = create_distance_matrix(remaining_locations)
+                else:
+                    # If we successfully mapped all locations, extract submatrix
+                    remaining_to_original_indices.append(len(locations) - 1)  # End point (last index in original)
+                    
+                    # Verify we have the right number of indices
+                    if len(remaining_to_original_indices) != len(remaining_locations):
+                        logger.warning(f"   ⚠️ Index mapping mismatch - computing full matrix")
+                        remaining_distance_matrix, remaining_duration_matrix = create_distance_matrix(remaining_locations)
+                    else:
+                        # Extract submatrix from original distance/duration matrices
+                        remaining_n = len(remaining_locations)
+                        remaining_distance_matrix = [[0] * remaining_n for _ in range(remaining_n)]
+                        remaining_duration_matrix = [[0] * remaining_n for _ in range(remaining_n)]
+                        
+                        for i in range(remaining_n):
+                            orig_i = remaining_to_original_indices[i]
+                            for j in range(remaining_n):
+                                orig_j = remaining_to_original_indices[j]
+                                # Extract from original matrix
+                                remaining_distance_matrix[i][j] = distance_matrix[orig_i][orig_j]
+                                remaining_duration_matrix[i][j] = duration_matrix[orig_i][orig_j]
+                        
+                        logger.info(f"   ✅ Successfully reused distance matrix - saved API calls!")
                 
                 # Rebuild priorities, time windows, and service times for remaining locations
                 # Use same logic as initial processing
@@ -3745,8 +3866,8 @@ def optimize_routes():
         logger.info(json.dumps(result, indent=2))
         logger.info("="*80)
         
-        # Log that we completed using Haversine
-        logger.info("✅ Routing optimization completed using HAVERSINE formula")
+        # Log that we completed using Google Distance Matrix API
+        logger.info("✅ Routing optimization completed using Google Distance Matrix API")
         
         return jsonify(result), 200
         
