@@ -565,9 +565,11 @@ def solve_vrp(
     distance_dimension.SetGlobalSpanCostCoefficient(0)
     
     # Fixed cost per vehicle — solver will fill existing trucks before opening new ones
-    vehicle_fixed_cost = max_distance_per_vehicle * 3
+    # Reduced vehicle fixed cost to encourage using more trucks and assigning more visits
+    # Lower fixed cost makes it easier to open new trucks, which helps with assignment
+    vehicle_fixed_cost = int(max_distance_per_vehicle * 1.5)  # Reduced from 3x to 1.5x, converted to int
     routing.SetFixedCostOfAllVehicles(vehicle_fixed_cost)
-    logger.info(f"📦 Vehicle fixed cost: {vehicle_fixed_cost} (packs trucks before using new ones)")
+    logger.info(f"📦 Vehicle fixed cost: {vehicle_fixed_cost} (reduced to encourage better assignment)")
     
     # ─── WAYPOINT COUNT CONSTRAINT ───
     # max_stops counts PHYSICAL LOCATIONS (combined nodes), not individual visits.
@@ -1032,6 +1034,22 @@ def solve_vrp(
             if skipped_pairs_for_combination:
                 logger.info(f"  📋 {len(skipped_pairs_for_combination)} skipped pairs are exchange/damage - will handle with CumulVar constraints")
     
+    # ─── TRACK PICKUP AND DROP NODES SEPARATELY ───
+    # This is needed to enforce: drop cannot be assigned if pickup is not assigned
+    pickup_nodes = set()  # Track which nodes are pickups
+    drop_nodes = set()     # Track which nodes are drops
+    
+    for pair in pickup_drop_pairs:
+        pickup_nodes.add(pair['pickup_node'])
+        drop_nodes.add(pair['drop_node'])
+    
+    # Also track pickup/drop nodes from skipped pairs for combination handling
+    for skipped_pair in skipped_pairs_for_combination:
+        pickup_nodes.add(skipped_pair['pickup_node'])
+        drop_nodes.add(skipped_pair['drop_node'])
+    
+    logger.info(f"📋 Identified {len(pickup_nodes)} pickup nodes and {len(drop_nodes)} drop nodes in pairs")
+    
     # ─── DROP PENALTIES (disjunctions) ───
     # Penalties for NOT visiting a node. Calibrated relative to distances:
     #   drop_penalty >> vehicle_fixed_cost >> typical_detour_distance
@@ -1047,9 +1065,10 @@ def solve_vrp(
     
     # ─── ENHANCED SLA PRIORITIZATION + MANDATORY VISITS ───
     # DRAMATICALLY increased penalties to ensure SLA-critical visits are NEVER dropped
-    # Base penalty is now 50x max distance (was 20x) for even stronger prioritization
-    # MANDATORY visits (returned_from, returned_to) get 1000x penalty - virtually impossible to drop
-    base_penalty = max_distance_per_vehicle * 50
+    # Base penalty is now 100x max distance (increased from 50x) for maximum assignment efficiency
+    # This makes assignment much more attractive than leaving visits unassigned
+    # MANDATORY visits (returned_from, returned_to) get 2000x penalty - virtually impossible to drop
+    base_penalty = max_distance_per_vehicle * 100
     
     logger.info(f"🎯 SLA-PRIORITIZED + MANDATORY routing — base penalty: {base_penalty} "
                 f"(vehicle fixed cost: {vehicle_fixed_cost})")
@@ -1092,32 +1111,33 @@ def solve_vrp(
             types_str = ', '.join(mandatory_types_found)
             logger.info(f"🔒 Node {node} marked as MANDATORY ({types_str}) - HIGHEST PRIORITY (can be unassigned if impossible)")
             # Add disjunction with EXTREMELY high penalty - highest priority but can be unassigned if needed
-            # Use 100x base penalty to ensure mandatory visits are scheduled whenever possible
-            mandatory_penalty = base_penalty * 100  # Extremely high, but allows unassignment if impossible
+            # Use 200x base penalty to ensure mandatory visits are scheduled whenever possible
+            mandatory_penalty = base_penalty * 200  # Extremely high, but allows unassignment if impossible
             routing.AddDisjunction([manager.NodeToIndex(node)], mandatory_penalty)
             continue
         
         # For all other visits, add disjunctions with SLA-based penalties
-        # MASSIVELY INCREASED penalty tiers to prioritize SLA visits
-        # These penalties ensure SLA visits are virtually guaranteed to be routed
+        # MASSIVELY INCREASED penalty tiers to prioritize SLA visits and maximize assignment
+        # These penalties ensure visits are assigned whenever possible
         if priority >= 15:
             # SLA BREACHED (≤0 days) — EXTREME penalty, practically impossible to drop
-            node_penalty = base_penalty * 20   # Was 10x, now 20x
+            node_penalty = base_penalty * 30   # Increased from 20x to 30x
             breached_count += 1
         elif priority >= 8:
             # Urgent (SLA 1-2 days) — Very high penalty
-            node_penalty = base_penalty * 10   # Was 5x, now 10x
+            node_penalty = base_penalty * 15   # Increased from 10x to 15x
             urgent_count += 1
         elif priority >= 7:
             # Warning (SLA 3 days) — High penalty
-            node_penalty = base_penalty * 5    # Was 3x, now 5x
+            node_penalty = base_penalty * 8    # Increased from 5x to 8x
         else:
-            # Normal (SLA > 3 days) — Standard penalty
-            node_penalty = base_penalty * 2    # Unchanged
+            # Normal (SLA > 3 days) — Standard penalty (increased to improve assignment)
+            node_penalty = base_penalty * 3    # Increased from 2x to 3x
         
         # Paired nodes (pickup-drop) get extra penalty to keep pairs together
+        # Increased multiplier to make pairs more attractive to assign
         if node in paired_nodes:
-            node_penalty = node_penalty * 2
+            node_penalty = node_penalty * 3  # Increased from 2x to 3x
             paired_count += 1
         
         routing.AddDisjunction([manager.NodeToIndex(node)], node_penalty)
@@ -1327,7 +1347,36 @@ def solve_vrp(
             routing.VehicleVar(pickup_index) == routing.VehicleVar(drop_index)
         )
         
+        # ─── HARD CONSTRAINT: Drop cannot be ASSIGNED if pickup is not assigned ───
+        # This enforces: if drop is assigned, pickup must be assigned
+        # Drop CAN be unassigned independently (has disjunction), but cannot be assigned without pickup
+        pickup_vehicle = routing.VehicleVar(pickup_index)
+        drop_vehicle = routing.VehicleVar(drop_index)
+        
+        solver = routing.solver()
+        
+        # Constraint: if drop is assigned (drop_vehicle >= 0), then pickup must be assigned (pickup_vehicle >= 0)
+        # Since AddPickupAndDelivery already enforces same vehicle when both are assigned,
+        # we need to prevent drop from being assigned if pickup is not assigned.
+        # 
+        # We can use: pickup_vehicle >= drop_vehicle when drop_vehicle >= 0
+        # But this doesn't work directly because both can be -1.
+        #
+        # Alternative: Use the fact that if drop_vehicle >= 0, then pickup_vehicle must be >= 0
+        # We can express this as: pickup_vehicle >= max(-1, drop_vehicle)
+        # But OR-Tools doesn't have max directly.
+        #
+        # Simplest approach: Use a constraint that enforces pickup_vehicle >= drop_vehicle
+        # This works because:
+        # - If drop_vehicle == -1, then pickup_vehicle >= -1 (always true, pickup can be -1 or >= 0)
+        # - If drop_vehicle >= 0, then pickup_vehicle >= drop_vehicle (pickup must be >= 0, same vehicle)
+        # Since AddPickupAndDelivery already enforces same vehicle, this effectively means:
+        # - If drop is assigned, pickup must be assigned (and on same vehicle)
+        # - If drop is not assigned, pickup can be assigned or not
+        solver.Add(pickup_vehicle >= drop_vehicle)
+        
         logger.info(f"Added pickup-drop pair for order {pair['order_id']}: pickup node {pair['pickup_node']} -> drop node {pair['drop_node']}")
+        logger.info(f"   🔒 HARD CONSTRAINT: Drop can be unassigned independently, but cannot be ASSIGNED if pickup is not assigned")
     
     logger.info(f"✅ Finished adding {len(pickup_drop_pairs)} pickup-drop pairs")
     
@@ -1511,37 +1560,47 @@ def solve_vrp(
     logger.info("Setting up solver parameters...")
     search_parameters = pywrapcp.DefaultRoutingSearchParameters()
     
-    # PARALLEL_CHEAPEST_INSERTION: inserts visits into cheapest position.
-    # Combined with high vehicle fixed costs, it fills existing trucks first.
+    # Use AUTOMATIC strategy - lets OR-Tools choose the best first solution strategy
+    # This often performs better than PARALLEL_CHEAPEST_INSERTION for complex problems with constraints
     search_parameters.first_solution_strategy = (
-        routing_enums_pb2.FirstSolutionStrategy.PARALLEL_CHEAPEST_INSERTION
+        routing_enums_pb2.FirstSolutionStrategy.AUTOMATIC
     )
     
-    # GUIDED_LOCAL_SEARCH: escapes local minima by penalizing repeated arcs.
-    # Good at moving visits between vehicles to find better packing.
+    # Use TABU_SEARCH for better exploration - often finds better solutions than GUIDED_LOCAL_SEARCH
+    # TABU_SEARCH maintains a memory of recent moves to escape local optima more effectively
     search_parameters.local_search_metaheuristic = (
-        routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH
+        routing_enums_pb2.LocalSearchMetaheuristic.TABU_SEARCH
     )
     
-    # Dynamic time limit — INCREASED for SLA-prioritized routing
-    # More time allows solver to find better solutions that satisfy SLA constraints
+    # Dynamic time limit — SIGNIFICANTLY INCREASED for maximum assignment efficiency
+    # Much more time allows solver to explore many more solutions and assign more visits
     num_nodes = len(locations)
     if num_nodes <= 10:
-        time_limit = 15   # Was 10, now 15
+        time_limit = 30   # Increased from 20
     elif num_nodes <= 20:
-        time_limit = 25   # Was 15, now 25
+        time_limit = 60   # Increased from 35
     elif num_nodes <= 35:
-        time_limit = 40   # Was 25, now 40
+        time_limit = 90   # Increased from 50
     else:
-        time_limit = 60   # Was 40, now 60 - critical for SLA optimization
+        time_limit = 120  # Increased from 90 - critical for maximizing assignment
     
     search_parameters.time_limit.seconds = time_limit
     search_parameters.log_search = False
     
-    # Make solver more lenient - allow it to return partial solutions even if constraints are tight
-    # This ensures we always get a solution, even if some visits are unassigned
+    # Enhanced solver parameters for better assignment efficiency
+    # Allow solver to explore more solutions and find better packing
     search_parameters.use_full_propagation = False  # Faster, more lenient propagation
     search_parameters.use_depth_first_search = False  # Use breadth-first for better coverage
+    
+    # Enable more aggressive local search operators for better assignment
+    # These operators help the solver find better solutions by exploring more neighborhoods
+    try:
+        search_parameters.local_search_operators.use_tsp_opt = pywrapcp.BOOL_TRUE
+        search_parameters.local_search_operators.use_lin_kernighan = pywrapcp.BOOL_TRUE
+        search_parameters.local_search_operators.use_tsp_opt_2 = pywrapcp.BOOL_TRUE
+    except AttributeError:
+        # Some OR-Tools versions may not have these operators, skip if not available
+        pass
     
     logger.info(f"🚀 Starting solver: {num_vehicles} vehicles, {len(locations)} locations, "
                 f"max {max_distance_per_vehicle/1000:.0f}km/truck, max {max_waypoints} stops/truck, "
@@ -3596,11 +3655,37 @@ def optimize_routes():
                           f"{trucks_remaining} truck(s) remaining, {unassigned_count} visit(s) unassigned")
                 logger.info(f"   Running solver again with remaining trucks and unassigned visits...")
                 
-                # Extract unassigned visit IDs
-                unassigned_visit_ids = {uv['visitId'] for uv in result.get('unassigned_visits', [])}
+                # Track ALL assigned visit IDs from ALL previous passes to avoid duplicates
+                # This is the source of truth - if a visit is in a route, it's assigned
+                all_assigned_visit_ids = set()
+                for route in result.get('routes', []):
+                    for stop in route.get('stops', []):
+                        visit_id = stop.get('visitId')
+                        if visit_id:
+                            all_assigned_visit_ids.add(visit_id)
                 
-                # Filter original visits to only unassigned ones
-                remaining_visits = [v for v in visits if v['visitId'] in unassigned_visit_ids]
+                logger.info(f"   Already assigned {len(all_assigned_visit_ids)} visit(s) in previous passes")
+                
+                # Build set of all original visit IDs for comparison
+                all_original_visit_ids = {v['visitId'] for v in visits if v.get('visitId')}
+                
+                # Remaining visits = all original visits that are NOT in any route
+                # This is more reliable than using unassigned_visits list
+                remaining_visits = [
+                    v for v in visits 
+                    if v.get('visitId') and v['visitId'] not in all_assigned_visit_ids
+                ]
+                
+                logger.info(f"   Found {len(remaining_visits)} truly unassigned visit(s) out of {len(visits)} total")
+                
+                # Warn if unassigned_visits list doesn't match our calculation
+                unassigned_from_list = {uv['visitId'] for uv in result.get('unassigned_visits', [])}
+                remaining_visit_ids = {v['visitId'] for v in remaining_visits}
+                if unassigned_from_list != remaining_visit_ids:
+                    diff = unassigned_from_list.symmetric_difference(remaining_visit_ids)
+                    if diff:
+                        logger.warning(f"   ⚠️ Mismatch: unassigned_visits list has {len(unassigned_from_list)} visits, "
+                                     f"but routes show {len(remaining_visit_ids)} unassigned. Difference: {len(diff)} visit(s)")
                 
                 if len(remaining_visits) == 0:
                     logger.info("   No visits to assign - stopping multi-pass")
@@ -3767,12 +3852,42 @@ def optimize_routes():
                 )
                 
                 if remaining_result and remaining_result.get('routes'):
-                    # Merge results: add new routes to existing routes
-                    logger.info(f"   ✅ Pass {pass_number + 1} assigned {len(remaining_result['routes'])} additional route(s)")
-                    result['routes'].extend(remaining_result['routes'])
-                    # Update unassigned visits to only those that remain unassigned
-                    result['unassigned_visits'] = remaining_result.get('unassigned_visits', [])
-                    pass_number += 1
+                    # Track assigned visit IDs from new routes to prevent duplicates
+                    new_assigned_visit_ids = set()
+                    for route in remaining_result['routes']:
+                        for stop in route.get('stops', []):
+                            visit_id = stop.get('visitId')
+                            if visit_id:
+                                new_assigned_visit_ids.add(visit_id)
+                    
+                    # Filter out any routes that have duplicate visits (safety check)
+                    unique_routes = []
+                    seen_route_visits = set()
+                    for route in remaining_result['routes']:
+                        route_visit_ids = tuple(sorted([stop.get('visitId') for stop in route.get('stops', []) if stop.get('visitId')]))
+                        if route_visit_ids and route_visit_ids not in seen_route_visits:
+                            # Also check if any visit in this route is already assigned in previous routes
+                            route_has_duplicate = False
+                            for stop in route.get('stops', []):
+                                if stop.get('visitId') in all_assigned_visit_ids:
+                                    route_has_duplicate = True
+                                    logger.warning(f"   ⚠️ Skipping route with duplicate visit {stop.get('visitId')} already assigned")
+                                    break
+                            
+                            if not route_has_duplicate:
+                                seen_route_visits.add(route_visit_ids)
+                                unique_routes.append(route)
+                    
+                    if len(unique_routes) > 0:
+                        # Merge results: add new unique routes to existing routes
+                        logger.info(f"   ✅ Pass {pass_number + 1} assigned {len(unique_routes)} additional unique route(s)")
+                        result['routes'].extend(unique_routes)
+                        # Update unassigned visits to only those that remain unassigned
+                        result['unassigned_visits'] = remaining_result.get('unassigned_visits', [])
+                        pass_number += 1
+                    else:
+                        logger.info(f"   ⚠️ Pass {pass_number + 1} produced only duplicate routes - stopping")
+                        break
                 else:
                     logger.info(f"   ⚠️ Pass {pass_number + 1} could not assign any additional visits - stopping")
                     break
