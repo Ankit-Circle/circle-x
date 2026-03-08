@@ -3655,37 +3655,11 @@ def optimize_routes():
                           f"{trucks_remaining} truck(s) remaining, {unassigned_count} visit(s) unassigned")
                 logger.info(f"   Running solver again with remaining trucks and unassigned visits...")
                 
-                # Track ALL assigned visit IDs from ALL previous passes to avoid duplicates
-                # This is the source of truth - if a visit is in a route, it's assigned
-                all_assigned_visit_ids = set()
-                for route in result.get('routes', []):
-                    for stop in route.get('stops', []):
-                        visit_id = stop.get('visitId')
-                        if visit_id:
-                            all_assigned_visit_ids.add(visit_id)
+                # Extract unassigned visit IDs
+                unassigned_visit_ids = {uv['visitId'] for uv in result.get('unassigned_visits', [])}
                 
-                logger.info(f"   Already assigned {len(all_assigned_visit_ids)} visit(s) in previous passes")
-                
-                # Build set of all original visit IDs for comparison
-                all_original_visit_ids = {v['visitId'] for v in visits if v.get('visitId')}
-                
-                # Remaining visits = all original visits that are NOT in any route
-                # This is more reliable than using unassigned_visits list
-                remaining_visits = [
-                    v for v in visits 
-                    if v.get('visitId') and v['visitId'] not in all_assigned_visit_ids
-                ]
-                
-                logger.info(f"   Found {len(remaining_visits)} truly unassigned visit(s) out of {len(visits)} total")
-                
-                # Warn if unassigned_visits list doesn't match our calculation
-                unassigned_from_list = {uv['visitId'] for uv in result.get('unassigned_visits', [])}
-                remaining_visit_ids = {v['visitId'] for v in remaining_visits}
-                if unassigned_from_list != remaining_visit_ids:
-                    diff = unassigned_from_list.symmetric_difference(remaining_visit_ids)
-                    if diff:
-                        logger.warning(f"   ⚠️ Mismatch: unassigned_visits list has {len(unassigned_from_list)} visits, "
-                                     f"but routes show {len(remaining_visit_ids)} unassigned. Difference: {len(diff)} visit(s)")
+                # Filter original visits to only unassigned ones
+                remaining_visits = [v for v in visits if v['visitId'] in unassigned_visit_ids]
                 
                 if len(remaining_visits) == 0:
                     logger.info("   No visits to assign - stopping multi-pass")
@@ -3852,42 +3826,12 @@ def optimize_routes():
                 )
                 
                 if remaining_result and remaining_result.get('routes'):
-                    # Track assigned visit IDs from new routes to prevent duplicates
-                    new_assigned_visit_ids = set()
-                    for route in remaining_result['routes']:
-                        for stop in route.get('stops', []):
-                            visit_id = stop.get('visitId')
-                            if visit_id:
-                                new_assigned_visit_ids.add(visit_id)
-                    
-                    # Filter out any routes that have duplicate visits (safety check)
-                    unique_routes = []
-                    seen_route_visits = set()
-                    for route in remaining_result['routes']:
-                        route_visit_ids = tuple(sorted([stop.get('visitId') for stop in route.get('stops', []) if stop.get('visitId')]))
-                        if route_visit_ids and route_visit_ids not in seen_route_visits:
-                            # Also check if any visit in this route is already assigned in previous routes
-                            route_has_duplicate = False
-                            for stop in route.get('stops', []):
-                                if stop.get('visitId') in all_assigned_visit_ids:
-                                    route_has_duplicate = True
-                                    logger.warning(f"   ⚠️ Skipping route with duplicate visit {stop.get('visitId')} already assigned")
-                                    break
-                            
-                            if not route_has_duplicate:
-                                seen_route_visits.add(route_visit_ids)
-                                unique_routes.append(route)
-                    
-                    if len(unique_routes) > 0:
-                        # Merge results: add new unique routes to existing routes
-                        logger.info(f"   ✅ Pass {pass_number + 1} assigned {len(unique_routes)} additional unique route(s)")
-                        result['routes'].extend(unique_routes)
-                        # Update unassigned visits to only those that remain unassigned
-                        result['unassigned_visits'] = remaining_result.get('unassigned_visits', [])
-                        pass_number += 1
-                    else:
-                        logger.info(f"   ⚠️ Pass {pass_number + 1} produced only duplicate routes - stopping")
-                        break
+                    # Merge results: add new routes to existing routes
+                    logger.info(f"   ✅ Pass {pass_number + 1} assigned {len(remaining_result['routes'])} additional route(s)")
+                    result['routes'].extend(remaining_result['routes'])
+                    # Update unassigned visits to only those that remain unassigned
+                    result['unassigned_visits'] = remaining_result.get('unassigned_visits', [])
+                    pass_number += 1
                 else:
                     logger.info(f"   ⚠️ Pass {pass_number + 1} could not assign any additional visits - stopping")
                     break
