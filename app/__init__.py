@@ -9,12 +9,13 @@ def create_app():
     from app.image_enhancement import image_enhancement_bp
     from app.pricing import pricing_bp
     from app.pricing import pricing_db_bp
+    from app.image_convert import image_convert_bp
 
     # Register with `/api/` prefix
     app.register_blueprint(image_enhancement_bp, url_prefix="/api/enhance")
     app.register_blueprint(pricing_bp, url_prefix="/api/pricing")
     app.register_blueprint(pricing_db_bp, url_prefix="/api/pricing-db")
-
+    app.register_blueprint(image_convert_bp, url_prefix="/api/convert")
     @app.route("/health", methods=["GET"])
     def health():
         return jsonify({
