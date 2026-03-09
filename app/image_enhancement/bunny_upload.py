@@ -103,6 +103,13 @@ def upload_to_bunny(
 
     bunny_url = f"{BUNNY_STORAGE_HOST}/{BUNNY_STORAGE_ZONE_NAME}/{disposition['bunnyPath']}"
 
+    # Debug logging for Bunny configuration
+    print("Bunny URL:", bunny_url)
+    print("Bunny path:", disposition["bunnyPath"])
+    print("Zone:", BUNNY_STORAGE_ZONE_NAME)
+    print("Host:", BUNNY_STORAGE_HOST)
+    print("Pull host:", BUNNY_PULL_ZONE_HOST)
+
     resp = requests.put(
         bunny_url,
         headers={

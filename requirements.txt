@@ -4,7 +4,7 @@ flask-cors==5.0.1
 gunicorn==21.2.0
 numpy==1.26.4
 pandas==2.2.3
-Pillow==10.0.0
+Pillow==10.1.0
 pillow-avif-plugin==1.5.2
 requests==2.32.3
 python-dotenv==1.1.1
@@ -27,3 +27,6 @@ strenum==0.4.15
 h2==4.2.0
 hpack==4.1.0
 hyperframe==6.1.0
+
+# FastAPI image conversion service
+pillow-heif==0.20.0
