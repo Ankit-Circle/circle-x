@@ -12,6 +12,7 @@ from supabase import create_client, Client
 from app.convert import (
     ImageConversionError,
     convert_avif_to_jpeg,
+    convert_dng_to_jpeg,
     convert_heic_to_jpeg,
     convert_webp_to_jpeg,
 )
@@ -73,6 +74,8 @@ def _detect_format_from_filename(name: str) -> Optional[str]:
         return "avif"
     if name.endswith(".webp"):
         return "webp"
+    if name.endswith(".dng"):
+        return "dng"
     return None
 
 
@@ -89,6 +92,8 @@ def _detect_format_from_url_and_mime(url: str, mime: str | None) -> Optional[str
         return "avif"
     if ext == "webp":
         return "webp"
+    if ext == "dng":
+        return "dng"
     if ext in {"jpg", "jpeg"}:
         return "jpeg"
     if ext == "png":
@@ -101,6 +106,8 @@ def _detect_format_from_url_and_mime(url: str, mime: str | None) -> Optional[str
         return "avif"
     if mime == "image/webp":
         return "webp"
+    if mime in {"image/dng", "image/x-adobe-dng"}:
+        return "dng"
     if mime in {"image/jpeg", "image/jpg"}:
         return "jpeg"
     if mime == "image/png":
@@ -220,13 +227,15 @@ def convert_and_upload_route():
             fmt = "avif"
         elif mime == "image/webp":
             fmt = "webp"
+        elif mime in {"image/dng", "image/x-adobe-dng"}:
+            fmt = "dng"
 
-    if fmt not in {"heic", "avif", "webp"}:
+    if fmt not in {"heic", "avif", "webp", "dng"}:
         return (
             jsonify(
                 {
                     "error": "Unsupported image format. "
-                    "Supported formats: HEIC, HEIF, AVIF, WEBP."
+                    "Supported formats: HEIC, HEIF, AVIF, WEBP, DNG."
                 }
             ),
             400,
@@ -241,8 +250,10 @@ def convert_and_upload_route():
             jpeg_bytes = convert_heic_to_jpeg(data)
         elif fmt == "avif":
             jpeg_bytes = convert_avif_to_jpeg(data)
-        else:
+        elif fmt == "webp":
             jpeg_bytes = convert_webp_to_jpeg(data)
+        else:  # dng
+            jpeg_bytes = convert_dng_to_jpeg(data)
     except ImageConversionError as exc:
         return jsonify({"error": str(exc)}), 400
     except Exception:
@@ -319,13 +330,13 @@ def convert_from_url_route():
             200,
         )
 
-    if fmt not in {"heic", "avif", "webp"}:
+    if fmt not in {"heic", "avif", "webp", "dng"}:
         return (
             jsonify(
                 {
                     "success": False,
                     "error": "Unsupported or unknown image format. "
-                    "Supported conversion formats: HEIC, HEIF, AVIF, WEBP.",
+                    "Supported conversion formats: HEIC, HEIF, AVIF, WEBP, DNG.",
                 }
             ),
             400,
@@ -337,8 +348,10 @@ def convert_from_url_route():
             jpeg_bytes = convert_heic_to_jpeg(image_bytes)
         elif fmt == "avif":
             jpeg_bytes = convert_avif_to_jpeg(image_bytes)
-        else:
+        elif fmt == "webp":
             jpeg_bytes = convert_webp_to_jpeg(image_bytes)
+        else:  # dng
+            jpeg_bytes = convert_dng_to_jpeg(image_bytes)
     except ImageConversionError as exc:
         return jsonify({"success": False, "error": str(exc)}), 400
     except Exception as exc:
@@ -423,7 +436,7 @@ def convert_batch_route():
         if ext in {"jpg", "jpeg", "png"}:
             print("Skipping conversion for (already JPEG/PNG):", url)
             continue
-        if ext not in {"heic", "heif", "avif", "webp"}:
+        if ext not in {"heic", "heif", "avif", "webp", "dng"}:
             print("Skipping unsupported format:", url)
             continue
 
@@ -439,7 +452,7 @@ def convert_batch_route():
         if ext in {"heic", "heif"}:
             fmt = "heic"
         else:
-            fmt = ext  # avif / webp
+            fmt = ext  # avif / webp / dng
 
         print("Converting image format:", fmt, "for", url)
 
@@ -448,8 +461,10 @@ def convert_batch_route():
                 jpeg_bytes = convert_heic_to_jpeg(image_bytes)
             elif fmt == "avif":
                 jpeg_bytes = convert_avif_to_jpeg(image_bytes)
-            else:  # webp
+            elif fmt == "webp":
                 jpeg_bytes = convert_webp_to_jpeg(image_bytes)
+            else:  # dng
+                jpeg_bytes = convert_dng_to_jpeg(image_bytes)
         except ImageConversionError as exc:
             print("Conversion error for", url, ":", exc)
             continue
@@ -559,7 +574,7 @@ def process_submission_route():
             updated_media.append(item)
             continue
 
-        if ext not in {"heic", "heif", "avif", "webp"}:
+        if ext not in {"heic", "heif", "avif", "webp", "dng"}:
             updated_media.append(item)
             continue
 
@@ -578,7 +593,7 @@ def process_submission_route():
         if ext in {"heic", "heif"}:
             fmt = "heic"
         else:
-            fmt = ext  # avif / webp
+            fmt = ext  # avif / webp / dng
 
         logger.info("Converting format %s for %s", fmt, url)
 
@@ -587,8 +602,10 @@ def process_submission_route():
                 jpeg_bytes = convert_heic_to_jpeg(image_bytes)
             elif fmt == "avif":
                 jpeg_bytes = convert_avif_to_jpeg(image_bytes)
-            else:  # webp
+            elif fmt == "webp":
                 jpeg_bytes = convert_webp_to_jpeg(image_bytes)
+            else:  # dng
+                jpeg_bytes = convert_dng_to_jpeg(image_bytes)
         except ImageConversionError as exc:
             logger.error("Conversion error for %s: %s", url, exc)
             updated_media.append(item)
