@@ -6,13 +6,15 @@ from typing import Literal
 from PIL import Image, UnidentifiedImageError
 import pillow_heif
 import pillow_avif  # noqa: F401  - imported to register AVIF support with Pillow
+import rawpy
+import imageio
 
 
 # Register HEIF/HEIC opener with Pillow
 pillow_heif.register_heif_opener()
 
 
-ImageFormat = Literal["heic", "avif", "webp"]
+ImageFormat = Literal["heic", "avif", "webp", "dng"]
 MAX_WIDTH = 2000
 
 
@@ -47,10 +49,8 @@ def _ensure_expected_format(img: Image.Image, expected: ImageFormat) -> None:
             raise ImageConversionError(f"Uploaded image is '{fmt or 'unknown'}', expected WEBP")
 
 
-def _convert_to_jpeg_bytes(image_bytes: bytes, expected_format: ImageFormat) -> bytes:
-    """Convert image bytes to optimized JPEG bytes with basic validation."""
-    img = _open_image(image_bytes)
-    _ensure_expected_format(img, expected_format)
+def _convert_image_to_jpeg(img: Image.Image) -> bytes:
+    """Convert a Pillow image to optimized JPEG bytes (resize + RGB + compression)."""
 
     # Resize if too wide
     if img.width > MAX_WIDTH:
@@ -75,6 +75,15 @@ def _convert_to_jpeg_bytes(image_bytes: bytes, expected_format: ImageFormat) -> 
     return out_buffer.getvalue()
 
 
+def _convert_to_jpeg_bytes(image_bytes: bytes, expected_format: ImageFormat) -> bytes:
+    """Convert image bytes to optimized JPEG bytes with basic validation for known formats."""
+    img = _open_image(image_bytes)
+    # Only enforce strict format check for HEIC/AVIF/WEBP.
+    if expected_format in {"heic", "avif", "webp"}:
+        _ensure_expected_format(img, expected_format)
+    return _convert_image_to_jpeg(img)
+
+
 def convert_heic_to_jpeg(image_bytes: bytes) -> bytes:
     """Convert HEIC/HEIF image bytes to JPEG bytes."""
     return _convert_to_jpeg_bytes(image_bytes, expected_format="heic")
@@ -88,4 +97,14 @@ def convert_avif_to_jpeg(image_bytes: bytes) -> bytes:
 def convert_webp_to_jpeg(image_bytes: bytes) -> bytes:
     """Convert WEBP image bytes to JPEG bytes."""
     return _convert_to_jpeg_bytes(image_bytes, expected_format="webp")
+
+
+def convert_dng_to_jpeg(image_bytes: bytes) -> bytes:
+    """Convert DNG image bytes to JPEG bytes using rawpy + imageio."""
+    with rawpy.imread(BytesIO(image_bytes)) as raw:
+        rgb = raw.postprocess()
+
+    buffer = BytesIO()
+    imageio.imwrite(buffer, rgb, format="jpeg", quality=85)
+    return buffer.getvalue()
 
