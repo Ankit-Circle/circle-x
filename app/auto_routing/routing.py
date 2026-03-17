@@ -2040,6 +2040,16 @@ def optimize_routes():
         if filtered_excluded_visits:
             result['unassigned_visits'].extend(filtered_excluded_visits)
             logger.info(f"Added {len(filtered_excluded_visits)} filtered visits to unassigned list")
+
+        # If vehicle_type is 'bike', rename truckId labels to rider_1, rider_2, ...
+        vehicle_type = (data.get("vehicle_type") or "").strip().lower() if data.get("vehicle_type") else ""
+        logger.info(f"🚚 vehicle_type from request: '{vehicle_type}'")
+        if vehicle_type == "bike":
+            logger.info("🚲 Vehicle type is BIKE — renaming truckIds to rider labels")
+            for idx, route in enumerate(result.get("routes", []), start=1):
+                original_truck_id = route.get("truckId", f"TRUCK_{idx}")
+                route["original_truck_id"] = original_truck_id
+                route["truckId"] = f"rider_{idx}"
         
         # Log route utilization summary
         total_locations = 0
