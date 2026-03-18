@@ -373,7 +373,8 @@ def solve_vrp(
     original_visits: List[Dict] = None,
     time_windows: Optional[List[Optional[Tuple[int, int]]]] = None,
     service_times: Optional[List[int]] = None,
-    max_route_time: int = 36000
+    max_route_time: int = 36000,
+    mandatory_visit_ids: Optional[set] = None
 ) -> Dict:
     """
     Hybrid VRP Solver: CVRP + VRPPD + VRPTW
@@ -593,6 +594,40 @@ def solve_vrp(
     
     logger.info(f"🔍 Building pickup-drop pairs from combined location info...")
     
+    def _norm_vtype(vtype: Optional[str]) -> str:
+        vt = (vtype or "").strip().lower()
+        # API/UI sometimes sends "damaged pickup" vs "damaged_pickup"
+        vt = vt.replace(" ", "_")
+        return vt
+
+    def _is_pickup_vtype(vtype: Optional[str]) -> bool:
+        return _norm_vtype(vtype) in {
+            "pickup", "pick",
+            "return_pickup",
+            "exchanged_pickup",
+            "damaged_pickup",
+        }
+
+    def _is_drop_vtype(vtype: Optional[str]) -> bool:
+        return _norm_vtype(vtype) in {
+            "drop", "delivery",
+            "return_drop",
+            "exchanged_drop",
+            "damaged_drop",
+        }
+
+    def _pair_group(vtype: Optional[str]) -> str:
+        vt = _norm_vtype(vtype)
+        if vt in {"pickup", "pick", "drop", "delivery"}:
+            return "standard"
+        if vt in {"return_pickup", "return_drop"}:
+            return "return"
+        if vt in {"exchanged_pickup", "exchanged_drop"}:
+            return "exchange"
+        if vt in {"damaged_pickup", "damaged_drop"}:
+            return "damage"
+        return "other"
+
     if combined_order_info:
         # Step 1: Build order_map  — order_id -> {'pickup': node, 'drop': node}
         for node in range(len(locations)):
@@ -608,40 +643,53 @@ def solve_vrp(
                     if order_id and visit_type:
                         if order_id not in order_map:
                             order_map[order_id] = {}
-                        
-                        if visit_type.lower() in ['pickup', 'pick']:
-                            order_map[order_id]['pickup'] = node
-                        elif visit_type.lower() in ['drop', 'delivery']:
-                            order_map[order_id]['drop'] = node
-                        elif visit_type.lower() in ['returned_from', 'returned_to']:
-                            # Returned visits don't have pickup-drop constraints
-                            # They are standalone mandatory visits
-                            pass
+
+                        vt = _norm_vtype(visit_type)
+                        # Returned visits don't have pickup-drop constraints (standalone mandatory)
+                        if vt in {"returned_from", "returned_to"}:
+                            continue
+
+                        group = _pair_group(vt)
+                        if group not in order_map[order_id]:
+                            order_map[order_id][group] = {}
+
+                        if _is_pickup_vtype(vt):
+                            order_map[order_id][group]["pickup"] = node
+                        elif _is_drop_vtype(vt):
+                            order_map[order_id][group]["drop"] = node
         
         # Step 2: Collect candidate pairs, sorted by priority (breached first)
         candidate_pairs = []
-        for order_id, nodes in order_map.items():
-            if 'pickup' in nodes and 'drop' in nodes:
-                pickup_node = nodes['pickup']
-                drop_node = nodes['drop']
-                
-                if pickup_node == drop_node:
-                    logger.info(f"📍 Order {order_id}: pickup and drop at SAME location (node {pickup_node}) — no constraint needed")
+        for order_id, groups in order_map.items():
+            # groups: { group_name: {"pickup": node?, "drop": node?}, ... }
+            for group_name, nodes in groups.items():
+                if not isinstance(nodes, dict):
                     continue
-                
-                # Get priority of the drop node for sorting
-                pri = priorities[drop_node] if drop_node < len(priorities) else 5
-                candidate_pairs.append({
-                    'order_id': order_id,
-                    'pickup_node': pickup_node,
-                    'drop_node': drop_node,
-                    'priority': pri
-                })
-                logger.info(f"✅ Complete pair for order {order_id}: pickup node {pickup_node} -> drop node {drop_node}")
-            elif 'pickup' in nodes:
-                logger.warning(f"⚠️ Order {order_id} has PICKUP (node {nodes['pickup']}) but NO DROP")
-            elif 'drop' in nodes:
-                logger.warning(f"⚠️ Order {order_id} has DROP (node {nodes['drop']}) but NO PICKUP")
+                if "pickup" in nodes and "drop" in nodes:
+                    pickup_node = nodes["pickup"]
+                    drop_node = nodes["drop"]
+
+                    if pickup_node == drop_node:
+                        logger.info(
+                            f"📍 Order {order_id} ({group_name}): pickup and drop at SAME location (node {pickup_node}) — no constraint needed"
+                        )
+                        continue
+
+                    # Get priority of the drop node for sorting
+                    pri = priorities[drop_node] if drop_node < len(priorities) else 5
+                    candidate_pairs.append({
+                        "order_id": order_id,
+                        "pickup_node": pickup_node,
+                        "drop_node": drop_node,
+                        "priority": pri
+                    })
+                    logger.info(
+                        f"✅ Complete pair for order {order_id} ({group_name}): pickup node {pickup_node} -> drop node {drop_node}"
+                    )
+                elif "pickup" in nodes:
+                    logger.warning(f"⚠️ Order {order_id} ({group_name}) has PICKUP (node {nodes['pickup']}) but NO DROP")
+                elif "drop" in nodes:
+                    logger.warning(f"⚠️ Order {order_id} ({group_name}) has DROP (node {nodes['drop']}) but NO PICKUP")
         
         # Step 3: Select one pair per node (highest priority wins)
         # Sort candidates so highest-priority pairs are picked first
@@ -713,22 +761,30 @@ def solve_vrp(
         
         priority = priorities[node] if node < len(priorities) else 5
         
-        # Check if this node contains a mandatory visit type (returned_from, returned_to)
+        # Check if this node contains a mandatory visit
         is_mandatory = False
-        if combined_order_info and node < len(combined_order_info) and combined_order_info[node]:
+        if mandatory_visit_ids and visit_groups and node < len(visit_groups) and visit_groups[node]:
+            # visit_groups[node] is a list of visitIds for this combined node
+            for vid in visit_groups[node]:
+                if vid in mandatory_visit_ids:
+                    is_mandatory = True
+                    break
+
+        if not is_mandatory and combined_order_info and node < len(combined_order_info) and combined_order_info[node]:
+            # Backward compatibility: mandatory by type for legacy returned_* visits
             info = combined_order_info[node]
-            visit_types_at_node = info.get('visit_types', [])
+            visit_types_at_node = info.get("visit_types", [])
             for vtype in visit_types_at_node:
-                if vtype and vtype.lower() in ['returned_from', 'returned_to']:
+                if _norm_vtype(vtype) in {"returned_from", "returned_to"}:
                     is_mandatory = True
                     break
         
-        # MANDATORY visits (returned_from, returned_to) are NOT added to disjunctions
+        # MANDATORY visits are NOT added to disjunctions
         # This means the solver CANNOT drop them - they MUST be scheduled in a route
         # No disjunction = no option to leave unassigned = truly mandatory
         if is_mandatory:
             mandatory_count += 1
-            logger.info(f"🔒 Node {node} marked as MANDATORY (returned_from/returned_to) - MUST be scheduled")
+            logger.info(f"🔒 Node {node} marked as MANDATORY - MUST be scheduled")
             # Skip adding disjunction for this node - it's mandatory!
             continue
         
@@ -1823,17 +1879,218 @@ def optimize_routes():
         # Also track mandatory visits that MUST be scheduled
         original_order_ids = []
         original_visit_types = []
-        mandatory_visit_ids = set()  # Track visits that MUST be in final routes
+        mandatory_visit_ids = set()  # visitIds that MUST be scheduled (no disjunction)
+        forced_unassigned_visit_ids = set()  # visitIds that must be returned as unassigned
+        forced_unassigned_records = []  # records to append to unassigned_visits at end
+
+        def _norm_vtype(vtype: Optional[str]) -> str:
+            vt = (vtype or "").strip().lower()
+            return vt.replace(" ", "_")
+
+        HIGH_PRIORITY_TYPES = {
+            "exchanged_pickup",
+            "exchanged_drop",
+            "damaged_pickup",
+            "damaged_drop",
+            "return_pickup",
+            "return_drop",
+        }
         
         for visit in visits:
             original_order_ids.append(visit.get("order_id"))
             visit_type = visit.get("visit_type")
             original_visit_types.append(visit_type)
+
+            # Ensure these very-high-priority visit types are never deprioritized by SLA filtering
+            # (treat as SLA-breached for priority-tiering purposes).
+            if visit_type and _norm_vtype(visit_type) in HIGH_PRIORITY_TYPES:
+                try:
+                    visit["sla_days"] = min(int(visit.get("sla_days", 0)), 0)
+                except Exception:
+                    visit["sla_days"] = 0
             
             # Track mandatory visits
-            if visit_type and visit_type.lower() in ['returned_from', 'returned_to']:
+            if visit_type and _norm_vtype(visit_type) in ['returned_from', 'returned_to']:
                 mandatory_visit_ids.add(visit['visitId'])
                 logger.info(f"🔒 Mandatory visit detected: {visit['visitId']} (type: {visit_type})")
+
+        # ─── NEW: Exchange/Damage/Return mandatory + special exchange scheduling ───
+        # Rules:
+        # - These 6 types are very high priority; treat as mandatory (cannot be dropped).
+        # - Return: behave like normal pickup/drop pair (mandatory).
+        # - Exchange (4-type set): if all four present, schedule:
+        #     exchanged_pickup (mandatory standalone) AND (damaged_pickup -> exchanged_drop as a pair),
+        #     and force damaged_drop into unassigned.
+        #   If only one of the four is present, that single visit is mandatory.
+        #   For partial (2-3) sets, keep them mandatory; default pairing is within same type family.
+        #
+        # Implementation details:
+        # - We can "force unassigned" only by excluding the visit before solving.
+        order_to_indices: Dict[str, List[int]] = {}
+        for idx, v in enumerate(visits):
+            oid = v.get("order_id")
+            if not oid:
+                continue
+            order_to_indices.setdefault(str(oid), []).append(idx)
+
+        def _haversine_km(a_lat: float, a_lng: float, b_lat: float, b_lng: float) -> float:
+            # Fast-enough great-circle distance for choosing between exchange scheduling options.
+            # Not used for final routing optimization (which uses Google Distance Matrix).
+            from math import radians, sin, cos, sqrt, asin
+            r = 6371.0
+            dlat = radians(b_lat - a_lat)
+            dlng = radians(b_lng - a_lng)
+            lat1 = radians(a_lat)
+            lat2 = radians(b_lat)
+            h = sin(dlat / 2) ** 2 + cos(lat1) * cos(lat2) * sin(dlng / 2) ** 2
+            return 2 * r * asin(sqrt(h))
+
+        def _get_coords_by_idx(i: Optional[int]) -> Optional[Tuple[float, float]]:
+            if i is None or i < 0 or i >= len(visits):
+                return None
+            try:
+                return float(visits[i].get("lat")), float(visits[i].get("lng"))
+            except Exception:
+                return None
+
+        for oid, idxs in order_to_indices.items():
+            type_to_vid = {}  # normalized vtype -> visitId
+            type_to_idx = {}  # normalized vtype -> index in visits list
+
+            for i in idxs:
+                vt = _norm_vtype(visits[i].get("visit_type"))
+                if not vt:
+                    continue
+                # only keep first if duplicates arrive
+                if vt not in type_to_vid:
+                    type_to_vid[vt] = visits[i].get("visitId")
+                    type_to_idx[vt] = i
+
+            present = set(type_to_vid.keys())
+
+            # Return state: mandatory + pair enforced by solver
+            if "return_pickup" in present:
+                vid = type_to_vid.get("return_pickup")
+                if vid:
+                    mandatory_visit_ids.add(vid)
+            if "return_drop" in present:
+                vid = type_to_vid.get("return_drop")
+                if vid:
+                    mandatory_visit_ids.add(vid)
+
+            # Exchange order state: special handling
+            exchange_set = {"exchanged_pickup", "exchanged_drop", "damaged_pickup", "damaged_drop"}
+            exchange_present = present.intersection(exchange_set)
+            if not exchange_present:
+                continue
+
+            # If only one of the exchange/damage visits is present, that visit is mandatory
+            if len(exchange_present) == 1:
+                only_vt = next(iter(exchange_present))
+                vid = type_to_vid.get(only_vt)
+                if vid:
+                    mandatory_visit_ids.add(vid)
+                continue
+
+            # If all 4 present, choose the more efficient of:
+            # A) Keep exchange pair (exchanged_pickup -> exchanged_drop), force damaged_drop unassigned
+            #    (damaged_pickup becomes standalone mandatory)
+            # B) Keep damage pair (damaged_pickup -> damaged_drop), force exchanged_drop unassigned
+            #    (exchanged_pickup becomes standalone mandatory)
+            if exchange_present == exchange_set:
+                # We pick the option with the smaller heuristic score:
+                #   score = kept_pair_distance_km + min(dist(start, standalone_pickup), dist(end, standalone_pickup))
+                start_lat, start_lng = float(start_point["lat"]), float(start_point["lng"])
+                end_lat, end_lng = float(end_point["lat"]), float(end_point["lng"])
+
+                ex_pu = _get_coords_by_idx(type_to_idx.get("exchanged_pickup"))
+                ex_dr = _get_coords_by_idx(type_to_idx.get("exchanged_drop"))
+                dmg_pu = _get_coords_by_idx(type_to_idx.get("damaged_pickup"))
+                dmg_dr = _get_coords_by_idx(type_to_idx.get("damaged_drop"))
+
+                def _standalone_cost_km(coords: Optional[Tuple[float, float]]) -> float:
+                    if not coords:
+                        return 10**9
+                    lat, lng = coords
+                    return min(
+                        _haversine_km(start_lat, start_lng, lat, lng),
+                        _haversine_km(end_lat, end_lng, lat, lng),
+                    )
+
+                def _pair_cost_km(a: Optional[Tuple[float, float]], b: Optional[Tuple[float, float]]) -> float:
+                    if not a or not b:
+                        return 10**9
+                    return _haversine_km(a[0], a[1], b[0], b[1])
+
+                # Option A: keep exchange pair; standalone damaged_pickup; unassign damaged_drop
+                score_a = _pair_cost_km(ex_pu, ex_dr) + _standalone_cost_km(dmg_pu)
+                # Option B: keep damage pair; standalone exchanged_pickup; unassign exchanged_drop
+                score_b = _pair_cost_km(dmg_pu, dmg_dr) + _standalone_cost_km(ex_pu)
+
+                choose_a = score_a <= score_b
+                logger.info(
+                    f"🔁 Exchange-rule choice for order {oid}: "
+                    f"scoreA={score_a:.2f}km vs scoreB={score_b:.2f}km → "
+                    f"{'A(keep exchange pair, unassign damaged_drop)' if choose_a else 'B(keep damage pair, unassign exchanged_drop)'}"
+                )
+
+                if choose_a:
+                    # Mandatory: all except the forced-unassigned damaged_drop
+                    for vt in ("exchanged_pickup", "exchanged_drop", "damaged_pickup"):
+                        vid = type_to_vid.get(vt)
+                        if vid:
+                            mandatory_visit_ids.add(vid)
+
+                    # Force damaged_drop to unassigned
+                    damaged_drop_vid = type_to_vid.get("damaged_drop")
+                    if damaged_drop_vid:
+                        forced_unassigned_visit_ids.add(damaged_drop_vid)
+                        forced_unassigned_records.append({
+                            "visitId": damaged_drop_vid,
+                            "reason": "exchange_rule_forced_unassigned_damaged_drop",
+                        })
+                else:
+                    # Mandatory: all except the forced-unassigned exchanged_drop
+                    for vt in ("damaged_pickup", "damaged_drop", "exchanged_pickup"):
+                        vid = type_to_vid.get(vt)
+                        if vid:
+                            mandatory_visit_ids.add(vid)
+
+                    # Force exchanged_drop to unassigned
+                    exchanged_drop_vid = type_to_vid.get("exchanged_drop")
+                    if exchanged_drop_vid:
+                        forced_unassigned_visit_ids.add(exchanged_drop_vid)
+                        forced_unassigned_records.append({
+                            "visitId": exchanged_drop_vid,
+                            "reason": "exchange_rule_forced_unassigned_exchanged_drop",
+                        })
+                continue
+
+            # Partial (2-3): keep all present mandatory. Pairing will be within same family
+            # (exchange pickup->exchange drop, damaged pickup->damaged drop) if both exist.
+            for vt in exchange_present:
+                vid = type_to_vid.get(vt)
+                if vid:
+                    mandatory_visit_ids.add(vid)
+
+        # Exclude forced-unassigned visits from solving upfront
+        if forced_unassigned_visit_ids:
+            kept_visits = []
+            kept_order_ids = []
+            kept_types = []
+            for v, oid, vt in zip(visits, original_order_ids, original_visit_types):
+                if v.get("visitId") in forced_unassigned_visit_ids:
+                    continue
+                kept_visits.append(v)
+                kept_order_ids.append(oid)
+                kept_types.append(vt)
+
+            removed_count = len(visits) - len(kept_visits)
+            if removed_count:
+                logger.info(f"🧾 Forced-unassigned exchange-rule visits excluded from solve: {removed_count}")
+            visits = kept_visits
+            original_order_ids = kept_order_ids
+            original_visit_types = kept_types
         
         if mandatory_visit_ids:
             logger.info(f"📋 Total mandatory visits to schedule: {len(mandatory_visit_ids)}")
@@ -2011,7 +2268,8 @@ def optimize_routes():
             original_visits=visits,
             time_windows=aligned_time_windows if has_any_time_window else None,
             service_times=aligned_service_times,
-            max_route_time=max_route_time
+            max_route_time=max_route_time,
+            mandatory_visit_ids=mandatory_visit_ids
         )
         
         if result is None:
@@ -2040,6 +2298,11 @@ def optimize_routes():
         if filtered_excluded_visits:
             result['unassigned_visits'].extend(filtered_excluded_visits)
             logger.info(f"Added {len(filtered_excluded_visits)} filtered visits to unassigned list")
+
+        # Add forced-unassigned visits (exchange rule) to unassigned visits
+        if forced_unassigned_records:
+            result["unassigned_visits"].extend(forced_unassigned_records)
+            logger.info(f"Added {len(forced_unassigned_records)} forced-unassigned exchange-rule visits to unassigned list")
 
         # If vehicle_type is 'bike', rename truckId labels to rider_1, rider_2, ...
         vehicle_type = (data.get("vehicle_type") or "").strip().lower() if data.get("vehicle_type") else ""
