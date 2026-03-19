@@ -1075,12 +1075,14 @@ def extract_solution(
                             "sequence": sequence
                         }
                         
-                        # Add order_id and visit_type from original visit if available
+                        # Add order_id, visit_type, and vol_capacity from original visit if available
                         if original_visit:
                             if 'order_id' in original_visit and original_visit['order_id']:
                                 stop_data["order_id"] = original_visit['order_id']
                             if 'visit_type' in original_visit and original_visit['visit_type']:
                                 stop_data["visit_type"] = original_visit['visit_type']
+                            if original_visit.get('vol_capacity') is not None:
+                                stop_data["vol_capacity"] = original_visit['vol_capacity']
                         
                         stops.append(stop_data)
                         # Note: We keep the same sequence for all visits at the same location
@@ -1093,7 +1095,7 @@ def extract_solution(
                         "sequence": sequence
                     }
                     
-                    # Add order_id and visit_type from original visits
+                    # Add order_id, visit_type, and vol_capacity from original visits
                     if original_visits:
                         for orig_v in original_visits:
                             if orig_v['visitId'] == visit_info['visitId']:
@@ -1101,6 +1103,8 @@ def extract_solution(
                                     stop_data["order_id"] = orig_v['order_id']
                                 if 'visit_type' in orig_v and orig_v['visit_type']:
                                     stop_data["visit_type"] = orig_v['visit_type']
+                                if orig_v.get('vol_capacity') is not None:
+                                    stop_data["vol_capacity"] = orig_v['vol_capacity']
                                 break
                     
                     stops.append(stop_data)
@@ -1749,6 +1753,272 @@ def fix_validation_errors(
     return result
 
 
+def enforce_volume_capacity(
+    routes: List[Dict],
+    unassigned_visits: List[Dict],
+    original_visits: List[Dict],
+    truck_capacity: float
+) -> Tuple[List[Dict], List[Dict]]:
+    """
+    Post-process routes to enforce per-truck volume capacity constraints.
+
+    Volume model
+    ────────────
+    1. Pre-loaded items  — drops/deliveries that have NO matching pickup in this
+       route (the truck departs the depot already carrying these items).
+       Their combined vol_capacity forms the *initial* truck load.
+    2. Pickups along the route  ADD to the running volume load.
+    3. Drops along the route    SUBTRACT from the running volume load.
+    4. At no point should   current_volume > truck_capacity.
+
+    Removal strategy (when a violation is found)
+    ─────────────────────────────────────────────
+    Candidates for removal are:
+      • Pre-loaded drops  (removing them reduces the starting load)
+      • Pickups that occur at or before the first violation point
+        (removing them — and their paired drop — reduces load from that point on)
+
+    Among all candidates the one with the highest sla_days (least urgent) is
+    removed first.  When removing a pickup its paired drop is always removed
+    too, and vice-versa, to keep the route consistent.
+
+    Removed visits are appended to unassigned_visits with
+    reason='volume_capacity_exceeded'.
+
+    Returns
+    ───────
+    (updated_routes, updated_unassigned_visits)
+    """
+    if not truck_capacity or truck_capacity <= 0:
+        return routes, unassigned_visits
+
+    # ── Build per-visit lookups from original input ──────────────────────────
+    vol_map: Dict[str, float] = {}
+    sla_map: Dict[str, int] = {}
+    for v in original_visits:
+        vid = v.get("visitId")
+        if vid:
+            vol_map[vid] = float(v.get("vol_capacity") or 0)
+            sd = v.get("sla_days")
+            sla_map[vid] = int(sd) if sd is not None else 999
+
+    seen_unassigned: set = set(
+        u.get("visitId") for u in unassigned_visits if u.get("visitId")
+    )
+
+    # ── Visit-type helpers ────────────────────────────────────────────────────
+    def _norm(vtype: Optional[str]) -> str:
+        return (vtype or "").strip().lower().replace(" ", "_")
+
+    def _is_pickup(vtype: Optional[str]) -> bool:
+        return _norm(vtype) in {
+            "pickup", "pick",
+            "damaged_pickup", "return_pickup", "exchanged_pickup",
+        }
+
+    def _is_drop(vtype: Optional[str]) -> bool:
+        return _norm(vtype) in {
+            "drop", "delivery",
+            "damaged_drop", "return_drop", "exchanged_drop",
+        }
+
+    def _family(vtype: Optional[str]) -> Optional[str]:
+        vt = _norm(vtype)
+        if vt in {"pickup", "pick", "drop", "delivery"}:
+            return "standard"
+        if vt in {"damaged_pickup", "damaged_drop"}:
+            return "damage"
+        if vt in {"return_pickup", "return_drop"}:
+            return "return"
+        if vt in {"exchanged_pickup", "exchanged_drop"}:
+            return "exchange"
+        return None
+
+    # ── Per-route helpers ─────────────────────────────────────────────────────
+    def build_route_info(
+        stops: List[Dict],
+    ) -> Tuple[float, set, Dict[str, str]]:
+        """
+        Analyse a (sorted) stop list and return:
+          preloaded_vol   – initial truck load (vol of drops without a paired
+                            pickup inside this route)
+          preloaded_vids  – set of visitIds that are pre-loaded
+          pair_map        – {visitId: paired_visitId} for in-route pickup/drop pairs
+        """
+        # Keyed by  "order_id::family"  →  {pickup_vids, drop_vids}
+        bucket: Dict[str, Dict[str, List[str]]] = {}
+        for stop in stops:
+            oid = stop.get("order_id")
+            vtype = stop.get("visit_type") or ""
+            vid = stop.get("visitId", "")
+            fam = _family(vtype)
+            if not fam:
+                # No order_id *and* no recognised family → treat as pre-loaded drop
+                if not oid and _is_drop(vtype):
+                    key = f"__standalone__{vid}"
+                    bucket.setdefault(key, {"pickup_vids": [], "drop_vids": []})
+                    bucket[key]["drop_vids"].append(vid)
+                continue
+            key = f"{oid}::{fam}"
+            bucket.setdefault(key, {"pickup_vids": [], "drop_vids": []})
+            if _is_pickup(vtype):
+                bucket[key]["pickup_vids"].append(vid)
+            elif _is_drop(vtype):
+                bucket[key]["drop_vids"].append(vid)
+
+        preloaded_vids: set = set()
+        pair_map: Dict[str, str] = {}
+
+        for info in bucket.values():
+            pickups = info["pickup_vids"]
+            drops = info["drop_vids"]
+            if drops and not pickups:
+                preloaded_vids.update(drops)
+            elif pickups and drops:
+                for pu, dr in zip(pickups, drops):
+                    pair_map[pu] = dr
+                    pair_map[dr] = pu
+
+        preloaded_vol = sum(vol_map.get(v, 0) for v in preloaded_vids)
+        return preloaded_vol, preloaded_vids, pair_map
+
+    def simulate(stops: List[Dict], preloaded_vol: float) -> Tuple[float, int]:
+        """
+        Walk the stop sequence tracking current volume.
+        Returns (max_load_seen, first_violation_index).
+        first_violation_index = -1 if no violation found.
+        """
+        load = preloaded_vol
+        max_load = load
+        first_violation = -1
+        for i, stop in enumerate(stops):
+            vtype = stop.get("visit_type") or ""
+            vol = vol_map.get(stop.get("visitId", ""), 0)
+            if _is_pickup(vtype):
+                load += vol
+            elif _is_drop(vtype):
+                load -= vol
+            if load > max_load:
+                max_load = load
+            if load > truck_capacity and first_violation == -1:
+                first_violation = i
+        return max_load, first_violation
+
+    # ── Main enforcement loop per route ──────────────────────────────────────
+    updated_routes: List[Dict] = []
+
+    for route in routes:
+        stops = sorted(route["stops"], key=lambda s: s["sequence"])
+
+        if not stops:
+            updated_routes.append(route)
+            continue
+
+        changed = False
+        max_iters = len(stops) + 5   # safety cap
+
+        for _iter in range(max_iters):
+            preloaded_vol, preloaded_vids, pair_map = build_route_info(stops)
+
+            # Check whether the initial load itself breaches capacity
+            initial_breach = preloaded_vol > truck_capacity
+
+            max_load, violation_idx = simulate(stops, preloaded_vol)
+
+            if not initial_breach and violation_idx == -1:
+                break  # constraint satisfied
+
+            # Effective violation position (for finding candidates)
+            eff_viol_idx = 0 if initial_breach else violation_idx
+
+            # Build candidate list
+            # A candidate can reduce the load at or before the violation point:
+            #   • Pre-loaded drops        → reduce starting load
+            #   • Pickups at/before viol  → reduce load from that point onward
+            candidates = []
+            for i, stop in enumerate(stops):
+                vid = stop.get("visitId", "")
+                vtype = stop.get("visit_type") or ""
+                is_pre = vid in preloaded_vids
+                is_pu_before = _is_pickup(vtype) and i <= eff_viol_idx
+
+                if is_pre or is_pu_before:
+                    candidates.append({
+                        "idx": i,
+                        "visitId": vid,
+                        "sla_days": sla_map.get(vid, 999),
+                        "vol": vol_map.get(vid, 0),
+                        "paired_vid": pair_map.get(vid),
+                    })
+
+            if not candidates:
+                # Fallback: remove the stop right at the violation point
+                viol_stop = stops[eff_viol_idx]
+                vid = viol_stop.get("visitId", "")
+                candidates = [{
+                    "idx": eff_viol_idx,
+                    "visitId": vid,
+                    "sla_days": sla_map.get(vid, 999),
+                    "vol": vol_map.get(vid, 0),
+                    "paired_vid": pair_map.get(vid),
+                }]
+
+            # Least urgent first (highest sla_days), tie-break: most volume (helps most)
+            candidates.sort(key=lambda c: (-c["sla_days"], -c["vol"]))
+            best = candidates[0]
+
+            to_remove: set = {best["visitId"]}
+            if best["paired_vid"]:
+                to_remove.add(best["paired_vid"])
+
+            for vid in to_remove:
+                if vid not in seen_unassigned:
+                    unassigned_visits.append({
+                        "visitId": vid,
+                        "reason": "volume_capacity_exceeded",
+                    })
+                    seen_unassigned.add(vid)
+                    logger.info(
+                        f"📦 Vol cap: unassigning {vid} "
+                        f"(vol={vol_map.get(vid, 0)}, sla={sla_map.get(vid, 0)}) "
+                        f"from {route['truckId']}"
+                    )
+
+            stops = [s for s in stops if s.get("visitId") not in to_remove]
+            changed = True
+
+        # Re-sequence and rebuild stats when stops were modified
+        if changed:
+            for seq, stop in enumerate(stops, 1):
+                stop["sequence"] = seq
+            route = dict(route)          # shallow copy to avoid mutating shared refs
+            route["stops"] = stops
+            route["waypoint_count"] = len(set(s["sequence"] for s in stops))
+            route["total_visits"] = len(stops)
+
+        # Annotate route with final volume utilisation info
+        if stops:
+            preloaded_vol, _, _ = build_route_info(stops)
+            max_load, _ = simulate(stops, preloaded_vol)
+            util_pct = round(max_load / truck_capacity * 100, 1) if truck_capacity > 0 else 0
+            route["volume_utilization"] = {
+                "max_load": round(max_load, 2),
+                "truck_capacity": truck_capacity,
+                "utilization_pct": util_pct,
+                "initial_preloaded_vol": round(preloaded_vol, 2),
+            }
+            logger.info(
+                f"📦 {route['truckId']}: vol OK — "
+                f"max={max_load:.1f}/{truck_capacity:.1f} ({util_pct:.0f}%), "
+                f"preloaded={preloaded_vol:.1f}"
+            )
+
+        if stops:
+            updated_routes.append(route)
+
+    return updated_routes, unassigned_visits
+
+
 @auto_routing_bp.route("/optimize", methods=["POST"])
 def optimize_routes():
     """
@@ -1762,6 +2032,7 @@ def optimize_routes():
         "trucks": 3,
         "max_km": 120,
         "max_stops": 25,               // Optional, default 25 — max stops per truck
+        "truck_capacity": 50,          // Optional — max volume units a truck can carry at any moment
         "shift_duration_hours": 10,     // Optional, default 10 — max hours per driver shift
         "service_time_minutes": 10,     // Optional, default 10 — minutes spent at each stop
         "start": { "lat": 12.97, "lng": 77.59 },
@@ -1775,6 +2046,7 @@ def optimize_routes():
                 "order_id": "ORD123",       // Optional
                 "visit_type": "pickup",     // Optional: "pickup", "drop", "returned_from", "returned_to"
                                              // Note: "returned_from" and "returned_to" are MANDATORY
+                "vol_capacity": 2,          // Optional — volume units this visit occupies/frees
                 "time_window_start": 60,    // Optional: earliest arrival (min from shift start)
                 "time_window_end": 300      // Optional: latest arrival (min from shift start)
             },
@@ -1784,10 +2056,19 @@ def optimize_routes():
                 "lng": 77.61, 
                 "sla_days": 3,
                 "order_id": "ORD123",       // Optional
-                "visit_type": "drop"        // Optional: "pickup", "drop", "returned_from", "returned_to"
+                "visit_type": "drop",       // Optional: "pickup", "drop", "returned_from", "returned_to"
+                "vol_capacity": 2           // Optional — volume units this visit occupies/frees
             }
         ]
     }
+
+    Volume capacity rules (when truck_capacity is provided):
+      - Drops whose order has NO pickup in the same route = pre-loaded items (initial truck load).
+      - Pickups along the route ADD vol_capacity to the running load.
+      - Drops along the route SUBTRACT vol_capacity from the running load.
+      - At no point may running_load > truck_capacity.
+      - Visits that would cause a violation are moved to unassigned_visits
+        (least-urgent / highest sla_days removed first, paired pickup+drop always removed together).
     
     Returns:
     {
@@ -1844,6 +2125,7 @@ def optimize_routes():
         max_stops = data.get("max_stops", MAX_WAYPOINTS_PER_ROUTE)  # Default 25
         shift_duration_hours = data.get("shift_duration_hours", 10)  # Default 10h shift
         service_time_minutes = data.get("service_time_minutes", 10)  # Default 10min per stop
+        truck_capacity = data.get("truck_capacity")   # Optional: max volume units per truck
         start_point = data["start"]
         end_point = data["end"]
         visits = data["visits"]
@@ -1870,10 +2152,11 @@ def optimize_routes():
                 if field not in visit:
                     return jsonify({"error": f"Visit {i} missing required field: {field}"}), 400
         
+        vol_cap_str = f", vol cap {truck_capacity}/truck" if truck_capacity is not None else ""
         logger.info(f"🚛 Hybrid VRP (CVRP+VRPPD+VRPTW): {num_trucks} trucks, "
                      f"max {max_km}km, max {max_stops} stops/truck, "
-                     f"{shift_duration_hours}h shift, {service_time_minutes}min/stop, "
-                     f"{len(visits)} visits")
+                     f"{shift_duration_hours}h shift, {service_time_minutes}min/stop"
+                     f"{vol_cap_str}, {len(visits)} visits")
         
         # Extract order_ids and visit_types from original visits
         # Also track mandatory visits that MUST be scheduled
@@ -2294,6 +2577,21 @@ def optimize_routes():
                 max_waypoints=max_stops
             )
         
+        # Post-processing: Enforce volume capacity constraint
+        # Runs AFTER the solver and validation fixes so the final routes are stable.
+        # For each truck:  simulate running volume (pre-loaded drops + pickups - drops along route)
+        # and iteratively unassign least-urgent visits until every truck stays within truck_capacity.
+        if truck_capacity is not None and float(truck_capacity) > 0:
+            tc = float(truck_capacity)
+            logger.info(f"📦 Enforcing volume capacity: {tc} units/truck...")
+            result['routes'], result['unassigned_visits'] = enforce_volume_capacity(
+                routes=result['routes'],
+                unassigned_visits=result.get('unassigned_visits', []),
+                original_visits=data['visits'],   # full original list — has vol_capacity for every visit
+                truck_capacity=tc,
+            )
+            logger.info(f"✅ Volume capacity enforcement complete")
+
         # Add filtered-out visits to unassigned visits
         if filtered_excluded_visits:
             result['unassigned_visits'].extend(filtered_excluded_visits)
@@ -2327,9 +2625,13 @@ def optimize_routes():
             util_time = (est_hrs / shift_duration_hours * 100) if shift_duration_hours > 0 else 0
             total_locations += num_locations
             total_visits_assigned += num_visits
+            vol_info = ""
+            if route.get('volume_utilization'):
+                vu = route['volume_utilization']
+                vol_info = f", vol {vu['max_load']}/{vu['truck_capacity']} ({vu['utilization_pct']:.0f}%)"
             logger.info(f"📊 {route['truckId']}: {num_locations} locations/{num_visits} visits ({util_stops:.0f}%), "
                         f"{est_km:.1f}km ({util_km:.0f}%), "
-                        f"{est_hrs:.1f}h ({util_time:.0f}%)")
+                        f"{est_hrs:.1f}h ({util_time:.0f}%){vol_info}")
         
         logger.info(f"✅ Solution: {len(result['routes'])} routes, "
                      f"{total_locations} locations/{total_visits_assigned} visits assigned, "
