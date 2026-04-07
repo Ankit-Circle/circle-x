@@ -1,6 +1,7 @@
 import logging
 import os
 from typing import Dict, List, Optional, Set, Tuple
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import googlemaps
 import h3
@@ -15,6 +16,8 @@ HEX_CACHE_TABLE = os.environ.get("HEX_CACHE_TABLE", "hex_distance_cache")
 MAX_DESTINATIONS_PER_GOOGLE_CALL = 25
 MAX_SUPABASE_FILTER_CHUNK = 100
 FALLBACK_LARGE_VALUE = 9_999_999
+ENABLE_HEX_USAGE_STATS = os.environ.get("ENABLE_HEX_USAGE_STATS", "0") == "1"
+DM_API_MAX_WORKERS = max(1, int(os.environ.get("DM_API_MAX_WORKERS", "6")))
 
 # Google Maps Distance Matrix API client setup
 GOOGLE_MAPS_API_KEY = os.environ.get("GOOGLE_MAPS_API_KEY")
@@ -259,21 +262,32 @@ def create_distance_matrix(
         for origin_hex, destination_hex in pending_pairs_res7:
             origin_to_destinations.setdefault(origin_hex, []).append(destination_hex)
 
+        res7_jobs: List[Tuple[str, List[str], Tuple[float, float]]] = []
         for origin_hex, destination_hexes in origin_to_destinations.items():
             origin_latlng = _hex_to_latlng(origin_hex)
             unique_destinations = sorted(set(destination_hexes))
-
             for chunk in _chunk(unique_destinations, MAX_DESTINATIONS_PER_GOOGLE_CALL):
-                destination_coords = [_hex_to_latlng(dest_hex) for dest_hex in chunk]
-                result = gmaps.distance_matrix(
-                    origins=[origin_latlng],
-                    destinations=destination_coords,
-                    mode="driving",
-                )
+                res7_jobs.append((origin_hex, chunk, origin_latlng))
 
+        def _run_dm_call(origin_latlng, destination_coords):
+            return gmaps.distance_matrix(
+                origins=[origin_latlng],
+                destinations=destination_coords,
+                mode="driving",
+            )
+
+        with ThreadPoolExecutor(max_workers=DM_API_MAX_WORKERS) as pool:
+            future_map = {}
+            for origin_hex, chunk, origin_latlng in res7_jobs:
+                destination_coords = [_hex_to_latlng(dest_hex) for dest_hex in chunk]
+                fut = pool.submit(_run_dm_call, origin_latlng, destination_coords)
+                future_map[fut] = (origin_hex, chunk)
+
+            for fut in as_completed(future_map):
+                origin_hex, chunk = future_map[fut]
+                result = fut.result()
                 if result["status"] != "OK":
                     raise Exception(f"Google Maps API error: {result['status']}")
-
                 row_elements = result["rows"][0]["elements"]
                 for dest_hex, element in zip(chunk, row_elements):
                     key = (origin_hex, dest_hex)
@@ -360,17 +374,23 @@ def create_distance_matrix(
             for origin_hex, destination_hex in pending_pairs_res8:
                 origin_to_destinations_res8.setdefault(origin_hex, []).append(destination_hex)
 
+            res8_jobs: List[Tuple[str, List[str], Tuple[float, float]]] = []
             for origin_hex, destination_hexes in origin_to_destinations_res8.items():
                 origin_latlng = _hex_to_latlng(origin_hex)
                 unique_destinations = sorted(set(destination_hexes))
-
                 for chunk in _chunk(unique_destinations, MAX_DESTINATIONS_PER_GOOGLE_CALL):
+                    res8_jobs.append((origin_hex, chunk, origin_latlng))
+
+            with ThreadPoolExecutor(max_workers=DM_API_MAX_WORKERS) as pool:
+                future_map = {}
+                for origin_hex, chunk, origin_latlng in res8_jobs:
                     destination_coords = [_hex_to_latlng(dest_hex) for dest_hex in chunk]
-                    result = gmaps.distance_matrix(
-                        origins=[origin_latlng],
-                        destinations=destination_coords,
-                        mode="driving",
-                    )
+                    fut = pool.submit(_run_dm_call, origin_latlng, destination_coords)
+                    future_map[fut] = (origin_hex, chunk)
+
+                for fut in as_completed(future_map):
+                    origin_hex, chunk = future_map[fut]
+                    result = fut.result()
                     if result["status"] != "OK":
                         raise Exception(f"Google Maps API error: {result['status']}")
 
@@ -414,12 +434,6 @@ def create_distance_matrix(
     total_unique_locations = len(
         {(loc.get("lat"), loc.get("lng")) for loc in locations if "lat" in loc and "lng" in loc}
     )
-    existing_res7_hexes = _fetch_existing_cache_hexes(supabase, H3_RESOLUTION, unique_hexes_res7)
-    new_res7_hexes_used = len(unique_hexes_res7 - existing_res7_hexes)
-    existing_res8_hexes = _fetch_existing_cache_hexes(
-        supabase, H3_FINE_RESOLUTION, unique_hexes_res8_used
-    )
-    new_res8_hexes_used = len(unique_hexes_res8_used - existing_res8_hexes)
     total_hex_used = len(unique_hexes_res7) + len(unique_hexes_res8_used)
     logger.info(
         "🧩 Total hex used | res7=%s | res8=%s | combined=%s",
@@ -427,12 +441,19 @@ def create_distance_matrix(
         len(unique_hexes_res8_used),
         total_hex_used,
     )
-    logger.info(
-        "🆕 New hexes used (not source-destination pairs) | res7=%s | res8=%s | combined=%s",
-        new_res7_hexes_used,
-        new_res8_hexes_used,
-        new_res7_hexes_used + new_res8_hexes_used,
-    )
+    if ENABLE_HEX_USAGE_STATS:
+        existing_res7_hexes = _fetch_existing_cache_hexes(supabase, H3_RESOLUTION, unique_hexes_res7)
+        new_res7_hexes_used = len(unique_hexes_res7 - existing_res7_hexes)
+        existing_res8_hexes = _fetch_existing_cache_hexes(
+            supabase, H3_FINE_RESOLUTION, unique_hexes_res8_used
+        )
+        new_res8_hexes_used = len(unique_hexes_res8_used - existing_res8_hexes)
+        logger.info(
+            "🆕 New hexes used (not source-destination pairs) | res7=%s | res8=%s | combined=%s",
+            new_res7_hexes_used,
+            new_res8_hexes_used,
+            new_res7_hexes_used + new_res8_hexes_used,
+        )
     logger.info(
         "📊 H3 cache stats | unique_locations=%s | res7_unique_hexes=%s | res8_unique_hexes=%s | "
         "cache_hits(res7+res8)=%s (%s+%s) | cache_misses(res7+res8)=%s (%s+%s)",
