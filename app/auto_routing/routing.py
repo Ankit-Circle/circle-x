@@ -900,6 +900,19 @@ def solve_vrp(
             },
         ]
 
+        # Hard wall-clock budget to avoid Gunicorn worker timeout kills.
+        # Keeps same profile sequence/logic, but caps profile runtime by remaining budget.
+        worker_timeout_sec = int(os.environ.get("AUTO_ROUTING_WORKER_TIMEOUT_SEC", "90"))
+        solve_budget_sec = int(
+            os.environ.get(
+                "AUTO_ROUTING_SOLVE_BUDGET_SEC",
+                str(max(20, worker_timeout_sec - 15))
+            )
+        )
+        # Per-profile minimum to still allow solver to return a useful candidate.
+        min_profile_seconds = int(os.environ.get("AUTO_ROUTING_MIN_PROFILE_SECONDS", "5"))
+        budget_start = time.time()
+
         best_solution = None
         best_sla_score = -1
         best_assigned_nodes = -1
@@ -909,16 +922,28 @@ def solve_vrp(
         total_visit_nodes = max(0, len(locations) - 2)
 
         for profile in solve_profiles:
+            elapsed_budget = time.time() - budget_start
+            remaining_budget = solve_budget_sec - elapsed_budget
+            if remaining_budget < min_profile_seconds:
+                logger.warning(
+                    f"⏱️ Solve budget nearly exhausted "
+                    f"(elapsed={elapsed_budget:.1f}s, budget={solve_budget_sec}s). "
+                    f"Skipping remaining profiles."
+                )
+                break
+
+            profile_time_limit = int(max(min_profile_seconds, min(profile["time_limit"], remaining_budget)))
             params = pywrapcp.DefaultRoutingSearchParameters()
             params.first_solution_strategy = profile["first_solution"]
             params.local_search_metaheuristic = profile["metaheuristic"]
-            params.time_limit.seconds = profile["time_limit"]
+            params.time_limit.seconds = profile_time_limit
             params.log_search = False
 
             routing.SetFixedCostOfAllVehicles(max(0, int(profile["fixed_cost"])))
             logger.info(
                 f"🧪 Solve profile={profile['name']} "
-                f"time_limit={profile['time_limit']}s fixed_cost={int(profile['fixed_cost'])}"
+                f"time_limit={profile_time_limit}s fixed_cost={int(profile['fixed_cost'])} "
+                f"(budget_remaining={remaining_budget:.1f}s)"
             )
 
             p_start = time.time()
@@ -2207,6 +2232,7 @@ def optimize_routes():
         shift_duration_hours = data.get("shift_duration_hours", 10)  # Default 10h shift
         service_time_minutes = data.get("service_time_minutes", 10)  # Default 10min per stop
         truck_capacity = data.get("truck_capacity")   # Optional: max volume units per truck
+        pickup_dropoff_same_day = bool(data.get("pickup_dropoff_same_day", True))
         start_point = data["start"]
         end_point = data["end"]
         visits = data["visits"]
@@ -2277,6 +2303,61 @@ def optimize_routes():
             if visit_type and _norm_vtype(visit_type) in ['returned_from', 'returned_to']:
                 mandatory_visit_ids.add(visit['visitId'])
                 logger.info(f"🔒 Mandatory visit detected: {visit['visitId']} (type: {visit_type})")
+
+        # If same-day pickup+drop is disabled, keep only pickup visits from STANDARD
+        # pickup/drop pairs for the same order. Other visit families remain unchanged.
+        if not pickup_dropoff_same_day:
+            standard_presence: Dict[str, Dict[str, int]] = {}
+            for oid, vt in zip(original_order_ids, original_visit_types):
+                if not oid:
+                    continue
+                norm_vt = _norm_vtype(vt)
+                key = str(oid)
+                if key not in standard_presence:
+                    standard_presence[key] = {"pickup": 0, "drop": 0}
+                if norm_vt in {"pickup", "pick"}:
+                    standard_presence[key]["pickup"] += 1
+                elif norm_vt in {"drop", "delivery"}:
+                    standard_presence[key]["drop"] += 1
+
+            paired_standard_orders = {
+                oid for oid, counts in standard_presence.items()
+                if counts.get("pickup", 0) > 0 and counts.get("drop", 0) > 0
+            }
+
+            if paired_standard_orders:
+                kept_visits = []
+                kept_order_ids = []
+                kept_types = []
+                removed_count = 0
+
+                for v, oid, vt in zip(visits, original_order_ids, original_visit_types):
+                    norm_vt = _norm_vtype(vt)
+                    if (
+                        oid
+                        and str(oid) in paired_standard_orders
+                        and norm_vt in {"drop", "delivery"}
+                    ):
+                        removed_count += 1
+                        forced_unassigned_visit_ids.add(v.get("visitId"))
+                        forced_unassigned_records.append({
+                            "visitId": v.get("visitId"),
+                            "reason": "pickup_dropoff_same_day_false_drop_deferred",
+                        })
+                        continue
+
+                    kept_visits.append(v)
+                    kept_order_ids.append(oid)
+                    kept_types.append(vt)
+
+                if removed_count > 0:
+                    visits = kept_visits
+                    original_order_ids = kept_order_ids
+                    original_visit_types = kept_types
+                    logger.info(
+                        f"🗓️ pickup_dropoff_same_day=false: deferred {removed_count} standard drop visit(s) "
+                        f"from {len(paired_standard_orders)} pickup-drop order pair(s); routing pickups only."
+                    )
 
         # ─── NEW: Exchange/Damage/Return mandatory + special exchange scheduling ───
         # Rules:
@@ -2496,6 +2577,13 @@ def optimize_routes():
             key for key, counts in pair_presence.items()
             if counts.get("drop", 0) > 0 and counts.get("pickup", 0) == 0
         }
+        # Independent STANDARD drops only (drop exists, pickup missing for standard family).
+        # These should be prioritized above normal paired standard pickup/drop visits.
+        independent_standard_drop_order_ids = {
+            key.split("::", 1)[0]
+            for key in unpaired_drop_keys
+            if key.endswith("::standard")
+        }
         if unpaired_drop_keys:
             logger.info(
                 f"📌 Unpaired drop groups detected: {len(unpaired_drop_keys)} "
@@ -2597,8 +2685,12 @@ def optimize_routes():
         # Create ENHANCED priority list - MUCH stronger SLA prioritization
         # Lower SLA days = exponentially higher priority
         UNPAIRED_DROP_PRIORITY_FLOOR = int(data.get("unpaired_drop_priority_floor", 12))
+        # Independent standard drops should outrank any standard pickup/drop pair.
+        # Standard paired visits max out around 25 in current SLA scoring, so default 40.
+        INDEPENDENT_STANDARD_DROP_PRIORITY = int(data.get("independent_standard_drop_priority", 40))
         priorities = [5]  # Start point - neutral priority
         boosted_unpaired_nodes = 0
+        boosted_independent_standard_drop_nodes = 0
         for idx, visit in enumerate(combined_visits):
             sla_days = visit.get("sla_days", 5)
             
@@ -2641,6 +2733,27 @@ def optimize_routes():
                 priority = UNPAIRED_DROP_PRIORITY_FLOOR
                 boosted_unpaired_nodes += 1
 
+            # Strong override: independent standard drop orders get top priority among
+            # standard pickup/drop traffic (higher than paired standard visits).
+            is_independent_standard_drop_node = False
+            if idx < len(combined_order_info):
+                info = combined_order_info[idx] or {}
+                node_oids = info.get("order_ids", [])
+                node_types = info.get("visit_types", [])
+                for oid, vt in zip(node_oids, node_types):
+                    norm_vt = _norm_vtype(vt)
+                    if (
+                        oid
+                        and norm_vt in {"drop", "delivery"}
+                        and str(oid) in independent_standard_drop_order_ids
+                    ):
+                        is_independent_standard_drop_node = True
+                        break
+
+            if is_independent_standard_drop_node and priority < INDEPENDENT_STANDARD_DROP_PRIORITY:
+                priority = INDEPENDENT_STANDARD_DROP_PRIORITY
+                boosted_independent_standard_drop_nodes += 1
+
             priorities.append(priority)
         priorities.append(5)  # End point - neutral priority
         
@@ -2654,6 +2767,11 @@ def optimize_routes():
             logger.info(
                 f"📌 Boosted {boosted_unpaired_nodes} unpaired-drop nodes "
                 f"to priority floor {UNPAIRED_DROP_PRIORITY_FLOOR}"
+            )
+        if boosted_independent_standard_drop_nodes:
+            logger.info(
+                f"🚀 Boosted {boosted_independent_standard_drop_nodes} independent STANDARD drop node(s) "
+                f"to priority {INDEPENDENT_STANDARD_DROP_PRIORITY}"
             )
         
         # Prepare combined_order_info aligned with locations (add None for start/end)
@@ -2754,6 +2872,79 @@ def optimize_routes():
                 truck_capacity=tc,
             )
             logger.info(f"✅ Volume capacity enforcement complete")
+
+        # Hard guard: for orders that were STANDARD pickup+drop pairs in the request,
+        # never keep DROP in final routes unless PICKUP for same order is also routed.
+        # NOTE: Independent drops (orders with only drop in request) must remain allowed.
+        request_std_presence: Dict[str, Dict[str, int]] = {}
+        for v in data.get("visits", []):
+            oid = v.get("order_id")
+            if not oid:
+                continue
+            vt = _norm_vtype(v.get("visit_type"))
+            key = str(oid)
+            if key not in request_std_presence:
+                request_std_presence[key] = {"pickup": 0, "drop": 0}
+            if vt in {"pickup", "pick"}:
+                request_std_presence[key]["pickup"] += 1
+            elif vt in {"drop", "delivery"}:
+                request_std_presence[key]["drop"] += 1
+
+        request_std_paired_orders = {
+            oid for oid, counts in request_std_presence.items()
+            if counts.get("pickup", 0) > 0 and counts.get("drop", 0) > 0
+        }
+
+        # This closes edge-cases where pair constraints are skipped (e.g., node conflicts)
+        # or where only drops survive later post-processing.
+        std_pickup_orders_in_routes = set()
+        for route in result.get("routes", []):
+            for stop in route.get("stops", []):
+                oid = stop.get("order_id")
+                vt = _norm_vtype(stop.get("visit_type"))
+                if oid and vt in {"pickup", "pick"}:
+                    std_pickup_orders_in_routes.add(str(oid))
+
+        removed_drop_count = 0
+        seen_unassigned_ids = {
+            u.get("visitId")
+            for u in result.get("unassigned_visits", [])
+            if isinstance(u, dict) and u.get("visitId")
+        }
+        for route in result.get("routes", []):
+            kept_stops = []
+            for stop in route.get("stops", []):
+                oid = stop.get("order_id")
+                vt = _norm_vtype(stop.get("visit_type"))
+                is_std_drop = vt in {"drop", "delivery"}
+                has_std_pickup_in_routes = oid and str(oid) in std_pickup_orders_in_routes
+                is_request_paired_order = oid and str(oid) in request_std_paired_orders
+
+                if is_std_drop and is_request_paired_order and not has_std_pickup_in_routes:
+                    removed_drop_count += 1
+                    vid = stop.get("visitId")
+                    if vid and vid not in seen_unassigned_ids:
+                        result.setdefault("unassigned_visits", []).append({
+                            "visitId": vid,
+                            "reason": "drop_without_pickup_in_final_routes",
+                        })
+                        seen_unassigned_ids.add(vid)
+                    continue
+
+                kept_stops.append(stop)
+
+            # Re-sequence and rebuild route counters after removals
+            for seq, stop in enumerate(kept_stops, 1):
+                stop["sequence"] = seq
+            route["stops"] = kept_stops
+            route["total_visits"] = len(kept_stops)
+            route["waypoint_count"] = len({s["sequence"] for s in kept_stops}) if kept_stops else 0
+
+        if removed_drop_count:
+            logger.warning(
+                f"🧹 Removed {removed_drop_count} standard DROP visit(s) without routed PICKUP "
+                f"(reason=drop_without_pickup_in_final_routes)"
+            )
 
         # Add filtered-out visits to unassigned visits
         if filtered_excluded_visits:
