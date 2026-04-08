@@ -206,6 +206,14 @@ def create_distance_matrix(
     if n == 0:
         return distance_matrix, duration_matrix
 
+    # Shared Google DM helper used by both res7 and res8 refinement calls.
+    def _run_dm_call(origin_latlng, destination_coords):
+        return gmaps.distance_matrix(
+            origins=[origin_latlng],
+            destinations=destination_coords,
+            mode="driving",
+        )
+
     logger.info(
         f"🗺️  Building {n}x{n} distance + duration matrix via H3 hex cache (res={H3_RESOLUTION}) + Google fallback..."
     )
@@ -268,13 +276,6 @@ def create_distance_matrix(
             unique_destinations = sorted(set(destination_hexes))
             for chunk in _chunk(unique_destinations, MAX_DESTINATIONS_PER_GOOGLE_CALL):
                 res7_jobs.append((origin_hex, chunk, origin_latlng))
-
-        def _run_dm_call(origin_latlng, destination_coords):
-            return gmaps.distance_matrix(
-                origins=[origin_latlng],
-                destinations=destination_coords,
-                mode="driving",
-            )
 
         with ThreadPoolExecutor(max_workers=DM_API_MAX_WORKERS) as pool:
             future_map = {}

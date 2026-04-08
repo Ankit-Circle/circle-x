@@ -900,6 +900,19 @@ def solve_vrp(
             },
         ]
 
+        # Hard wall-clock budget to avoid Gunicorn worker timeout kills.
+        # Keeps same profile sequence/logic, but caps profile runtime by remaining budget.
+        worker_timeout_sec = int(os.environ.get("AUTO_ROUTING_WORKER_TIMEOUT_SEC", "90"))
+        solve_budget_sec = int(
+            os.environ.get(
+                "AUTO_ROUTING_SOLVE_BUDGET_SEC",
+                str(max(20, worker_timeout_sec - 15))
+            )
+        )
+        # Per-profile minimum to still allow solver to return a useful candidate.
+        min_profile_seconds = int(os.environ.get("AUTO_ROUTING_MIN_PROFILE_SECONDS", "5"))
+        budget_start = time.time()
+
         best_solution = None
         best_sla_score = -1
         best_assigned_nodes = -1
@@ -909,16 +922,28 @@ def solve_vrp(
         total_visit_nodes = max(0, len(locations) - 2)
 
         for profile in solve_profiles:
+            elapsed_budget = time.time() - budget_start
+            remaining_budget = solve_budget_sec - elapsed_budget
+            if remaining_budget < min_profile_seconds:
+                logger.warning(
+                    f"⏱️ Solve budget nearly exhausted "
+                    f"(elapsed={elapsed_budget:.1f}s, budget={solve_budget_sec}s). "
+                    f"Skipping remaining profiles."
+                )
+                break
+
+            profile_time_limit = int(max(min_profile_seconds, min(profile["time_limit"], remaining_budget)))
             params = pywrapcp.DefaultRoutingSearchParameters()
             params.first_solution_strategy = profile["first_solution"]
             params.local_search_metaheuristic = profile["metaheuristic"]
-            params.time_limit.seconds = profile["time_limit"]
+            params.time_limit.seconds = profile_time_limit
             params.log_search = False
 
             routing.SetFixedCostOfAllVehicles(max(0, int(profile["fixed_cost"])))
             logger.info(
                 f"🧪 Solve profile={profile['name']} "
-                f"time_limit={profile['time_limit']}s fixed_cost={int(profile['fixed_cost'])}"
+                f"time_limit={profile_time_limit}s fixed_cost={int(profile['fixed_cost'])} "
+                f"(budget_remaining={remaining_budget:.1f}s)"
             )
 
             p_start = time.time()
