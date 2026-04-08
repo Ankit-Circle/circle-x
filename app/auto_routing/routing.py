@@ -3,6 +3,7 @@ import sys
 import time
 import tracemalloc
 import json
+import os
 from flask import Blueprint, request, jsonify
 from ortools.constraint_solver import routing_enums_pb2
 from ortools.constraint_solver import pywrapcp
@@ -15,6 +16,8 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+VERBOSE_API_LOGS = os.environ.get("AUTO_ROUTING_VERBOSE_LOGS", "0") == "1"
+ENABLE_MEMORY_PROFILING = os.environ.get("AUTO_ROUTING_MEMORY_PROFILE", "0") == "1"
 
 auto_routing_bp = Blueprint("auto_routing", __name__)
 
@@ -28,6 +31,8 @@ def log_memory(label: str, snapshot_start=None):
     If snapshot_start is provided, also logs the delta from that snapshot.
     Returns the current tracemalloc snapshot for chaining.
     """
+    if not ENABLE_MEMORY_PROFILING or not tracemalloc.is_tracing():
+        return None
     snapshot = tracemalloc.take_snapshot()
     current, peak = tracemalloc.get_traced_memory()
     current_mb = current / (1024 * 1024)
@@ -410,10 +415,22 @@ def solve_vrp(
     # This guarantees: include visit > use new truck > minimize distance
     distance_dimension.SetGlobalSpanCostCoefficient(0)
     
-    # Fixed cost per vehicle — solver will fill existing trucks before opening new ones
-    vehicle_fixed_cost = max_distance_per_vehicle * 3
+    # Fixed cost per vehicle — adaptive so high-load plans can open more trucks.
+    # Very high fixed costs can make first-solution construction fail on dense SLA jobs.
+    total_visit_nodes = max(0, len(locations) - 2)
+    avg_stops_per_truck = (total_visit_nodes / max(1, num_vehicles)) if num_vehicles > 0 else total_visit_nodes
+    load_ratio = (avg_stops_per_truck / max(1, max_waypoints)) if max_waypoints > 0 else 1.0
+    if load_ratio >= 0.85:
+        vehicle_fixed_cost = max(1, int(max_distance_per_vehicle * 0.5))
+    elif load_ratio >= 0.65:
+        vehicle_fixed_cost = max(1, int(max_distance_per_vehicle * 1.2))
+    else:
+        vehicle_fixed_cost = max(1, int(max_distance_per_vehicle * 3))
     routing.SetFixedCostOfAllVehicles(vehicle_fixed_cost)
-    logger.info(f"📦 Vehicle fixed cost: {vehicle_fixed_cost} (packs trucks before using new ones)")
+    logger.info(
+        f"📦 Vehicle fixed cost: {vehicle_fixed_cost} "
+        f"(load_ratio={load_ratio:.2f}, avg_stops/truck={avg_stops_per_truck:.1f})"
+    )
     
     # ─── WAYPOINT COUNT CONSTRAINT ───
     # max_stops counts PHYSICAL LOCATIONS (combined nodes), not individual visits.
@@ -719,32 +736,30 @@ def solve_vrp(
                     is_mandatory = True
                     break
         
-        # MANDATORY visits are NOT added to disjunctions
-        # This means the solver CANNOT drop them - they MUST be scheduled in a route
-        # No disjunction = no option to leave unassigned = truly mandatory
+        # MANDATORY visits are modeled as SOFT-MANDATORY with extreme penalties.
+        # This avoids global infeasibility on tough instances while still strongly
+        # forcing assignment whenever a feasible route exists.
         if is_mandatory:
             mandatory_count += 1
-            logger.info(f"🔒 Node {node} marked as MANDATORY - MUST be scheduled")
-            # Skip adding disjunction for this node - it's mandatory!
+            node_penalty = base_penalty * 1000
+            routing.AddDisjunction([manager.NodeToIndex(node)], node_penalty)
+            logger.info(f"🔒 Node {node} marked as SOFT-MANDATORY (penalty={node_penalty})")
             continue
         
-        # For all other visits, add disjunctions with SLA-based penalties
-        # MASSIVELY INCREASED penalty tiers to prioritize SLA visits
-        # These penalties ensure SLA visits are virtually guaranteed to be routed
+        # For all other visits, add disjunctions with SLA-based penalties.
+        # Use a continuous (priority^2) scaling instead of coarse tiers so
+        # lower SLA days always dominate higher SLA days in objective tradeoffs.
         if priority >= 15:
-            # SLA BREACHED (≤0 days) — EXTREME penalty, practically impossible to drop
-            node_penalty = base_penalty * 20   # Was 10x, now 20x
             breached_count += 1
         elif priority >= 8:
-            # Urgent (SLA 1-2 days) — Very high penalty
-            node_penalty = base_penalty * 10   # Was 5x, now 10x
             urgent_count += 1
-        elif priority >= 7:
-            # Warning (SLA 3 days) — High penalty
-            node_penalty = base_penalty * 5    # Was 3x, now 5x
-        else:
-            # Normal (SLA > 3 days) — Standard penalty
-            node_penalty = base_penalty * 2    # Unchanged
+
+        priority_int = max(1, int(priority))
+        # Examples:
+        #   priority 5  ->  base * (5^2)   = 25x
+        #   priority 12 ->  base * (12^2)  = 144x
+        #   priority 25 ->  base * (25^2)  = 625x
+        node_penalty = base_penalty * (priority_int * priority_int)
         
         # Paired nodes (pickup-drop) get extra penalty to keep pairs together
         if node in paired_nodes:
@@ -781,20 +796,6 @@ def solve_vrp(
     
     # ─── SOLVER SEARCH PARAMETERS ───
     logger.info("Setting up solver parameters...")
-    search_parameters = pywrapcp.DefaultRoutingSearchParameters()
-    
-    # PARALLEL_CHEAPEST_INSERTION: inserts visits into cheapest position.
-    # Combined with high vehicle fixed costs, it fills existing trucks first.
-    search_parameters.first_solution_strategy = (
-        routing_enums_pb2.FirstSolutionStrategy.PARALLEL_CHEAPEST_INSERTION
-    )
-    
-    # GUIDED_LOCAL_SEARCH: escapes local minima by penalizing repeated arcs.
-    # Good at moving visits between vehicles to find better packing.
-    search_parameters.local_search_metaheuristic = (
-        routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH
-    )
-    
     # Dynamic time limit — INCREASED for SLA-prioritized routing
     # More time allows solver to find better solutions that satisfy SLA constraints
     num_nodes = len(locations)
@@ -806,10 +807,6 @@ def solve_vrp(
         time_limit = 40   # Was 25, now 40
     else:
         time_limit = 60   # Was 40, now 60 - critical for SLA optimization
-    
-    search_parameters.time_limit.seconds = time_limit
-    search_parameters.log_search = False
-    
     logger.info(f"🚀 Starting solver: {num_vehicles} vehicles, {len(locations)} locations, "
                 f"max {max_distance_per_vehicle/1000:.0f}km/truck, max {max_waypoints} stops/truck, "
                 f"time limit: {time_limit}s")
@@ -836,15 +833,6 @@ def solve_vrp(
     
     solve_start = time.time()
     try:
-        solution = routing.SolveWithParameters(search_parameters)
-        solve_elapsed = time.time() - solve_start
-        
-        # Restart tracemalloc after solver finishes
-        if was_tracing:
-            tracemalloc.start()
-        
-        # Check solver status
-        status = routing.status()
         status_names = {
             0: "ROUTING_NOT_SOLVED",
             1: "ROUTING_SUCCESS",
@@ -852,16 +840,158 @@ def solve_vrp(
             3: "ROUTING_FAIL_TIMEOUT",
             4: "ROUTING_INVALID"
         }
-        status_name = status_names.get(status, f"UNKNOWN({status})")
-        logger.info(f"✅ Solver completed in {solve_elapsed:.2f}s — status: {status_name}, solution: {solution is not None}")
+
+        # Precompute visit node metadata once (avoid repeated NodeToIndex + priority work per profile).
+        visit_node_meta = []  # (index, priority_squared)
+        max_possible_sla_score = 0
+        for node in range(len(locations)):
+            if node == start_index or node == end_index:
+                continue
+            idx = manager.NodeToIndex(node)
+            if idx == -1:
+                continue
+            node_priority = priorities[node] if node < len(priorities) else 1
+            p2 = max(1, int(node_priority)) ** 2
+            visit_node_meta.append((idx, p2))
+            max_possible_sla_score += p2
+
+        def _assignment_metrics(sol):
+            # Single pass for both metrics -> less overhead per profile.
+            assigned = 0
+            sla_score = 0
+            for idx, p2 in visit_node_meta:
+                if sol.Value(routing.NextVar(idx)) != idx:
+                    assigned += 1
+                    sla_score += p2
+            return assigned, sla_score
+
+        def _count_active_vehicles(sol):
+            active = 0
+            for v in range(num_vehicles):
+                start_i = routing.Start(v)
+                end_i = routing.End(v)
+                if sol.Value(routing.NextVar(start_i)) != end_i:
+                    active += 1
+            return active
+
+        # Multi-profile search:
+        # choose the solution with MAX assigned nodes; tie-breaker = more active vehicles.
+        solve_profiles = [
+            {
+                "name": "primary_packing",
+                "first_solution": routing_enums_pb2.FirstSolutionStrategy.PARALLEL_CHEAPEST_INSERTION,
+                "metaheuristic": routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH,
+                "time_limit": time_limit,
+                "fixed_cost": vehicle_fixed_cost,
+            },
+            {
+                "name": "balanced_expansion",
+                "first_solution": routing_enums_pb2.FirstSolutionStrategy.AUTOMATIC,
+                "metaheuristic": routing_enums_pb2.LocalSearchMetaheuristic.TABU_SEARCH,
+                "time_limit": max(time_limit * 2, 90),
+                "fixed_cost": 0,
+            },
+            {
+                "name": "aggressive_assignment",
+                "first_solution": routing_enums_pb2.FirstSolutionStrategy.LOCAL_CHEAPEST_INSERTION,
+                "metaheuristic": routing_enums_pb2.LocalSearchMetaheuristic.SIMULATED_ANNEALING,
+                "time_limit": max(time_limit * 2, 90),
+                "fixed_cost": 0,
+            },
+        ]
+
+        best_solution = None
+        best_sla_score = -1
+        best_assigned_nodes = -1
+        best_active_vehicles = -1
+        best_status_name = "ROUTING_NOT_SOLVED"
+        best_profile_name = ""
+        total_visit_nodes = max(0, len(locations) - 2)
+
+        for profile in solve_profiles:
+            params = pywrapcp.DefaultRoutingSearchParameters()
+            params.first_solution_strategy = profile["first_solution"]
+            params.local_search_metaheuristic = profile["metaheuristic"]
+            params.time_limit.seconds = profile["time_limit"]
+            params.log_search = False
+
+            routing.SetFixedCostOfAllVehicles(max(0, int(profile["fixed_cost"])))
+            logger.info(
+                f"🧪 Solve profile={profile['name']} "
+                f"time_limit={profile['time_limit']}s fixed_cost={int(profile['fixed_cost'])}"
+            )
+
+            p_start = time.time()
+            candidate = routing.SolveWithParameters(params)
+            p_elapsed = time.time() - p_start
+
+            status = routing.status()
+            status_name = status_names.get(status, f"UNKNOWN({status})")
+
+            if candidate:
+                assigned_nodes, sla_score = _assignment_metrics(candidate)
+                active_vehicles = _count_active_vehicles(candidate)
+            else:
+                sla_score = -1
+                assigned_nodes = -1
+                active_vehicles = -1
+
+            logger.info(
+                f"✅ Profile {profile['name']} completed in {p_elapsed:.2f}s — "
+                f"status: {status_name}, solution: {candidate is not None}, "
+                f"sla_score={max(0, sla_score)}, "
+                f"assigned_nodes={max(0, assigned_nodes)}/{total_visit_nodes}, "
+                f"active_vehicles={max(0, active_vehicles)}/{num_vehicles}"
+            )
+
+            is_better = False
+            if candidate and sla_score > best_sla_score:
+                is_better = True
+            elif candidate and sla_score == best_sla_score and assigned_nodes > best_assigned_nodes:
+                is_better = True
+            elif candidate and sla_score == best_sla_score and assigned_nodes == best_assigned_nodes and active_vehicles > best_active_vehicles:
+                is_better = True
+
+            if is_better:
+                best_solution = candidate
+                best_sla_score = sla_score
+                best_assigned_nodes = assigned_nodes
+                best_active_vehicles = active_vehicles
+                best_status_name = status_name
+                best_profile_name = profile["name"]
+
+            # Safe early stop: no later profile can beat this tuple
+            # (sla_score, assigned_nodes, active_vehicles) lexicographically.
+            if (
+                best_solution is not None and
+                best_sla_score >= max_possible_sla_score and
+                best_assigned_nodes >= total_visit_nodes and
+                best_active_vehicles >= num_vehicles
+            ):
+                logger.info("⏭️ Early stop: achieved best-possible assignment metrics.")
+                break
+
+        solution = best_solution
+        solve_elapsed = time.time() - solve_start
+
+        # Restart tracemalloc after solver finishes
+        if was_tracing:
+            tracemalloc.start()
+
+        logger.info(
+            f"🏁 Solver best profile: {best_profile_name or 'none'} — "
+            f"elapsed={solve_elapsed:.2f}s status={best_status_name} "
+            f"solution={solution is not None}, "
+            f"sla_score={max(0, best_sla_score)}, "
+            f"assigned_nodes={max(0, best_assigned_nodes)}/{total_visit_nodes}, "
+            f"active_vehicles={max(0, best_active_vehicles)}/{num_vehicles}"
+        )
+
         log_memory("Solver DONE", model_snap)
-        
+
         if not solution:
-            logger.error(f"❌ No solution found. Status: {status_name}")
-            if status == 3:
-                logger.error("Solver timed out. Try reducing visits or increasing time limit.")
-            elif status == 2:
-                logger.error("Solver failed - constraints may be infeasible. Check pickup-drop pairs and distance limits.")
+            logger.error(f"❌ No solution found across all profiles. Last best status: {best_status_name}")
+            logger.error("Try increasing max_km, max_stops, shift duration, or trucks.")
     except Exception as e:
         solve_elapsed = time.time() - solve_start
         logger.error(f"❌ Solver crashed after {solve_elapsed:.2f}s: {str(e)}", exc_info=True)
@@ -2037,7 +2167,7 @@ def optimize_routes():
     """
     try:
         # ─── Start memory + time tracking ───
-        if not tracemalloc.is_tracing():
+        if ENABLE_MEMORY_PROFILING and not tracemalloc.is_tracing():
             tracemalloc.start()
         api_start_time = time.time()
         api_snap = log_memory("API START")
@@ -2045,10 +2175,21 @@ def optimize_routes():
         data = request.get_json()
         
         # ─── LOG INPUT ───
-        logger.info("="*80)
+        logger.info("=" * 80)
         logger.info("📥 API REQUEST INPUT:")
-        logger.info(json.dumps(data, indent=2))
-        logger.info("="*80)
+        if VERBOSE_API_LOGS:
+            logger.info(json.dumps(data, indent=2))
+        else:
+            logger.info(
+                "trucks=%s max_km=%s visits=%s max_stops=%s shift_duration_hours=%s truck_capacity=%s",
+                data.get("trucks"),
+                data.get("max_km"),
+                len(data.get("visits", [])) if isinstance(data.get("visits", []), list) else "NA",
+                data.get("max_stops", MAX_WAYPOINTS_PER_ROUTE),
+                data.get("shift_duration_hours", 10),
+                data.get("truck_capacity"),
+            )
+        logger.info("=" * 80)
         
         # Validate input
         if not data:
@@ -2317,37 +2458,89 @@ def optimize_routes():
         
         if mandatory_visit_ids:
             logger.info(f"📋 Total mandatory visits to schedule: {len(mandatory_visit_ids)}")
+
+        # Identify drop visits that have no pickup pair in the current solve set.
+        # These "unpaired drops" should be prioritized above normal pickup/drop visits.
+        def _pair_family_and_role(vtype: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
+            vt = _norm_vtype(vtype)
+            if vt in {"pickup", "pick"}:
+                return "standard", "pickup"
+            if vt in {"drop", "delivery"}:
+                return "standard", "drop"
+            if vt == "return_pickup":
+                return "return", "pickup"
+            if vt == "return_drop":
+                return "return", "drop"
+            if vt == "damaged_pickup":
+                return "damage", "pickup"
+            if vt == "damaged_drop":
+                return "damage", "drop"
+            if vt == "exchanged_pickup":
+                return "exchange", "pickup"
+            if vt == "exchanged_drop":
+                return "exchange", "drop"
+            return None, None
+
+        pair_presence: Dict[str, Dict[str, int]] = {}
+        for oid, vt in zip(original_order_ids, original_visit_types):
+            if not oid:
+                continue
+            family, role = _pair_family_and_role(vt)
+            if not family or not role:
+                continue
+            key = f"{oid}::{family}"
+            pair_presence.setdefault(key, {"pickup": 0, "drop": 0})
+            pair_presence[key][role] += 1
+
+        unpaired_drop_keys = {
+            key for key, counts in pair_presence.items()
+            if counts.get("drop", 0) > 0 and counts.get("pickup", 0) == 0
+        }
+        if unpaired_drop_keys:
+            logger.info(
+                f"📌 Unpaired drop groups detected: {len(unpaired_drop_keys)} "
+                f"(will prioritize above normal pickup/drop)"
+            )
         
-        # STEP 1: Filter visits by priority if dataset is large
-        # This prevents solver from hanging on large datasets
-        # Allow API to override these parameters
-        MAX_VISITS_FOR_ROUTING = data.get("max_visits_for_routing", 80)  # Configurable limit (increased)
+        # STEP 1: Optional pre-filtering by priority.
+        # IMPORTANT: Disabled by default to avoid dropping urgent visits silently.
+        # Enable only when client explicitly sends max_visits_for_routing > 0.
+        MAX_VISITS_FOR_ROUTING = data.get("max_visits_for_routing")
         SLA_THRESHOLD = data.get("sla_threshold", 3)  # Visits with SLA <= 3 days are urgent
         
         filtered_excluded_visits = []
         
-        if len(visits) > MAX_VISITS_FOR_ROUTING:
-            logger.warning(f"⚠️ Large dataset detected ({len(visits)} visits). Filtering by SLA priority...")
-            visits, original_order_ids, original_visit_types, filtered_excluded_visits = \
-                filter_visits_by_priority(
-                    visits, 
-                    original_order_ids, 
-                    original_visit_types,
-                    max_visits=MAX_VISITS_FOR_ROUTING,
-                    sla_threshold=SLA_THRESHOLD
-                )
+        if isinstance(MAX_VISITS_FOR_ROUTING, (int, float)) and MAX_VISITS_FOR_ROUTING > 0 and len(visits) > int(MAX_VISITS_FOR_ROUTING):
+            logger.warning(
+                f"⚠️ max_visits_for_routing={int(MAX_VISITS_FOR_ROUTING)} applied to {len(visits)} visits. "
+                f"Filtering by SLA priority..."
+            )
+            visits, original_order_ids, original_visit_types, filtered_excluded_visits = filter_visits_by_priority(
+                visits,
+                original_order_ids,
+                original_visit_types,
+                max_visits=int(MAX_VISITS_FOR_ROUTING),
+                sla_threshold=SLA_THRESHOLD
+            )
         else:
-            logger.info(f"✅ Dataset size ({len(visits)} visits) is within limits. Processing all visits.")
+            logger.info(
+                f"✅ Priority pre-filter disabled (or not triggered). "
+                f"Processing all {len(visits)} visits."
+            )
         
         # Combine visits at the same location
         logger.info("Combining visits at same locations...")
         combined_visits, visit_groups, combined_order_info, location_to_visits = \
             combine_visits_at_same_location(visits, original_order_ids, original_visit_types)
         
-        # Safety check: If too many unique locations, further reduce by taking highest priority
-        MAX_UNIQUE_LOCATIONS = data.get("max_unique_locations", 40)
-        if len(combined_visits) > MAX_UNIQUE_LOCATIONS:
-            logger.warning(f"⚠️ {len(combined_visits)} unique locations exceed limit of {MAX_UNIQUE_LOCATIONS}. Reducing...")
+        # Optional unique-location cap.
+        # IMPORTANT: Disabled by default. Apply only when max_unique_locations > 0 is sent.
+        MAX_UNIQUE_LOCATIONS = data.get("max_unique_locations")
+        if isinstance(MAX_UNIQUE_LOCATIONS, (int, float)) and MAX_UNIQUE_LOCATIONS > 0 and len(combined_visits) > int(MAX_UNIQUE_LOCATIONS):
+            logger.warning(
+                f"⚠️ max_unique_locations={int(MAX_UNIQUE_LOCATIONS)} applied to "
+                f"{len(combined_visits)} unique locations. Reducing..."
+            )
             
             # Sort by SLA (lowest first = highest priority)
             indexed_visits = list(enumerate(combined_visits))
@@ -2355,7 +2548,7 @@ def optimize_routes():
             
             # Keep only top N locations
             kept_indices = set()
-            for idx, _ in indexed_visits[:MAX_UNIQUE_LOCATIONS]:
+            for idx, _ in indexed_visits[:int(MAX_UNIQUE_LOCATIONS)]:
                 kept_indices.add(idx)
             
             # Filter all aligned lists
@@ -2382,6 +2575,11 @@ def optimize_routes():
             combined_order_info = new_combined_order_info
             
             logger.info(f"✅ Reduced to {len(combined_visits)} unique locations")
+        else:
+            logger.info(
+                f"✅ Unique-location cap disabled (or not triggered). "
+                f"Using all {len(combined_visits)} unique locations."
+            )
         
         # Build locations list: [start, ...combined_visits, end]
         locations = [start_point] + combined_visits + [end_point]
@@ -2398,8 +2596,10 @@ def optimize_routes():
         
         # Create ENHANCED priority list - MUCH stronger SLA prioritization
         # Lower SLA days = exponentially higher priority
+        UNPAIRED_DROP_PRIORITY_FLOOR = int(data.get("unpaired_drop_priority_floor", 12))
         priorities = [5]  # Start point - neutral priority
-        for visit in combined_visits:
+        boosted_unpaired_nodes = 0
+        for idx, visit in enumerate(combined_visits):
             sla_days = visit.get("sla_days", 5)
             
             # ENHANCED priority calculation with stronger differentiation
@@ -2423,6 +2623,24 @@ def optimize_routes():
                 # 6+ days: LOW priority
                 priority = max(1, 6 - sla_days)
             
+            # Boost unpaired drops above normal pickup/drop priorities
+            # while still preserving higher SLA urgencies if already above the floor.
+            is_unpaired_drop_node = False
+            if idx < len(combined_order_info):
+                info = combined_order_info[idx] or {}
+                node_oids = info.get("order_ids", [])
+                node_types = info.get("visit_types", [])
+                for oid, vt in zip(node_oids, node_types):
+                    family, role = _pair_family_and_role(vt)
+                    if oid and family and role == "drop":
+                        if f"{oid}::{family}" in unpaired_drop_keys:
+                            is_unpaired_drop_node = True
+                            break
+
+            if is_unpaired_drop_node and priority < UNPAIRED_DROP_PRIORITY_FLOOR:
+                priority = UNPAIRED_DROP_PRIORITY_FLOOR
+                boosted_unpaired_nodes += 1
+
             priorities.append(priority)
         priorities.append(5)  # End point - neutral priority
         
@@ -2432,6 +2650,11 @@ def optimize_routes():
                     f"URGENT={sum(1 for p in priorities if 10 <= p < 15)}, "
                     f"WARNING={sum(1 for p in priorities if 8 <= p < 10)}, "
                     f"NORMAL={sum(1 for p in priorities if 5 <= p < 8)}")
+        if boosted_unpaired_nodes:
+            logger.info(
+                f"📌 Boosted {boosted_unpaired_nodes} unpaired-drop nodes "
+                f"to priority floor {UNPAIRED_DROP_PRIORITY_FLOOR}"
+            )
         
         # Prepare combined_order_info aligned with locations (add None for start/end)
         aligned_order_info = [None] + combined_order_info + [None]
@@ -2496,7 +2719,7 @@ def optimize_routes():
         )
         
         if result is None:
-            if tracemalloc.is_tracing():
+            if ENABLE_MEMORY_PROFILING and tracemalloc.is_tracing():
                 tracemalloc.stop()
             return jsonify({
                 "error": "Could not find a solution for the given constraints",
@@ -2579,32 +2802,37 @@ def optimize_routes():
         
         # ─── Final memory + timing summary ───
         total_elapsed = time.time() - api_start_time
-        current_mem, peak_mem = tracemalloc.get_traced_memory()
-        tracemalloc.stop()
-        
+        if ENABLE_MEMORY_PROFILING and tracemalloc.is_tracing():
+            current_mem, peak_mem = tracemalloc.get_traced_memory()
+            tracemalloc.stop()
+        else:
+            current_mem, peak_mem = 0, 0
+
         logger.info(f"{'='*60}")
-        logger.info(f"🧠 MEMORY SUMMARY:")
-        logger.info(f"   Peak RAM used:    {peak_mem / (1024*1024):.2f} MB")
-        logger.info(f"   Final RAM used:   {current_mem / (1024*1024):.2f} MB")
+        if ENABLE_MEMORY_PROFILING:
+            logger.info(f"🧠 MEMORY SUMMARY:")
+            logger.info(f"   Peak RAM used:    {peak_mem / (1024*1024):.2f} MB")
+            logger.info(f"   Final RAM used:   {current_mem / (1024*1024):.2f} MB")
         logger.info(f"⏱️  TIMING SUMMARY:")
         logger.info(f"   Total API time:   {total_elapsed:.2f}s")
         logger.info(f"{'='*60}")
         
         # ─── LOG OUTPUT ───
-        logger.info("="*80)
+        logger.info("=" * 80)
         logger.info("📤 API RESPONSE OUTPUT:")
         logger.info(f"Number of routes: {len(result['routes'])}")
         logger.info(f"Number of unassigned visits: {len(result['unassigned_visits'])}")
-        logger.info("Full response:")
-        logger.info(json.dumps(result, indent=2))
-        logger.info("="*80)
+        if VERBOSE_API_LOGS:
+            logger.info("Full response:")
+            logger.info(json.dumps(result, indent=2))
+        logger.info("=" * 80)
         
         return jsonify(result), 200
         
     except Exception as e:
         logger.error(f"Error in optimize_routes: {str(e)}", exc_info=True)
         # Stop tracemalloc if it was started
-        if tracemalloc.is_tracing():
+        if ENABLE_MEMORY_PROFILING and tracemalloc.is_tracing():
             tracemalloc.stop()
         return jsonify({"error": f"Internal server error: {str(e)}"}), 500
 
