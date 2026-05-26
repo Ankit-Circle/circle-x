@@ -6,7 +6,6 @@ import os
 import logging
 
 import requests
-import imagehash
 from PIL import Image
 from flask import Blueprint, jsonify, request, send_file
 from supabase import create_client, Client
@@ -32,6 +31,7 @@ logger = logging.getLogger(__name__)
 def _compute_phash(image_bytes: bytes) -> int | None:
     """Compute perceptual hash from image bytes. Returns signed int64 or None on failure."""
     try:
+        import imagehash  # lazy import — keeps scipy out of worker startup memory
         img = Image.open(BytesIO(image_bytes)).convert("RGB")
         h = imagehash.phash(img, hash_size=8)  # 64-bit hash
         # Convert hex hash to signed int64 (matches PostgreSQL bigint)
