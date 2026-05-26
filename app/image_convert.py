@@ -29,7 +29,7 @@ MAX_DOWNLOAD_BYTES_DNG = 80 * 1024 * 1024  # 80 MB (DNG/RAW files are typically 
 logger = logging.getLogger(__name__)
 
 
-HASH_THREAD_WORKERS = 5  # 5 concurrent: ~5×40MB=200MB peak, safe on 1GB with 3 gunicorn workers
+HASH_THREAD_WORKERS = 20  # 20 concurrent: ~20×10MB=200MB peak, safe given real-world image sizes
 
 
 def _download_and_hash(url: str) -> Tuple[str, int | None]:
