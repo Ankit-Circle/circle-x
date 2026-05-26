@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from io import BytesIO
-from typing import Optional, List, Dict
+from typing import Optional, List, Dict, Tuple
 import os
 import logging
 
@@ -26,6 +27,24 @@ MAX_DOWNLOAD_BYTES = 20 * 1024 * 1024       # 20 MB (default)
 MAX_DOWNLOAD_BYTES_DNG = 80 * 1024 * 1024  # 80 MB (DNG/RAW files are typically 20-80MB)
 
 logger = logging.getLogger(__name__)
+
+
+HASH_THREAD_WORKERS = 5  # 5 concurrent: ~5×40MB=200MB peak, safe on 1GB with 3 gunicorn workers
+
+
+def _download_and_hash(url: str) -> Tuple[str, int | None]:
+    """Download a single image URL and compute its pHash. Returns (url, phash_or_None)."""
+    if not url:
+        return url, None
+    base = url.split("?", 1)[0].lower()
+    ext = base.rsplit(".", 1)[-1] if "." in base else ""
+    max_bytes = MAX_DOWNLOAD_BYTES_DNG if ext == "dng" else MAX_DOWNLOAD_BYTES
+    try:
+        image_bytes, _ = download_image(url, max_bytes=max_bytes)
+    except Exception as exc:
+        print("Download failed for", url, ":", exc)
+        return url, None
+    return url, _compute_phash(image_bytes)
 
 
 def _compute_phash(image_bytes: bytes) -> int | None:
@@ -436,84 +455,68 @@ def convert_batch_route():
     if not isinstance(image_urls, list) or not all(isinstance(u, str) for u in image_urls):
         return jsonify({"converted": {}, "error": "Field 'imageUrls' must be a list of strings"}), 400
 
-    mapping: Dict[str, str] = {}
-    hashes: Dict[str, int] = {}
-
-    for url in image_urls:
-        original_url = url
-        mapping[original_url] = original_url  # default fallback
-
+    def _process_one(url: str) -> Tuple[str, str, int | None]:
+        """Returns (original_url, converted_url, phash_or_None)."""
         if not url:
-            continue
+            return url, url, None
 
-        print("Processing image URL:", url)
-
-        # Detect extension
         base = url.split("?", 1)[0].lower()
         ext = base.rsplit(".", 1)[-1] if "." in base else ""
-
         needs_conversion = ext in {"heic", "heif", "avif", "webp", "dng"}
 
-        # Skip unsupported formats (not jpg/jpeg/png and not convertible)
         if ext not in {"jpg", "jpeg", "png"} and not needs_conversion:
             print("Skipping unsupported format:", url)
-            continue
+            return url, url, None
 
-        # Download image (DNG/RAW files get a higher limit)
-        print("Downloading image:", url)
         try:
-            image_bytes, content_type = download_image(url, max_bytes=MAX_DOWNLOAD_BYTES_DNG if ext == "dng" else MAX_DOWNLOAD_BYTES)
+            image_bytes, _ = download_image(url, max_bytes=MAX_DOWNLOAD_BYTES_DNG if ext == "dng" else MAX_DOWNLOAD_BYTES)
         except Exception as exc:
-            print("Download failed for", url, "error:", exc)
-            continue
+            print("Download failed for", url, ":", exc)
+            return url, url, None
 
-        # Step 1: Try to compute pHash from original bytes
         phash_value = _compute_phash(image_bytes)
 
-        if needs_conversion:
-            # Determine conversion format
-            fmt = "heic" if ext in {"heic", "heif"} else ext
-
-            print("Converting image format:", fmt, "for", url)
-            try:
-                if fmt == "heic":
-                    jpeg_bytes = convert_heic_to_jpeg(image_bytes)
-                elif fmt == "avif":
-                    jpeg_bytes = convert_avif_to_jpeg(image_bytes)
-                elif fmt == "webp":
-                    jpeg_bytes = convert_webp_to_jpeg(image_bytes)
-                else:  # dng
-                    jpeg_bytes = convert_dng_to_jpeg(image_bytes)
-            except (ImageConversionError, Exception) as exc:
-                print("Conversion error for", url, ":", exc)
-                continue
-
-            # Step 2: If pHash failed from original, try from converted JPEG
-            if phash_value is None:
-                phash_value = _compute_phash(jpeg_bytes)
-
-            print("Uploading converted image to Bunny for", url)
-            try:
-                upload_info = upload_to_bunny(
-                    jpeg_bytes,
-                    content_type="image/jpeg",
-                    folder="product-images",
-                    filename="converted-batch.jpg",
-                )
-                converted_url = upload_info.get("public_url") or original_url
-                mapping[original_url] = converted_url
-                print("Conversion complete for", url, "->", converted_url)
-            except Exception as exc:
-                print("Upload failed for", url, ":", exc)
-                continue
-        else:
+        if not needs_conversion:
             print("Skipping conversion for (already JPEG/PNG):", url)
+            return url, url, phash_value
 
-        if phash_value is not None:
-            hashes[original_url] = phash_value
-            print("pHash computed for", url, ":", phash_value)
-        else:
-            print("pHash failed for", url)
+        fmt = "heic" if ext in {"heic", "heif"} else ext
+        try:
+            if fmt == "heic":
+                jpeg_bytes = convert_heic_to_jpeg(image_bytes)
+            elif fmt == "avif":
+                jpeg_bytes = convert_avif_to_jpeg(image_bytes)
+            elif fmt == "webp":
+                jpeg_bytes = convert_webp_to_jpeg(image_bytes)
+            else:
+                jpeg_bytes = convert_dng_to_jpeg(image_bytes)
+        except Exception as exc:
+            print("Conversion error for", url, ":", exc)
+            return url, url, phash_value
+
+        if phash_value is None:
+            phash_value = _compute_phash(jpeg_bytes)
+
+        try:
+            upload_info = upload_to_bunny(jpeg_bytes, content_type="image/jpeg", folder="product-images", filename="converted-batch.jpg")
+            converted_url = upload_info.get("public_url") or url
+            print("Conversion complete for", url, "->", converted_url)
+            return url, converted_url, phash_value
+        except Exception as exc:
+            print("Upload failed for", url, ":", exc)
+            return url, url, phash_value
+
+    mapping: Dict[str, str] = {url: url for url in image_urls if url}
+    hashes: Dict[str, int] = {}
+
+    valid_urls = [u for u in image_urls if u]
+    with ThreadPoolExecutor(max_workers=min(HASH_THREAD_WORKERS, len(valid_urls))) as pool:
+        futures = {pool.submit(_process_one, url): url for url in valid_urls}
+        for future in as_completed(futures):
+            original_url, converted_url, phash_value = future.result()
+            mapping[original_url] = converted_url
+            if phash_value is not None:
+                hashes[original_url] = phash_value
 
     return jsonify({"converted": mapping, "hashes": hashes}), 200
 
@@ -540,30 +543,18 @@ def hash_batch_route():
     if not isinstance(image_urls, list) or not all(isinstance(u, str) for u in image_urls):
         return jsonify({"hashes": {}, "error": "Field 'imageUrls' must be a list of strings"}), 400
 
+    valid_urls = [u for u in image_urls if u]
     hashes: Dict[str, int] = {}
 
-    for url in image_urls:
-        if not url:
-            continue
-
-        base = url.split("?", 1)[0].lower()
-        ext = base.rsplit(".", 1)[-1] if "." in base else ""
-
-        max_bytes = MAX_DOWNLOAD_BYTES_DNG if ext == "dng" else MAX_DOWNLOAD_BYTES
-
-        print("Downloading for hash:", url)
-        try:
-            image_bytes, _ = download_image(url, max_bytes=max_bytes)
-        except Exception as exc:
-            print("Download failed for", url, "error:", exc)
-            continue
-
-        phash_value = _compute_phash(image_bytes)
-        if phash_value is not None:
-            hashes[url] = phash_value
-            print("pHash computed for", url, ":", phash_value)
-        else:
-            print("pHash failed for", url)
+    with ThreadPoolExecutor(max_workers=min(HASH_THREAD_WORKERS, len(valid_urls))) as pool:
+        futures = {pool.submit(_download_and_hash, url): url for url in valid_urls}
+        for future in as_completed(futures):
+            url, phash_value = future.result()
+            if phash_value is not None:
+                hashes[url] = phash_value
+                print("pHash computed for", url, ":", phash_value)
+            else:
+                print("pHash failed for", url)
 
     return jsonify({"hashes": hashes}), 200
 
