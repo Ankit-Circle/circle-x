@@ -163,7 +163,7 @@ def download_image(url: str, max_bytes: int = MAX_DOWNLOAD_BYTES) -> tuple[bytes
         raise ValueError("Invalid image URL")
 
     try:
-        resp = requests.get(url, stream=True, timeout=30)
+        resp = requests.get(url, stream=True, timeout=(10, 30))
         resp.raise_for_status()
     except requests.RequestException as exc:
         raise ValueError(f"Failed to download image: {exc}") from exc
