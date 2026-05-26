@@ -518,6 +518,56 @@ def convert_batch_route():
     return jsonify({"converted": mapping, "hashes": hashes}), 200
 
 
+@image_convert_bp.route("/hash/batch", methods=["POST"])
+def hash_batch_route():
+    """
+    Compute pHash for a batch of image URLs without converting or uploading.
+    Exposed as: POST /api/convert/hash/batch
+
+    Expected JSON body:
+    {
+        "imageUrls": ["https://...", "..."]
+    }
+
+    Response:
+    {
+        "hashes": { "original_url": 1234567890 }
+    }
+    """
+    data = request.get_json(silent=True) or {}
+    image_urls = data.get("imageUrls") or []
+
+    if not isinstance(image_urls, list) or not all(isinstance(u, str) for u in image_urls):
+        return jsonify({"hashes": {}, "error": "Field 'imageUrls' must be a list of strings"}), 400
+
+    hashes: Dict[str, int] = {}
+
+    for url in image_urls:
+        if not url:
+            continue
+
+        base = url.split("?", 1)[0].lower()
+        ext = base.rsplit(".", 1)[-1] if "." in base else ""
+
+        max_bytes = MAX_DOWNLOAD_BYTES_DNG if ext == "dng" else MAX_DOWNLOAD_BYTES
+
+        print("Downloading for hash:", url)
+        try:
+            image_bytes, _ = download_image(url, max_bytes=max_bytes)
+        except Exception as exc:
+            print("Download failed for", url, "error:", exc)
+            continue
+
+        phash_value = _compute_phash(image_bytes)
+        if phash_value is not None:
+            hashes[url] = phash_value
+            print("pHash computed for", url, ":", phash_value)
+        else:
+            print("pHash failed for", url)
+
+    return jsonify({"hashes": hashes}), 200
+
+
 def run_agents(submission_id: str) -> None:
     """Placeholder for downstream agent pipeline trigger."""
     logger.info("Triggering agents for submission %s", submission_id)
