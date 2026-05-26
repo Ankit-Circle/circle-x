@@ -6,6 +6,8 @@ import os
 import logging
 
 import requests
+import imagehash
+from PIL import Image
 from flask import Blueprint, jsonify, request, send_file
 from supabase import create_client, Client
 
@@ -21,9 +23,26 @@ from app.image_enhancement.bunny_upload import upload_to_bunny
 
 image_convert_bp = Blueprint("image_convert", __name__)
 
-MAX_DOWNLOAD_BYTES = 20 * 1024 * 1024  # 20 MB
+MAX_DOWNLOAD_BYTES = 20 * 1024 * 1024       # 20 MB (default)
+MAX_DOWNLOAD_BYTES_DNG = 80 * 1024 * 1024  # 80 MB (DNG/RAW files are typically 20-80MB)
 
 logger = logging.getLogger(__name__)
+
+
+def _compute_phash(image_bytes: bytes) -> int | None:
+    """Compute perceptual hash from image bytes. Returns signed int64 or None on failure."""
+    try:
+        img = Image.open(BytesIO(image_bytes)).convert("RGB")
+        h = imagehash.phash(img, hash_size=8)  # 64-bit hash
+        # Convert hex hash to signed int64 (matches PostgreSQL bigint)
+        n = int(str(h), 16)
+        INT64_MAX = (1 << 63) - 1
+        if n > INT64_MAX:
+            n -= (1 << 64)
+        return n
+    except Exception as exc:
+        print("pHash computation failed:", exc)
+        return None
 
 
 _SUPABASE_CLIENT: Client | None = None
@@ -116,7 +135,7 @@ def _detect_format_from_url_and_mime(url: str, mime: str | None) -> Optional[str
     return None
 
 
-def download_image(url: str) -> tuple[bytes, Optional[str]]:
+def download_image(url: str, max_bytes: int = MAX_DOWNLOAD_BYTES) -> tuple[bytes, Optional[str]]:
     """Download image bytes from URL with basic size limiting.
 
     Returns (bytes, content_type).
@@ -137,8 +156,8 @@ def download_image(url: str) -> tuple[bytes, Optional[str]]:
         if not chunk:
             continue
         total += len(chunk)
-        if total > MAX_DOWNLOAD_BYTES:
-            raise ValueError("Image exceeds maximum allowed size of 20MB")
+        if total > max_bytes:
+            raise ValueError(f"Image exceeds maximum allowed size of {max_bytes // (1024 * 1024)}MB")
         chunks.append(chunk)
 
     if not chunks:
@@ -418,6 +437,7 @@ def convert_batch_route():
         return jsonify({"converted": {}, "error": "Field 'imageUrls' must be a list of strings"}), 400
 
     mapping: Dict[str, str] = {}
+    hashes: Dict[str, int] = {}
 
     for url in image_urls:
         original_url = url
@@ -432,64 +452,70 @@ def convert_batch_route():
         base = url.split("?", 1)[0].lower()
         ext = base.rsplit(".", 1)[-1] if "." in base else ""
 
-        # Skip non-convertible formats
-        if ext in {"jpg", "jpeg", "png"}:
-            print("Skipping conversion for (already JPEG/PNG):", url)
-            continue
-        if ext not in {"heic", "heif", "avif", "webp", "dng"}:
+        needs_conversion = ext in {"heic", "heif", "avif", "webp", "dng"}
+
+        # Skip unsupported formats (not jpg/jpeg/png and not convertible)
+        if ext not in {"jpg", "jpeg", "png"} and not needs_conversion:
             print("Skipping unsupported format:", url)
             continue
 
-        # Download image
+        # Download image (DNG/RAW files get a higher limit)
         print("Downloading image:", url)
         try:
-            image_bytes, content_type = download_image(url)
+            image_bytes, content_type = download_image(url, max_bytes=MAX_DOWNLOAD_BYTES_DNG if ext == "dng" else MAX_DOWNLOAD_BYTES)
         except Exception as exc:
             print("Download failed for", url, "error:", exc)
             continue
 
-        # Determine conversion format
-        if ext in {"heic", "heif"}:
-            fmt = "heic"
+        # Step 1: Try to compute pHash from original bytes
+        phash_value = _compute_phash(image_bytes)
+
+        if needs_conversion:
+            # Determine conversion format
+            fmt = "heic" if ext in {"heic", "heif"} else ext
+
+            print("Converting image format:", fmt, "for", url)
+            try:
+                if fmt == "heic":
+                    jpeg_bytes = convert_heic_to_jpeg(image_bytes)
+                elif fmt == "avif":
+                    jpeg_bytes = convert_avif_to_jpeg(image_bytes)
+                elif fmt == "webp":
+                    jpeg_bytes = convert_webp_to_jpeg(image_bytes)
+                else:  # dng
+                    jpeg_bytes = convert_dng_to_jpeg(image_bytes)
+            except (ImageConversionError, Exception) as exc:
+                print("Conversion error for", url, ":", exc)
+                continue
+
+            # Step 2: If pHash failed from original, try from converted JPEG
+            if phash_value is None:
+                phash_value = _compute_phash(jpeg_bytes)
+
+            print("Uploading converted image to Bunny for", url)
+            try:
+                upload_info = upload_to_bunny(
+                    jpeg_bytes,
+                    content_type="image/jpeg",
+                    folder="product-images",
+                    filename="converted-batch.jpg",
+                )
+                converted_url = upload_info.get("public_url") or original_url
+                mapping[original_url] = converted_url
+                print("Conversion complete for", url, "->", converted_url)
+            except Exception as exc:
+                print("Upload failed for", url, ":", exc)
+                continue
         else:
-            fmt = ext  # avif / webp / dng
+            print("Skipping conversion for (already JPEG/PNG):", url)
 
-        print("Converting image format:", fmt, "for", url)
+        if phash_value is not None:
+            hashes[original_url] = phash_value
+            print("pHash computed for", url, ":", phash_value)
+        else:
+            print("pHash failed for", url)
 
-        try:
-            if fmt == "heic":
-                jpeg_bytes = convert_heic_to_jpeg(image_bytes)
-            elif fmt == "avif":
-                jpeg_bytes = convert_avif_to_jpeg(image_bytes)
-            elif fmt == "webp":
-                jpeg_bytes = convert_webp_to_jpeg(image_bytes)
-            else:  # dng
-                jpeg_bytes = convert_dng_to_jpeg(image_bytes)
-        except ImageConversionError as exc:
-            print("Conversion error for", url, ":", exc)
-            continue
-        except Exception as exc:
-            print("Unexpected conversion error for", url, ":", exc)
-            continue
-
-        print("Uploading converted image to Bunny for", url)
-
-        try:
-            upload_info = upload_to_bunny(
-                jpeg_bytes,
-                content_type="image/jpeg",
-                folder="product-images",
-                filename="converted-batch.jpg",
-            )
-            converted_url = upload_info.get("public_url") or original_url
-            mapping[original_url] = converted_url
-            print("Conversion complete for", url, "->", converted_url)
-        except Exception as exc:
-            print("Upload failed for", url, ":", exc)
-            # keep original URL in mapping
-            continue
-
-    return jsonify({"converted": mapping}), 200
+    return jsonify({"converted": mapping, "hashes": hashes}), 200
 
 
 def run_agents(submission_id: str) -> None:
