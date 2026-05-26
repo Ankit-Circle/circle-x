@@ -33,3 +33,4 @@ hyperframe==6.1.0
 
 # FastAPI image conversion service
 pillow-heif==0.20.0
+imagehash==4.3.1
