@@ -1,4 +1,5 @@
 import os
+import json
 import requests
 import logging
 import time
@@ -10,6 +11,12 @@ from datetime import datetime
 from flask import Blueprint, request, jsonify
 from PIL import Image, ImageEnhance, ImageOps  # ✅ Added ImageOps for EXIF correction
 from io import BytesIO
+import openai
+
+# cloudinary
+import cloudinary
+import cloudinary.uploader
+
 # Load environment variables from .env file
 try:
     from dotenv import load_dotenv
@@ -61,6 +68,16 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 image_enhancement_bp = Blueprint("image_enhancement", __name__)
+
+openai.api_key = os.environ.get("OPENAI_API_KEY")
+
+
+# Configure Cloudinary
+cloudinary.config(
+    cloud_name=os.environ.get("CLOUDINARY_CLOUD_NAME"),
+    api_key=os.environ.get("CLOUDINARY_API_KEY"),
+    api_secret=os.environ.get("CLOUDINARY_API_SECRET")
+)
 
 # Global session for connection pooling
 _global_session = None
@@ -309,6 +326,267 @@ def analyze_image_characteristics(img):
             "fallback": True
         }
 
+def get_ai_suggestions_parallel(image_url, img):
+    """Get AI suggestions for image enhancement factors (optimized version)"""
+    start_time = time.time()
+    
+    # Clean the URL to remove any trailing colons or invalid characters
+    clean_image_url = image_url.rstrip(':').strip()
+    if clean_image_url != image_url:
+        logger.warning(f"URL cleaned from '{image_url}' to '{clean_image_url}' for AI processing")
+        image_url = clean_image_url
+    
+    logger.info(f"Starting AI suggestions for image: {image_url}")
+    
+    # Check if OpenAI API key is available
+    if not os.environ.get("OPENAI_API_KEY"):
+        logger.warning("OPENAI_API_KEY not found, using image analysis for fallback values")
+        # Use the already downloaded image for analysis
+        try:
+            fallback_factors = analyze_image_characteristics(img)
+            logger.info(f"Using analyzed fallback factors (no API key): {fallback_factors}")
+        except Exception as analysis_error:
+            logger.error(f"Failed to analyze image for fallback: {str(analysis_error)}")
+            fallback_factors = {
+                "brightness": 1.05,
+                "contrast": 1.15,
+                "saturation": 1.1,
+                "sharpness": 1.2,
+                "shadow": 1.0,
+                "apply_blur": False,  # Default to false for fallback
+                "fallback": True
+            }
+            logger.info(f"Using default fallback factors (no API key): {fallback_factors}")
+        
+        return fallback_factors
+    
+    try:
+        prompt = """
+Analyze this specific product image and provide optimal enhancement values.
+
+First, assess the image characteristics(this is just reference, you can use it or not):
+1. If the image is dark or underexposed: increase brightness (1.05-1.15) and contrast (1.2-1.3)
+2. If the image is bright or overexposed: decrease brightness (0.9-1.0) and increase contrast (1.1-1.2)
+3. If the image has muted colors: increase saturation (1.1-1.2)
+4. If the image has vibrant colors: keep saturation normal (1.0-1.05)
+5. If the image is blurry: increase sharpness (1.3-1.5)
+6. If the image is sharp: keep sharpness normal (1.1-1.2)
+
+Return only a JSON object with these exact values:
+- brightness: 0.9-1.15
+- contrast: 1.0-1.3
+- saturation: 1.0-1.2
+- sharpness: 1.0-1.5
+- shadow: 1.0
+
+Base your values on the actual image analysis, not generic defaults.
+"""
+        logger.debug("Sending request to OpenAI API...")
+        
+        response = openai.chat.completions.create(
+            model="gpt-4o",
+            messages=[
+                {"role": "system", "content": "You are an expert image enhancement specialist. Your task is to analyze each product image individually and provide specific enhancement values based on the actual image characteristics. Be precise and avoid generic responses. Always base your recommendations on the visual analysis of the provided image."},
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {"type": "image_url", "image_url": {"url": image_url, "detail": "high"}}
+                    ]
+                }
+            ],
+            temperature=0.2
+        )
+        
+        api_time = time.time() - start_time
+        logger.info(f"OpenAI API response received in {api_time:.2f} seconds")
+        
+        content = response.choices[0].message.content.strip()
+        logger.info(f"OpenAI raw response: {content}")
+        
+        clean_content = content.replace("```json", "").replace("```", "").strip()
+        logger.info(f"Cleaned content: {clean_content}")
+        factors = json.loads(clean_content)
+        
+        result_factors = {
+            "brightness": factors.get("brightness", 1.0),
+            "contrast": factors.get("contrast", 1.0),
+            "saturation": factors.get("saturation", 1.0),
+            "sharpness": factors.get("sharpness", 1.0),
+            "shadow": factors.get("shadow", 1.0)
+        }
+        
+        # Check if AI response seems generic (common default values)
+        generic_responses = [
+            {"brightness": 1.05, "contrast": 1.2, "saturation": 1.1, "sharpness": 1.3, "shadow": 1.0},
+            {"brightness": 1.05, "contrast": 1.15, "saturation": 1.1, "sharpness": 1.2, "shadow": 1.0},
+            {"brightness": 1.0, "contrast": 1.1, "saturation": 1.0, "sharpness": 1.1, "shadow": 1.0}
+        ]
+        
+        is_generic = any(
+            all(abs(result_factors.get(key, 0) - generic.get(key, 0)) < 0.01 for key in ["brightness", "contrast", "saturation", "sharpness", "shadow"])
+            for generic in generic_responses
+        )
+        
+        if is_generic:
+            logger.warning("AI response appears to be generic, using image analysis fallback")
+            try:
+                # Clean the URL to remove any trailing colons or invalid characters
+                clean_image_url = image_url.rstrip(':').strip()
+                if clean_image_url != image_url:
+                    logger.warning(f"URL cleaned from '{image_url}' to '{clean_image_url}' for fallback analysis")
+                    image_url = clean_image_url
+                
+                img_resp = requests.get(image_url, timeout=10)
+                img_resp.raise_for_status()
+                img = Image.open(BytesIO(img_resp.content))
+                img = ImageOps.exif_transpose(img).convert("RGB")
+                analyzed_factors = analyze_image_characteristics(img)
+                logger.info(f"Using analyzed factors instead of generic AI response: {analyzed_factors}")
+                return analyzed_factors
+            except Exception as analysis_error:
+                logger.error(f"Failed to analyze image for fallback: {str(analysis_error)}")
+                logger.info(f"Keeping AI response despite being generic: {result_factors}")
+        
+        total_time = time.time() - start_time
+        logger.info(f"AI suggestions completed in {total_time:.2f} seconds")
+        logger.info(f"AI suggested factors: {result_factors}")
+        
+        return result_factors
+        
+    except json.JSONDecodeError as e:
+        total_time = time.time() - start_time
+        error_msg = f"JSON decode error in AI response after {total_time:.2f} seconds: {str(e)}"
+        logger.error(error_msg)
+        logger.error(f"Raw response content: {content}")
+        
+        # Try to analyze the image for fallback values
+        try:
+            # Clean the URL to remove any trailing colons or invalid characters
+            clean_image_url = image_url.rstrip(':').strip()
+            if clean_image_url != image_url:
+                logger.warning(f"URL cleaned from '{image_url}' to '{clean_image_url}' for JSON error fallback")
+                image_url = clean_image_url
+            
+            img_resp = requests.get(image_url, timeout=10)
+            img_resp.raise_for_status()
+            img = Image.open(BytesIO(img_resp.content))
+            img = ImageOps.exif_transpose(img).convert("RGB")
+            fallback_factors = analyze_image_characteristics(img)
+            logger.info(f"Using analyzed fallback factors due to JSON error: {fallback_factors}")
+        except Exception as analysis_error:
+            logger.error(f"Failed to analyze image for fallback: {str(analysis_error)}")
+            fallback_factors = {
+                "brightness": 1.05,
+                "contrast": 1.15,
+                "saturation": 1.1,
+                "sharpness": 1.2,
+                "shadow": 1.0,
+                "fallback": True
+            }
+            logger.info(f"Using default fallback factors due to JSON error: {fallback_factors}")
+        
+        return fallback_factors
+        
+    except openai.AuthenticationError as e:
+        total_time = time.time() - start_time
+        error_msg = f"OpenAI authentication error after {total_time:.2f} seconds: {str(e)}"
+        logger.error(error_msg)
+        
+        # Try to analyze the image for fallback values
+        try:
+            # Clean the URL to remove any trailing colons or invalid characters
+            clean_image_url = image_url.rstrip(':').strip()
+            if clean_image_url != image_url:
+                logger.warning(f"URL cleaned from '{image_url}' to '{clean_image_url}' for authentication error fallback")
+                image_url = clean_image_url
+            
+            img_resp = requests.get(image_url, timeout=10)
+            img_resp.raise_for_status()
+            img = Image.open(BytesIO(img_resp.content))
+            img = ImageOps.exif_transpose(img).convert("RGB")
+            fallback_factors = analyze_image_characteristics(img)
+            logger.info(f"Using analyzed fallback factors due to authentication error: {fallback_factors}")
+        except Exception as analysis_error:
+            logger.error(f"Failed to analyze image for fallback: {str(analysis_error)}")
+            fallback_factors = {
+                "brightness": 1.05,
+                "contrast": 1.15,
+                "saturation": 1.1,
+                "sharpness": 1.2,
+                "shadow": 1.0,
+                "fallback": True
+            }
+            logger.info(f"Using default fallback factors due to authentication error: {fallback_factors}")
+        
+        return fallback_factors
+        
+    except openai.RateLimitError as e:
+        total_time = time.time() - start_time
+        error_msg = f"OpenAI rate limit error after {total_time:.2f} seconds: {str(e)}"
+        logger.error(error_msg)
+        
+        # Try to analyze the image for fallback values
+        try:
+            # Clean the URL to remove any trailing colons or invalid characters
+            clean_image_url = image_url.rstrip(':').strip()
+            if clean_image_url != image_url:
+                logger.warning(f"URL cleaned from '{image_url}' to '{clean_image_url}' for rate limit fallback")
+                image_url = clean_image_url
+            
+            img_resp = requests.get(image_url, timeout=10)
+            img_resp.raise_for_status()
+            img = Image.open(BytesIO(img_resp.content))
+            img = ImageOps.exif_transpose(img).convert("RGB")
+            fallback_factors = analyze_image_characteristics(img)
+            logger.info(f"Using analyzed fallback factors due to rate limit: {fallback_factors}")
+        except Exception as analysis_error:
+            logger.error(f"Failed to analyze image for fallback: {str(analysis_error)}")
+            fallback_factors = {
+                "brightness": 1.05,
+                "contrast": 1.15,
+                "saturation": 1.1,
+                "sharpness": 1.2,
+                "shadow": 1.0,
+                "fallback": True
+            }
+            logger.info(f"Using default fallback factors due to rate limit: {fallback_factors}")
+        
+        return fallback_factors
+        
+    except Exception as e:
+        total_time = time.time() - start_time
+        error_msg = f"Unexpected error in AI suggestions after {total_time:.2f} seconds: {str(e)}"
+        logger.error(error_msg)
+        
+        # Try to analyze the image for fallback values
+        try:
+            # Clean the URL to remove any trailing colons or invalid characters
+            clean_image_url = image_url.rstrip(':').strip()
+            if clean_image_url != image_url:
+                logger.warning(f"URL cleaned from '{image_url}' to '{clean_image_url}' for unexpected error fallback")
+                image_url = clean_image_url
+            
+            img_resp = requests.get(image_url, timeout=10)
+            img_resp.raise_for_status()
+            img = Image.open(BytesIO(img_resp.content))
+            img = ImageOps.exif_transpose(img).convert("RGB")
+            fallback_factors = analyze_image_characteristics(img)
+            logger.info(f"Using analyzed fallback factors due to unexpected error: {fallback_factors}")
+        except Exception as analysis_error:
+            logger.error(f"Failed to analyze image for fallback: {str(analysis_error)}")
+            fallback_factors = {
+                "brightness": 1.05,
+                "contrast": 1.15,
+                "saturation": 1.1,
+                "sharpness": 1.2,
+                "shadow": 1.0,
+                "fallback": True
+            }
+            logger.info(f"Using default fallback factors due to unexpected error: {fallback_factors}")
+        
+        return fallback_factors
+
 def validate_image_dimensions(img: Image.Image) -> tuple[bool, str]:
     """Validate if image dimensions are within acceptable limits"""
     try:
@@ -398,13 +676,13 @@ def process_single_image(image_url):
                         gc.collect()
                     img = processed_img  # Use the processed image for further processing
                 
-                # Check memory before analysis
+                # Check memory before AI processing
                 check_memory_usage()
-
-                # Analyze image characteristics to determine enhancement factors
-                factors = analyze_image_characteristics(img)
-
-                # Check memory after analysis
+                
+                # Get AI suggestions
+                factors = get_ai_suggestions_parallel(image_url, img)
+                
+                # Check memory after AI processing
                 check_memory_usage()
                 
                 # Enhance image
@@ -606,12 +884,12 @@ def process_image_parallel(img, image_url, request_id):
             logger.warning(f"[{request_id}] URL cleaned from '{image_url}' to '{clean_image_url}' for parallel processing")
             image_url = clean_image_url
         
-        # Step 1: Analyze image characteristics for enhancement factors
-        logger.info(f"[{request_id}] Analyzing image characteristics...")
+        # Step 1: Get AI suggestions (this can run while we prepare other things)
+        logger.info(f"[{request_id}] Getting AI suggestions in parallel...")
         ai_start = time.time()
-        factors = analyze_image_characteristics(img)
+        factors = get_ai_suggestions_parallel(image_url, img)
         ai_time = time.time() - ai_start
-        logger.info(f"[{request_id}] Image analysis completed in {ai_time:.2f} seconds")
+        logger.info(f"[{request_id}] AI suggestions completed in {ai_time:.2f} seconds")
         
         # Step 2: Enhance image
         logger.info(f"[{request_id}] Enhancing image...")
@@ -1258,8 +1536,8 @@ def enhance():
             
             # Fallback to sequential processing
             try:
-                # Analyze image characteristics for enhancement factors
-                factors = analyze_image_characteristics(img)
+                # Get AI suggestions
+                factors = get_ai_suggestions_parallel(image_url, img)
                 
                 # Enhance image
                 enhanced = enhance_image_pillow(img, factors)
@@ -1297,27 +1575,39 @@ def enhance():
         logger.info(f"[{request_id}] Final image saved in {save_time:.2f} seconds")
         logger.info(f"[{request_id}] Final image size: {final_size:,} bytes ({final_size/1024/1024:.2f} MB)")
 
-        # Step 9: Upload to Bunny
-        logger.info(f"[{request_id}] Step 9: Uploading to Bunny storage...")
+        # Step 9: Upload to Bunny (preferred) or Cloudinary (fallback)
+        logger.info(f"[{request_id}] Step 9: Uploading to storage...")
         upload_start = time.time()
-
+        
         try:
-            bunny_res = upload_to_bunny(
-                buf.getvalue(),
-                content_type="image/jpeg",
-                folder="mediaenrichment/enhanced",
-                filename="enhanced.jpg",
-            )
-            upload_url = bunny_res.get("public_url")
-            if not upload_url:
-                raise Exception("Failed to get Bunny public URL")
-            upload_time = time.time() - upload_start
-            logger.info(f"[{request_id}] Bunny upload completed in {upload_time:.2f} seconds")
-            logger.info(f"[{request_id}] Uploaded URL: {upload_url}")
+            upload_url = None
+            # Prefer Bunny if configured
+            if is_bunny_configured():
+                logger.info(f"[{request_id}] Bunny configured, uploading to Bunny Storage...")
+                bunny_res = upload_to_bunny(
+                    buf.getvalue(),
+                    content_type="image/jpeg",
+                    folder="mediaenrichment/enhanced",
+                    filename="enhanced.jpg",
+                )
+                upload_url = bunny_res.get("public_url")
+                if not upload_url:
+                    raise Exception("Failed to get Bunny public URL")
+                upload_time = time.time() - upload_start
+                logger.info(f"[{request_id}] Bunny upload completed in {upload_time:.2f} seconds")
+                logger.info(f"[{request_id}] Uploaded URL: {upload_url}")
+            else:
+                # Cloudinary fallback disabled; use placeholder if Bunny not configured
+                logger.warning(f"[{request_id}] Bunny not configured; using placeholder URL")
+                upload_url = "https://placehold.co/600x400?text=Image+Not+Found"
+                
         except Exception as e:
             upload_time = time.time() - upload_start
-            logger.error(f"[{request_id}] Bunny upload failed after {upload_time:.2f} seconds: {str(e)}")
+            error_msg = f"Failed to upload to storage: {str(e)}"
+            logger.error(f"[{request_id}] ERROR: {error_msg} after {upload_time:.2f} seconds")
+            # Use a placeholder URL instead of throwing error
             upload_url = "https://placehold.co/600x400?text=Image+Not+Found"
+            logger.info(f"[{request_id}] Using placeholder URL due to upload failure")
 
         # Step 10: Prepare response
         logger.info(f"[{request_id}] Step 10: Preparing response...")
@@ -1520,22 +1810,40 @@ def enhance_batch():
                     "request_id": request_id
                 })
 
-        # Upload results to Bunny
+        # Upload results to Bunny (preferred); Cloudinary disabled per request
         uploaded_results = []
         for result in results:
             if result["success"]:
                 try:
+                    # Save image to buffer
                     buf = BytesIO()
                     result["final_image"].save(buf, format="JPEG", quality=100)
                     buf.seek(0)
-
-                    bunny_res = upload_to_bunny(
-                        buf.getvalue(),
-                        content_type="image/jpeg",
-                        folder="mediaenrichment/enhanced",
-                        filename="enhanced.jpg",
-                    )
-                    upload_url = bunny_res.get("public_url") or "https://placehold.co/600x400?text=Image+Not+Found"
+                    
+                    upload_url = None
+                    if is_bunny_configured():
+                        bunny_res = upload_to_bunny(
+                            buf.getvalue(),
+                            content_type="image/jpeg",
+                            folder="mediaenrichment/enhanced",
+                            filename="enhanced.jpg",
+                        )
+                        upload_url = bunny_res.get("public_url")
+                    # elif all([
+                    #     os.environ.get("CLOUDINARY_CLOUD_NAME"),
+                    #     os.environ.get("CLOUDINARY_API_KEY"),
+                    #     os.environ.get("CLOUDINARY_API_SECRET")
+                    # ]):
+                    #     # Cloudinary upload disabled
+                    #     upload_result = cloudinary.uploader.upload(
+                    #         buf,
+                    #         folder="mediaenrichment/enhanced",
+                    #         resource_type="image",
+                    #         format="jpg"
+                    #     )
+                    #     upload_url = upload_result.get("secure_url")
+                    else:
+                        upload_url = "https://placehold.co/600x400?text=Image+Not+Found"
                     
                     uploaded_results.append({
                         "image_url": result["image_url"],
