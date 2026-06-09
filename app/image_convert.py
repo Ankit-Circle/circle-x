@@ -154,6 +154,22 @@ def _detect_format_from_url_and_mime(url: str, mime: str | None) -> Optional[str
     return None
 
 
+BUNNY_CDN_HOSTS = {"b-cdn.net"}
+
+
+def _bypass_bunny_optimizer(url: str) -> str:
+    """Append ?optimize=false for Bunny CDN URLs so we get raw bytes, not WebP transcodes."""
+    from urllib.parse import urlparse, urlencode, parse_qs, urlunparse
+    parsed = urlparse(url)
+    if not any(parsed.netloc.endswith(host) for host in BUNNY_CDN_HOSTS):
+        return url
+    params = parse_qs(parsed.query, keep_blank_values=True)
+    if "optimize" not in params:
+        new_query = parsed.query + ("&" if parsed.query else "") + "optimize=false"
+        url = urlunparse(parsed._replace(query=new_query))
+    return url
+
+
 def download_image(url: str, max_bytes: int = MAX_DOWNLOAD_BYTES) -> tuple[bytes, Optional[str]]:
     """Download image bytes from URL with basic size limiting.
 
@@ -468,19 +484,28 @@ def convert_batch_route():
             print("Skipping unsupported format:", url)
             return url, url, None
 
+        download_url = _bypass_bunny_optimizer(url) if needs_conversion else url
         try:
-            image_bytes, _ = download_image(url, max_bytes=MAX_DOWNLOAD_BYTES_DNG if ext == "dng" else MAX_DOWNLOAD_BYTES)
+            image_bytes, content_type = download_image(download_url, max_bytes=MAX_DOWNLOAD_BYTES_DNG if ext == "dng" else MAX_DOWNLOAD_BYTES)
         except Exception as exc:
             print("Download failed for", url, ":", exc)
             return url, url, None
 
         phash_value = _compute_phash(image_bytes)
 
-        if not needs_conversion:
-            print("Skipping conversion for (already JPEG/PNG):", url)
+        # Re-detect actual format from Content-Type — CDNs may transcode on the fly
+        # (e.g. Bunny CDN serves .heic URLs as image/webp). Content-Type takes precedence
+        # over the URL extension so we convert what we actually received.
+        actual_fmt = _detect_format_from_url_and_mime(url, content_type)
+        if actual_fmt in {"jpeg", "png"}:
+            print("Skipping conversion for (already JPEG/PNG after CDN transcode):", url)
             return url, url, phash_value
+        if actual_fmt in {"heic", "heif", "avif", "webp", "dng"}:
+            fmt = "heic" if actual_fmt in {"heic", "heif"} else actual_fmt
+        else:
+            # Fall back to URL extension (actual_fmt unknown / not actionable)
+            fmt = "heic" if ext in {"heic", "heif"} else ext
 
-        fmt = "heic" if ext in {"heic", "heif"} else ext
         try:
             if fmt == "heic":
                 jpeg_bytes = convert_heic_to_jpeg(image_bytes)
