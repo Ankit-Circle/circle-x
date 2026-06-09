@@ -156,6 +156,42 @@ def _detect_format_from_url_and_mime(url: str, mime: str | None) -> Optional[str
 
 BUNNY_CDN_HOSTS = {"b-cdn.net"}
 
+# Magic-byte signatures for image formats
+_MAGIC_BYTES: list[tuple[bytes, str]] = [
+    (b"\xff\xd8\xff", "jpeg"),
+    (b"\x89PNG\r\n\x1a\n", "png"),
+    (b"RIFF", "webp"),          # followed by 4-byte size then "WEBP"
+    (b"\x00\x00\x00\x0cftyp", "heic"),  # 12-byte ftyp box (exact size)
+]
+_FTYP_HEIC_BRANDS = {b"heic", b"heis", b"hevc", b"hevs", b"mif1", b"msf1"}
+_FTYP_AVIF_BRANDS = {b"avif", b"avis"}
+
+
+def _sniff_format(image_bytes: bytes) -> str | None:
+    """Detect actual image format from magic bytes, independent of filename/Content-Type."""
+    if len(image_bytes) < 12:
+        return None
+    head = image_bytes[:12]
+
+    if head[:3] == b"\xff\xd8\xff":
+        return "jpeg"
+    if head[:8] == b"\x89PNG\r\n\x1a\n":
+        return "png"
+    # RIFF….WEBP container
+    if head[:4] == b"RIFF" and head[8:12] == b"WEBP":
+        return "webp"
+    # ISO Base Media File Format (HEIC/AVIF share ftyp box structure)
+    if head[4:8] == b"ftyp":
+        brand = head[8:12]
+        if brand in _FTYP_AVIF_BRANDS:
+            return "avif"
+        if brand in _FTYP_HEIC_BRANDS:
+            return "heic"
+        # Some HEIC files use mif1/msf1 brands — treat unknown ftyp as heic
+        # (pillow-heif will reject if truly unreadable)
+        return "heic"
+    return None
+
 
 def _bypass_bunny_optimizer(url: str) -> str:
     """Append ?optimize=false for Bunny CDN URLs so we get raw bytes, not WebP transcodes."""
@@ -484,7 +520,8 @@ def convert_batch_route():
             print("Skipping unsupported format:", url)
             return url, url, None
 
-        download_url = _bypass_bunny_optimizer(url) if needs_conversion else url
+        # Always bypass Bunny optimizer so we get raw bytes (not CDN-transcoded WebP)
+        download_url = _bypass_bunny_optimizer(url)
         try:
             image_bytes, content_type = download_image(download_url, max_bytes=MAX_DOWNLOAD_BYTES_DNG if ext == "dng" else MAX_DOWNLOAD_BYTES)
         except Exception as exc:
@@ -493,18 +530,24 @@ def convert_batch_route():
 
         phash_value = _compute_phash(image_bytes)
 
-        # Re-detect actual format from Content-Type — CDNs may transcode on the fly
-        # (e.g. Bunny CDN serves .heic URLs as image/webp). Content-Type takes precedence
-        # over the URL extension so we convert what we actually received.
-        actual_fmt = _detect_format_from_url_and_mime(url, content_type)
-        if actual_fmt in {"jpeg", "png"}:
-            print("Skipping conversion for (already JPEG/PNG after CDN transcode):", url)
+        # Magic-byte sniff is the ground truth — catches files misnamed as .jpg but actually AVIF/HEIC/WebP
+        magic_fmt = _sniff_format(image_bytes)
+        if magic_fmt in {"jpeg", "png"}:
+            print("Skipping conversion for (valid JPEG/PNG by magic bytes):", url)
             return url, url, phash_value
-        if actual_fmt in {"heic", "heif", "avif", "webp", "dng"}:
-            fmt = "heic" if actual_fmt in {"heic", "heif"} else actual_fmt
+        if magic_fmt in {"heic", "avif", "webp"}:
+            fmt = magic_fmt
+            print(f"Magic-byte override: URL ext=.{ext} but actual format={magic_fmt} for {url}")
         else:
-            # Fall back to URL extension (actual_fmt unknown / not actionable)
-            fmt = "heic" if ext in {"heic", "heif"} else ext
+            # Fall back: Content-Type, then URL extension
+            actual_fmt = _detect_format_from_url_and_mime(url, content_type)
+            if actual_fmt in {"jpeg", "png"}:
+                print("Skipping conversion for (already JPEG/PNG by Content-Type):", url)
+                return url, url, phash_value
+            if actual_fmt in {"heic", "heif", "avif", "webp", "dng"}:
+                fmt = "heic" if actual_fmt in {"heic", "heif"} else actual_fmt
+            else:
+                fmt = "heic" if ext in {"heic", "heif"} else ext
 
         try:
             if fmt == "heic":
