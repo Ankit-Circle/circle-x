@@ -23,6 +23,8 @@ The solver maximizes visit coverage (prioritizing SLA-breached visits) while min
 - **Time Windows** — Optional per-visit earliest/latest arrival constraints
 - **Shift Duration Limits** — Max hours per driver shift
 - **Service Time Modeling** — Configurable minutes per stop (scales for combined locations)
+- **Volume Capacity Enforcement** — Optional `truck_capacity` with running load checks
+- **Warehouse Reload (Multi-Trip)** — Optional mid-route reload stops at warehouse
 - **Smart Location Combining** — Multiple visits at the same coordinates = 1 solver node
 - **Vehicle Cost Optimization** — Fills trucks before using new ones (fixed cost per vehicle)
 - **Memory & Timing Telemetry** — RAM usage and execution time logged per request
@@ -42,6 +44,13 @@ The solver maximizes visit coverage (prioritizing SLA-breached visits) while min
   "trucks": 3,
   "max_km": 120,
   "max_stops": 25,
+  "truck_capacity": 50,
+  "enable_warehouse_reload": false,
+  "max_reloads_per_truck": 2,
+  "warehouse": { "lat": 12.97, "lng": 77.59 },
+  "reload_service_time_minutes": 10,
+  "pickup_dropoff_same_day": true,
+  "vehicle_type": "truck",
   "shift_duration_hours": 10,
   "service_time_minutes": 10,
   "start": { "lat": 12.97, "lng": 77.59 },
@@ -85,11 +94,20 @@ The solver maximizes visit coverage (prioritizing SLA-breached visits) while min
 | `end` | object | **Yes** | — | End location `{ "lat", "lng" }` |
 | `visits` | array | **Yes** | — | List of visit objects |
 | `max_stops` | integer | No | `25` | Maximum stops per truck (individual visits, not combined nodes) |
+| `truck_capacity` | number | No | — | Max volume units a truck can carry at a time |
+| `enable_warehouse_reload` | boolean | No | `false` | Enables warehouse reload behavior |
+| `max_reloads_per_truck` | integer | No | `2` (when enabled) | Max warehouse reloads allowed per truck |
+| `warehouse` | object | No | `start` | Warehouse location `{ "lat", "lng" }` |
+| `reload_service_time_minutes` | number | No | `10` | Service time added at each reload stop |
+| `pickup_dropoff_same_day` | boolean | No | `true` | If false, standard drops are deferred to unassigned |
+| `vehicle_type` | string | No | — | If `bike`, output IDs are renamed to `rider_1`, `rider_2`, ... |
 | `shift_duration_hours` | number | No | `10` | Maximum hours per driver shift |
 | `service_time_minutes` | number | No | `10` | Minutes spent at each stop (scales for combined locations) |
-| `max_visits_for_routing` | integer | No | `80` | Auto-filter threshold; larger datasets are trimmed by SLA priority |
-| `max_unique_locations` | integer | No | `40` | Max unique locations passed to solver after combining |
+| `max_visits_for_routing` | integer | No | disabled | Optional pre-filter cap; applied only when explicitly provided > 0 |
+| `max_unique_locations` | integer | No | disabled | Optional unique-location cap; applied only when explicitly provided > 0 |
 | `sla_threshold` | integer | No | `3` | SLA cutoff for priority filtering |
+| `unpaired_drop_priority_floor` | integer | No | `12` | Minimum solver priority for unpaired drops |
+| `independent_standard_drop_priority` | integer | No | `40` | Priority override for independent standard drops |
 
 ### Visit Object
 
@@ -100,7 +118,8 @@ The solver maximizes visit coverage (prioritizing SLA-breached visits) while min
 | `lng` | number | **Yes** | Longitude |
 | `sla_days` | integer | **Yes** | Days until SLA breach (≤0 = already breached) |
 | `order_id` | string | No | Order ID — links pickup-drop pairs |
-| `visit_type` | string | No | `"pickup"`, `"drop"`, `"delivery"`, or `null` |
+| `visit_type` | string | No | `pickup`, `drop`, `delivery`, `returned_from`, `returned_to`, `return_pickup`, `return_drop`, `damaged_pickup`, `damaged_drop`, `exchanged_pickup`, `exchanged_drop`, or `null` |
+| `vol_capacity` | number | No | Volume units this visit adds/removes from running truck load |
 | `time_window_start` | number | No | Earliest arrival in **minutes** from shift start |
 | `time_window_end` | number | No | Latest arrival in **minutes** from shift start |
 
@@ -129,11 +148,26 @@ The solver maximizes visit coverage (prioritizing SLA-breached visits) while min
           "sequence": 2,
           "order_id": "ORD123",
           "visit_type": "drop"
+        },
+        {
+          "visitId": "WAREHOUSE_RELOAD_TRUCK_1_1",
+          "lat": 12.97,
+          "lng": 77.59,
+          "sequence": 3,
+          "visit_type": "warehouse_reload",
+          "is_warehouse_reload": true
         }
       ],
       "estimated_km": 38.4,
       "estimated_hours": 2.15,
-      "waypoint_count": 2
+      "waypoint_count": 3,
+      "volume_utilization": {
+        "max_load": 32.0,
+        "truck_capacity": 50.0,
+        "utilization_pct": 64.0,
+        "initial_preloaded_vol": 10.0,
+        "reloads_used": 1
+      }
     }
   ],
   "unassigned_visits": [
@@ -154,6 +188,16 @@ The solver maximizes visit coverage (prioritizing SLA-breached visits) while min
 | `estimated_km` | number | Estimated route distance in km |
 | `estimated_hours` | number | Estimated route duration in hours (travel + service time) |
 | `waypoint_count` | integer | Number of individual visits on this route |
+| `volume_utilization` | object | Optional. Present when `truck_capacity` is used |
+
+### Warehouse Reload Stop Fields
+
+When reload is used, stops may include:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `visit_type` | string | `warehouse_reload` |
+| `is_warehouse_reload` | boolean | Always `true` for reload stops |
 
 ### Unassigned Visit Reasons
 
@@ -166,6 +210,22 @@ The solver maximizes visit coverage (prioritizing SLA-breached visits) while min
 | `filtered_by_location_limit` | Excluded because unique locations exceeded solver limit |
 | `incomplete_pair_no_pickup` | Drop visit whose pickup wasn't routable |
 | `drop_rescheduled_pickup_in_route` | Drop unassigned; its pickup is in a route |
+| `volume_capacity_exceeded` | Removed in volume-capacity post-processing |
+| `cross_truck_violation_unfixable` | Pickup/drop violation could not be repaired |
+| `ordering_violation_exceeds_constraints` | Reordering would violate distance/stop constraints |
+| `ordering_violation_unfixable` | Drop location could not be resolved during repair |
+| `drop_without_pickup_in_final_routes` | Final guard removed a drop without its paired pickup |
+| `pickup_dropoff_same_day_false_drop_deferred` | Standard drop deferred when same-day flag is false |
+| `exchange_rule_forced_unassigned_damaged_drop` | Exchange-rule forced unassignment |
+| `exchange_rule_forced_unassigned_exchanged_drop` | Exchange-rule forced unassignment |
+
+## Backward Compatibility
+
+- Existing clients are backward compatible with no request changes.
+- `enable_warehouse_reload` defaults to `false`, so reload behavior is off by default.
+- `truck_capacity` is optional; if omitted, volume-capacity logic is skipped.
+- Old payloads continue to work as before.
+- Clients with strict enum parsing should allow optional new stop type `warehouse_reload` when reload is enabled.
 
 ### Validation Errors
 
