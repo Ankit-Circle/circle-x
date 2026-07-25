@@ -319,7 +319,8 @@ def solve_vrp(
     time_windows: Optional[List[Optional[Tuple[int, int]]]] = None,
     service_times: Optional[List[int]] = None,
     max_route_time: int = 36000,
-    mandatory_visit_ids: Optional[set] = None
+    mandatory_visit_ids: Optional[set] = None,
+    truck_capacity: Optional[float] = None,
 ) -> Dict:
     """
     Hybrid VRP Solver: CVRP + VRPPD + VRPTW
@@ -476,6 +477,93 @@ def solve_vrp(
         waypoint_dimension_name
     )
     waypoint_dimension = routing.GetDimensionOrDie(waypoint_dimension_name)
+
+    # ─── CAPACITY DIMENSION (solver-native) ───
+    # Tracks running load using signed demand and enables native feasibility checks.
+    # Reload nodes are forced to load=0 using capacity cumul constraints.
+    capacity_dimension = None
+    if truck_capacity is not None and float(truck_capacity) > 0:
+        capacity_units = max(1, int(round(float(truck_capacity))))
+
+        vol_map: Dict[str, int] = {}
+        vtype_map: Dict[str, str] = {}
+        if original_visits:
+            for v in original_visits:
+                vid = v.get("visitId")
+                if not vid:
+                    continue
+                vol_map[vid] = int(round(float(v.get("vol_capacity") or 0)))
+                vtype_map[vid] = (v.get("visit_type") or "").strip().lower().replace(" ", "_")
+
+        pickup_types = {
+            "pickup", "pick",
+            "damaged_pickup", "return_pickup", "exchanged_pickup",
+        }
+        drop_types = {
+            "drop", "delivery",
+            "damaged_drop", "return_drop", "exchanged_drop",
+        }
+
+        node_demand = [0] * len(locations)
+        for node in range(len(locations)):
+            if node == start_index or node == end_index:
+                continue
+
+            loc = locations[node] if node < len(locations) else {}
+            if loc.get("node_type") == "warehouse_reload":
+                # Reload reset is modeled via CumulVar==0 at these nodes.
+                node_demand[node] = 0
+                continue
+
+            demand = 0
+            if visit_groups and node < len(visit_groups) and visit_groups[node]:
+                for vid in visit_groups[node]:
+                    vol = vol_map.get(vid, 0)
+                    vt = vtype_map.get(vid, "")
+                    if vt in pickup_types:
+                        demand += max(0, vol)
+                    elif vt in drop_types:
+                        # Keep drop demand at 0 in solver to avoid infeasibility for
+                        # pre-loaded/independent deliveries; detailed volume balancing
+                        # remains in post-processing.
+                        demand += 0
+            else:
+                vid = loc.get("visitId")
+                vol = vol_map.get(vid, 0)
+                vt = vtype_map.get(vid, "")
+                if vt in pickup_types:
+                    demand += max(0, vol)
+
+            node_demand[node] = demand
+
+        def capacity_callback(from_index):
+            from_node = manager.IndexToNode(from_index)
+            return node_demand[from_node] if from_node < len(node_demand) else 0
+
+        capacity_callback_index = routing.RegisterUnaryTransitCallback(capacity_callback)
+        routing.AddDimensionWithVehicleCapacity(
+            capacity_callback_index,
+            0,
+            [capacity_units] * num_vehicles,
+            True,
+            "Capacity"
+        )
+        capacity_dimension = routing.GetDimensionOrDie("Capacity")
+
+        # Force load reset at each reload node.
+        reload_nodes = 0
+        for node in range(len(locations)):
+            loc = locations[node] if node < len(locations) else {}
+            if loc.get("node_type") == "warehouse_reload":
+                idx = manager.NodeToIndex(node)
+                if idx != -1:
+                    capacity_dimension.CumulVar(idx).SetValue(0)
+                    reload_nodes += 1
+
+        logger.info(
+            f"📦 Capacity dimension enabled: truck_capacity={capacity_units}, "
+            f"reload_nodes={reload_nodes}"
+        )
     
     # ─── VRPTW: Time Dimension (travel time + service time + time windows) ───
     # Service time per node = (service_time_per_visit × number_of_visits_at_node)
@@ -714,6 +802,13 @@ def solve_vrp(
     for node in range(len(locations)):
         # Skip start and end nodes
         if node == start_index or node == end_index:
+            continue
+
+        # Reload nodes are optional helper stops; keep drop penalty tiny so solver
+        # can use them only when needed.
+        loc = locations[node] if node < len(locations) else {}
+        if loc.get("node_type") == "warehouse_reload":
+            routing.AddDisjunction([manager.NodeToIndex(node)], 1)
             continue
         
         priority = priorities[node] if node < len(priorities) else 5
@@ -1148,6 +1243,24 @@ def extract_solution(
             # Add to stops if it's not start or end
             if node_index != start_index and node_index != end_index:
                 visit_info = locations[node_index]
+
+                if visit_info.get("node_type") == "warehouse_reload":
+                    stops.append({
+                        "visitId": visit_info.get("visitId", f"WAREHOUSE_RELOAD_{vehicle_id + 1}_{sequence}"),
+                        "lat": visit_info["lat"],
+                        "lng": visit_info["lng"],
+                        "sequence": sequence,
+                        "visit_type": "warehouse_reload",
+                        "is_warehouse_reload": True,
+                    })
+                    sequence += 1
+                    assigned_indices.add(node_index)
+                    previous_index = index
+                    index = solution.Value(routing.NextVar(index))
+                    next_node = manager.IndexToNode(index)
+                    if next_node != route_nodes[-1]:
+                        route_nodes.append(next_node)
+                    continue
                 
                 # If we have visit_groups, expand the combined visit to individual visits
                 if visit_groups and node_index < len(visit_groups):
@@ -1277,6 +1390,8 @@ def extract_solution(
     # Find unassigned visits
     for i, location in enumerate(locations):
         if i not in assigned_indices and 'visitId' in location:
+            if location.get("node_type") == "warehouse_reload":
+                continue
             reason = "max_km_exceeded"
             
             # Check if it's due to distance constraint
@@ -1852,7 +1967,18 @@ def enforce_volume_capacity(
     routes: List[Dict],
     unassigned_visits: List[Dict],
     original_visits: List[Dict],
-    truck_capacity: float
+    truck_capacity: float,
+    distance_matrix: Optional[List[List[int]]] = None,
+    duration_matrix: Optional[List[List[int]]] = None,
+    locations: Optional[List[Dict]] = None,
+    start_index: Optional[int] = None,
+    end_index: Optional[int] = None,
+    max_distance_per_vehicle: Optional[int] = None,
+    max_route_time: Optional[int] = None,
+    enable_warehouse_reload: bool = False,
+    warehouse_location: Optional[Dict] = None,
+    max_reloads_per_truck: int = 0,
+    reload_service_time_seconds: int = 0,
 ) -> Tuple[List[Dict], List[Dict]]:
     """
     Post-process routes to enforce per-truck volume capacity constraints.
@@ -1930,6 +2056,119 @@ def enforce_volume_capacity(
         return None
 
     # ── Per-route helpers ─────────────────────────────────────────────────────
+    location_index = {}
+    if locations:
+        for i, loc in enumerate(locations):
+            key = (round(float(loc["lat"]), 6), round(float(loc["lng"]), 6))
+            location_index[key] = i
+
+    def _find_node_index(lat: float, lng: float) -> Optional[int]:
+        if not locations:
+            return None
+        key = (round(float(lat), 6), round(float(lng), 6))
+        if key in location_index:
+            return location_index[key]
+        # Fuzzy match for minor lat/lng precision differences.
+        best_idx = None
+        best_dist = float("inf")
+        for (k_lat, k_lng), idx in location_index.items():
+            d = abs(k_lat - lat) + abs(k_lng - lng)
+            if d < 0.001 and d < best_dist:
+                best_dist = d
+                best_idx = idx
+        return best_idx
+
+    warehouse_lat = None
+    warehouse_lng = None
+    warehouse_node_idx = None
+    if warehouse_location and isinstance(warehouse_location, dict):
+        warehouse_lat = float(warehouse_location.get("lat"))
+        warehouse_lng = float(warehouse_location.get("lng"))
+        warehouse_node_idx = _find_node_index(warehouse_lat, warehouse_lng)
+
+    if warehouse_node_idx is None and locations and start_index is not None:
+        warehouse_lat = float(locations[start_index]["lat"])
+        warehouse_lng = float(locations[start_index]["lng"])
+        warehouse_node_idx = start_index
+
+    def _route_nodes_from_stops(stops: List[Dict]) -> Tuple[List[int], List[float]]:
+        """Build ordered unique waypoint nodes and their sequence labels."""
+        ordered = sorted(stops, key=lambda s: s["sequence"])
+        nodes = []
+        seq_labels = []
+        seen = set()
+        for stop in ordered:
+            seq = stop["sequence"]
+            if seq in seen:
+                continue
+            seen.add(seq)
+            n = _find_node_index(float(stop["lat"]), float(stop["lng"]))
+            if n is not None:
+                nodes.append(n)
+                seq_labels.append(seq)
+        return nodes, seq_labels
+
+    def _calc_route_distance_duration(nodes: List[int]) -> Tuple[int, int]:
+        if (
+            not distance_matrix
+            or not duration_matrix
+            or start_index is None
+            or end_index is None
+        ):
+            return 0, 0
+        total_dist = 0
+        total_dur = 0
+        prev = start_index
+        for n in nodes:
+            total_dist += distance_matrix[prev][n]
+            total_dur += duration_matrix[prev][n]
+            prev = n
+        total_dist += distance_matrix[prev][end_index]
+        total_dur += duration_matrix[prev][end_index]
+        return total_dist, total_dur
+
+    def _is_reload_stop(stop: Dict) -> bool:
+        return (
+            (stop.get("visit_type") == "warehouse_reload")
+            or bool(stop.get("is_warehouse_reload"))
+            or str(stop.get("visitId", "")).startswith("WAREHOUSE_RELOAD_")
+        )
+
+    def _can_insert_reload(route: Dict, stops: List[Dict], before_seq: float) -> bool:
+        """Check distance/time feasibility after inserting a warehouse stop."""
+        if (
+            warehouse_node_idx is None
+            or not distance_matrix
+            or not duration_matrix
+            or start_index is None
+            or end_index is None
+        ):
+            return False
+
+        nodes, seq_labels = _route_nodes_from_stops(stops)
+        if not nodes:
+            return False
+
+        insert_pos = None
+        for idx, seq in enumerate(seq_labels):
+            if seq == before_seq:
+                insert_pos = idx
+                break
+        if insert_pos is None:
+            return False
+
+        new_nodes = list(nodes)
+        new_nodes.insert(insert_pos, warehouse_node_idx)
+        new_dist, new_dur = _calc_route_distance_duration(new_nodes)
+        new_dur += max(0, int(reload_service_time_seconds))
+
+        if max_distance_per_vehicle is not None and new_dist > max_distance_per_vehicle:
+            return False
+        if max_route_time is not None and new_dur > max_route_time:
+            return False
+
+        return True
+
     def build_route_info(
         stops: List[Dict],
     ) -> Tuple[float, set, Dict[str, str]]:
@@ -1987,6 +2226,13 @@ def enforce_volume_capacity(
         max_load = load
         first_violation = -1
         for i, stop in enumerate(stops):
+            if _is_reload_stop(stop):
+                # Warehouse reload resets carrying load before continuing route.
+                load = 0
+                if load > max_load:
+                    max_load = load
+                continue
+
             vtype = stop.get("visit_type") or ""
             vol = vol_map.get(stop.get("visitId", ""), 0)
             if _is_pickup(vtype):
@@ -2004,6 +2250,7 @@ def enforce_volume_capacity(
 
     for route in routes:
         stops = sorted(route["stops"], key=lambda s: s["sequence"])
+        reloads_used = 0
 
         if not stops:
             updated_routes.append(route)
@@ -2030,8 +2277,43 @@ def enforce_volume_capacity(
             # A candidate can reduce the load at or before the violation point:
             #   • Pre-loaded drops        → reduce starting load
             #   • Pickups at/before viol  → reduce load from that point onward
+
+            # First try warehouse reload insertion before the violating stop sequence.
+            if (
+                enable_warehouse_reload
+                and reloads_used < max(0, int(max_reloads_per_truck))
+                and warehouse_node_idx is not None
+                and 0 <= eff_viol_idx < len(stops)
+            ):
+                violating_stop = stops[eff_viol_idx]
+                violating_seq = violating_stop["sequence"]
+                violating_vol = vol_map.get(violating_stop.get("visitId", ""), 0)
+
+                # If a single pickup itself exceeds capacity, reload cannot help.
+                if violating_vol <= truck_capacity and _can_insert_reload(route, stops, violating_seq):
+                    reload_id = f"WAREHOUSE_RELOAD_{route.get('truckId', 'TRUCK')}_{reloads_used + 1}"
+                    reload_stop = {
+                        "visitId": reload_id,
+                        "lat": warehouse_lat,
+                        "lng": warehouse_lng,
+                        "sequence": violating_seq - 0.1,
+                        "visit_type": "warehouse_reload",
+                        "is_warehouse_reload": True,
+                    }
+                    stops.append(reload_stop)
+                    stops.sort(key=lambda s: s["sequence"])
+                    changed = True
+                    reloads_used += 1
+                    logger.info(
+                        f"🔁 {route['truckId']}: inserted warehouse reload before seq={violating_seq} "
+                        f"(reload {reloads_used}/{max(0, int(max_reloads_per_truck))})"
+                    )
+                    continue
+
             candidates = []
             for i, stop in enumerate(stops):
+                if _is_reload_stop(stop):
+                    continue
                 vid = stop.get("visitId", "")
                 vtype = stop.get("visit_type") or ""
                 is_pre = vid in preloaded_vids
@@ -2091,6 +2373,13 @@ def enforce_volume_capacity(
             route["waypoint_count"] = len(set(s["sequence"] for s in stops))
             route["total_visits"] = len(stops)
 
+            # Recompute route travel stats after reload insertion/removals.
+            if distance_matrix and duration_matrix and start_index is not None and end_index is not None:
+                nodes, _ = _route_nodes_from_stops(stops)
+                dist, dur = _calc_route_distance_duration(nodes)
+                route["estimated_km"] = round(dist / 1000, 2)
+                route["estimated_hours"] = round(dur / 3600, 2)
+
         # Annotate route with final volume utilisation info
         if stops:
             preloaded_vol, _, _ = build_route_info(stops)
@@ -2101,11 +2390,12 @@ def enforce_volume_capacity(
                 "truck_capacity": truck_capacity,
                 "utilization_pct": util_pct,
                 "initial_preloaded_vol": round(preloaded_vol, 2),
+                "reloads_used": reloads_used,
             }
             logger.info(
                 f"📦 {route['truckId']}: vol OK — "
                 f"max={max_load:.1f}/{truck_capacity:.1f} ({util_pct:.0f}%), "
-                f"preloaded={preloaded_vol:.1f}"
+                f"preloaded={preloaded_vol:.1f}, reloads={reloads_used}"
             )
 
         if stops:
@@ -2128,6 +2418,10 @@ def optimize_routes():
         "max_km": 120,
         "max_stops": 25,               // Optional, default 25 — max stops per truck
         "truck_capacity": 50,          // Optional — max volume units a truck can carry at any moment
+        "enable_warehouse_reload": true, // Optional, default false
+        "max_reloads_per_truck": 2,      // Optional, default 2 when reload is enabled
+        "warehouse": { "lat": 12.97, "lng": 77.59 }, // Optional; defaults to start
+        "reload_service_time_minutes": 10, // Optional, default 10
         "shift_duration_hours": 10,     // Optional, default 10 — max hours per driver shift
         "service_time_minutes": 10,     // Optional, default 10 — minutes spent at each stop
         "start": { "lat": 12.97, "lng": 77.59 },
@@ -2232,9 +2526,13 @@ def optimize_routes():
         shift_duration_hours = data.get("shift_duration_hours", 10)  # Default 10h shift
         service_time_minutes = data.get("service_time_minutes", 10)  # Default 10min per stop
         truck_capacity = data.get("truck_capacity")   # Optional: max volume units per truck
+        enable_warehouse_reload = bool(data.get("enable_warehouse_reload", False))
+        max_reloads_per_truck = int(data.get("max_reloads_per_truck", 2)) if enable_warehouse_reload else 0
+        reload_service_time_minutes = int(data.get("reload_service_time_minutes", 10))
         pickup_dropoff_same_day = bool(data.get("pickup_dropoff_same_day", True))
         start_point = data["start"]
         end_point = data["end"]
+        warehouse_location = data.get("warehouse") if isinstance(data.get("warehouse"), dict) else start_point
         visits = data["visits"]
         
         # Validate data types and values
@@ -2251,6 +2549,14 @@ def optimize_routes():
         for point_name, point in [("start", start_point), ("end", end_point)]:
             if not isinstance(point, dict) or "lat" not in point or "lng" not in point:
                 return jsonify({"error": f"{point_name} must have 'lat' and 'lng' fields"}), 400
+
+        if enable_warehouse_reload:
+            if (
+                not isinstance(warehouse_location, dict)
+                or "lat" not in warehouse_location
+                or "lng" not in warehouse_location
+            ):
+                return jsonify({"error": "warehouse must have 'lat' and 'lng' fields when enable_warehouse_reload=true"}), 400
         
         # Validate visits
         for i, visit in enumerate(visits):
@@ -2260,10 +2566,14 @@ def optimize_routes():
                     return jsonify({"error": f"Visit {i} missing required field: {field}"}), 400
         
         vol_cap_str = f", vol cap {truck_capacity}/truck" if truck_capacity is not None else ""
+        reload_str = (
+            f", warehouse reload ON ({max_reloads_per_truck}/truck, service={reload_service_time_minutes}min)"
+            if enable_warehouse_reload else ""
+        )
         logger.info(f"🚛 Hybrid VRP (CVRP+VRPPD+VRPTW): {num_trucks} trucks, "
                      f"max {max_km}km, max {max_stops} stops/truck, "
                      f"{shift_duration_hours}h shift, {service_time_minutes}min/stop"
-                     f"{vol_cap_str}, {len(visits)} visits")
+                     f"{vol_cap_str}{reload_str}, {len(visits)} visits")
         
         # Extract order_ids and visit_types from original visits
         # Also track mandatory visits that MUST be scheduled
@@ -2668,6 +2978,28 @@ def optimize_routes():
                 f"✅ Unique-location cap disabled (or not triggered). "
                 f"Using all {len(combined_visits)} unique locations."
             )
+
+        # Optional solver-native reload nodes.
+        # These are virtual stops at warehouse location where load can reset.
+        if enable_warehouse_reload and truck_capacity is not None and float(truck_capacity) > 0 and max_reloads_per_truck > 0:
+            wh_lat = float(warehouse_location.get("lat", start_point["lat"]))
+            wh_lng = float(warehouse_location.get("lng", start_point["lng"]))
+            reload_node_count = max(0, int(num_trucks) * int(max_reloads_per_truck))
+            for i in range(reload_node_count):
+                combined_visits.append({
+                    "lat": wh_lat,
+                    "lng": wh_lng,
+                    "visitId": f"WAREHOUSE_RELOAD_NODE_{i + 1}",
+                    "sla_days": 999,
+                    "node_type": "warehouse_reload",
+                })
+                visit_groups.append([])
+                combined_order_info.append({"order_ids": [], "visit_types": []})
+
+            logger.info(
+                f"🔁 Added {reload_node_count} solver-native warehouse reload node(s) "
+                f"at ({wh_lat}, {wh_lng})"
+            )
         
         # Build locations list: [start, ...combined_visits, end]
         locations = [start_point] + combined_visits + [end_point]
@@ -2692,6 +3024,10 @@ def optimize_routes():
         boosted_unpaired_nodes = 0
         boosted_independent_standard_drop_nodes = 0
         for idx, visit in enumerate(combined_visits):
+            if visit.get("node_type") == "warehouse_reload":
+                priorities.append(1)
+                continue
+
             sla_days = visit.get("sla_days", 5)
             
             # ENHANCED priority calculation with stronger differentiation
@@ -2787,6 +3123,9 @@ def optimize_routes():
         aligned_time_windows = [None]  # None for start node
         has_any_time_window = False
         for visit in combined_visits:
+            if visit.get("node_type") == "warehouse_reload":
+                aligned_time_windows.append(None)
+                continue
             tw_start = visit.get("time_window_start")
             tw_end = visit.get("time_window_end")
             if tw_start is not None and tw_end is not None:
@@ -2801,6 +3140,9 @@ def optimize_routes():
         aligned_service_times = [0]  # 0 for start
         svc_seconds = int(service_time_minutes * 60)
         for idx, _ in enumerate(combined_visits):
+            if combined_visits[idx].get("node_type") == "warehouse_reload":
+                aligned_service_times.append(max(0, int(reload_service_time_minutes * 60)))
+                continue
             # visit_groups[idx] contains the list of visit IDs at this combined location
             num_visits_at_node = len(visit_groups[idx]) if idx < len(visit_groups) and visit_groups[idx] else 1
             aligned_service_times.append(svc_seconds * num_visits_at_node)
@@ -2833,7 +3175,8 @@ def optimize_routes():
             time_windows=aligned_time_windows if has_any_time_window else None,
             service_times=aligned_service_times,
             max_route_time=max_route_time,
-            mandatory_visit_ids=mandatory_visit_ids
+            mandatory_visit_ids=mandatory_visit_ids,
+            truck_capacity=truck_capacity,
         )
         
         if result is None:
@@ -2870,6 +3213,17 @@ def optimize_routes():
                 unassigned_visits=result.get('unassigned_visits', []),
                 original_visits=data['visits'],   # full original list — has vol_capacity for every visit
                 truck_capacity=tc,
+                distance_matrix=distance_matrix,
+                duration_matrix=duration_matrix,
+                locations=locations,
+                start_index=start_index,
+                end_index=end_index,
+                max_distance_per_vehicle=max_distance_meters,
+                max_route_time=max_route_time,
+                enable_warehouse_reload=enable_warehouse_reload,
+                warehouse_location=warehouse_location,
+                max_reloads_per_truck=max_reloads_per_truck,
+                reload_service_time_seconds=max(0, reload_service_time_minutes * 60),
             )
             logger.info(f"✅ Volume capacity enforcement complete")
 
