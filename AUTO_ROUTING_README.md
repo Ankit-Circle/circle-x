@@ -109,6 +109,71 @@ The solver maximizes visit coverage (prioritizing SLA-breached visits) while min
 | `unpaired_drop_priority_floor` | integer | No | `12` | Minimum solver priority for unpaired drops |
 | `independent_standard_drop_priority` | integer | No | `40` | Priority override for independent standard drops |
 
+### Optional mixed-fleet `vehicles[]`
+
+When `vehicles` is supplied, it replaces the homogeneous vehicle configuration.
+`trucks`, `max_km`, `start`, and `end` may be omitted; clients that omit
+`vehicles` continue on the existing legacy path unchanged.
+
+```json
+{
+  "vehicles": [
+    {
+      "vehicle_id": "truck_1",
+      "planner_vehicle_class": "large_truck",
+      "start": { "lat": 12.97, "lng": 77.59 },
+      "end": { "lat": 12.93, "lng": 77.62 },
+      "max_km": 120,
+      "max_stops": 25,
+      "truck_capacity": 50,
+      "shift_duration_hours": 10,
+      "service_time_minutes": 10,
+      "max_reloads": 0
+    },
+    {
+      "vehicle_id": "rider_1",
+      "planner_vehicle_class": "bike",
+      "start": { "lat": 12.98, "lng": 77.60 },
+      "end": { "lat": 12.98, "lng": 77.60 },
+      "max_km": 35,
+      "max_stops": 15,
+      "truck_capacity": 10,
+      "shift_duration_hours": 8,
+      "service_time_minutes": 8
+    }
+  ],
+  "visits": []
+}
+```
+
+Each vehicle requires a unique `vehicle_id`, a `planner_vehicle_class`
+(`large_truck`, `medium_truck`, or `bike`), start/end depot coordinates, and
+positive distance, point, and shift limits. Capacity is optional. `id`,
+`vehicle_class`, `max_points`, `capacity`, `shift_limit_hours`, and
+`reload_limit` are accepted aliases for their corresponding fields.
+
+Every unique start/end warehouse is added to the distance matrix. The solver
+uses each vehicle's own depot, KM, point, capacity, shift, and service-time
+limits. Mixed route objects add `vehicle_id`, `planner_vehicle_class`, and
+`effective_constraints`; the established fields (`truckId`, `start`, `end`,
+`stops`, `unassigned_visits`, and `validation_errors`) remain available.
+
+#### Mixed-fleet eligibility and QC
+
+Eligibility is applied after visits at the same location have been combined,
+so co-located work always travels together:
+
+| Largest size at the location | Allowed planner class |
+|---|---|
+| `L`, `XL`, `XXL` | `large_truck` |
+| `M` (with no larger item) | `medium_truck` |
+| `S` only | `bike` |
+
+Use one of `package_size`, `parcel_size`, `size`, or `order_size` on visits.
+All `drop` / `delivery` visits must include `qc_status` (or `qcStatus`) equal
+to `Passed`; otherwise they are returned as unassigned with
+`delivery_qc_not_passed`. Pickup inclusion is unchanged.
+
 ### Visit Object
 
 | Field | Type | Required | Description |

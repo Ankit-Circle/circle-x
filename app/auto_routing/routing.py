@@ -4,6 +4,7 @@ import time
 import tracemalloc
 import json
 import os
+from dataclasses import dataclass
 from flask import Blueprint, request, jsonify
 from ortools.constraint_solver import routing_enums_pb2
 from ortools.constraint_solver import pywrapcp
@@ -23,6 +24,171 @@ auto_routing_bp = Blueprint("auto_routing", __name__)
 
 # Maximum waypoints per route
 MAX_WAYPOINTS_PER_ROUTE = 25
+
+
+@dataclass(frozen=True)
+class VehicleSpec:
+    """Normalized mixed-fleet vehicle configuration used by the solver."""
+    vehicle_id: str
+    planner_vehicle_class: str
+    start: Dict
+    end: Dict
+    max_km: float
+    max_stops: int
+    truck_capacity: Optional[float]
+    shift_duration_hours: float
+    service_time_minutes: float
+    max_reloads: int = 0
+
+
+PLANNER_VEHICLE_CLASSES = {"large_truck", "medium_truck", "bike"}
+SIZE_CLASS_ALIASES = {
+    "s": "S", "small": "S",
+    "m": "M", "medium": "M",
+    "l": "L", "large": "L",
+    "xl": "XL", "xxl": "XXL",
+}
+
+
+def _numeric(value, field: str, *, positive: bool = True, integer: bool = False):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{field} must be a {'positive ' if positive else 'non-negative '}number")
+    if positive and value <= 0:
+        raise ValueError(f"{field} must be a positive number")
+    if not positive and value < 0:
+        raise ValueError(f"{field} must be a non-negative number")
+    if integer and int(value) != value:
+        raise ValueError(f"{field} must be an integer")
+    return int(value) if integer else float(value)
+
+
+def _validate_point(point: Dict, field: str) -> Dict:
+    if not isinstance(point, dict):
+        raise ValueError(f"{field} must have 'lat' and 'lng' fields")
+    try:
+        lat = float(point["lat"])
+        lng = float(point["lng"])
+    except (KeyError, TypeError, ValueError):
+        raise ValueError(f"{field} must have numeric 'lat' and 'lng' fields")
+    if not -90 <= lat <= 90 or not -180 <= lng <= 180:
+        raise ValueError(f"{field} coordinates are out of range")
+    return {"lat": lat, "lng": lng}
+
+
+def normalize_vehicle_specs(data: Dict) -> Optional[List[VehicleSpec]]:
+    """
+    Return normalized mixed-fleet vehicles, or None when the legacy payload is used.
+    Legacy callers intentionally retain the existing request contract and code path.
+    """
+    raw_vehicles = data.get("vehicles")
+    if raw_vehicles is None:
+        return None
+    if not isinstance(raw_vehicles, list) or not raw_vehicles:
+        raise ValueError("vehicles must be a non-empty array when provided")
+
+    defaults = {
+        "max_km": data.get("max_km"),
+        "max_stops": data.get("max_stops", MAX_WAYPOINTS_PER_ROUTE),
+        "truck_capacity": data.get("truck_capacity"),
+        "shift_duration_hours": data.get("shift_duration_hours", 10),
+        "service_time_minutes": data.get("service_time_minutes", 10),
+        "start": data.get("start"),
+        "end": data.get("end"),
+    }
+    normalized = []
+    seen_ids = set()
+    for index, raw in enumerate(raw_vehicles):
+        if not isinstance(raw, dict):
+            raise ValueError(f"vehicles[{index}] must be an object")
+        vehicle_id = raw.get("vehicle_id", raw.get("id"))
+        if not isinstance(vehicle_id, str) or not vehicle_id.strip():
+            raise ValueError(f"vehicles[{index}].vehicle_id is required")
+        vehicle_id = vehicle_id.strip()
+        if vehicle_id in seen_ids:
+            raise ValueError(f"Duplicate vehicle_id: {vehicle_id}")
+        seen_ids.add(vehicle_id)
+
+        vehicle_class = raw.get("planner_vehicle_class", raw.get("vehicle_class"))
+        if not isinstance(vehicle_class, str) or vehicle_class.strip().lower() not in PLANNER_VEHICLE_CLASSES:
+            raise ValueError(
+                f"vehicles[{index}].planner_vehicle_class must be one of "
+                f"{', '.join(sorted(PLANNER_VEHICLE_CLASSES))}"
+            )
+
+        start = _validate_point(raw.get("start", defaults["start"]), f"vehicles[{index}].start")
+        end = _validate_point(raw.get("end", defaults["end"]), f"vehicles[{index}].end")
+        max_km = _numeric(raw.get("max_km", defaults["max_km"]), f"vehicles[{index}].max_km")
+        max_stops = _numeric(
+            raw.get("max_stops", raw.get("max_points", defaults["max_stops"])),
+            f"vehicles[{index}].max_stops",
+            integer=True,
+        )
+        shift_duration_hours = _numeric(
+            raw.get("shift_duration_hours", raw.get("shift_limit_hours", defaults["shift_duration_hours"])),
+            f"vehicles[{index}].shift_duration_hours",
+        )
+        service_time_minutes = _numeric(
+            raw.get("service_time_minutes", defaults["service_time_minutes"]),
+            f"vehicles[{index}].service_time_minutes",
+            positive=False,
+        )
+        capacity = raw.get("truck_capacity", raw.get("capacity", defaults["truck_capacity"]))
+        if capacity is not None:
+            capacity = _numeric(capacity, f"vehicles[{index}].truck_capacity")
+        max_reloads = _numeric(
+            raw.get("max_reloads", raw.get("reload_limit", 0)),
+            f"vehicles[{index}].max_reloads",
+            positive=False,
+            integer=True,
+        )
+        normalized.append(VehicleSpec(
+            vehicle_id=vehicle_id,
+            planner_vehicle_class=vehicle_class.strip().lower(),
+            start=start,
+            end=end,
+            max_km=max_km,
+            max_stops=max_stops,
+            truck_capacity=capacity,
+            shift_duration_hours=shift_duration_hours,
+            service_time_minutes=service_time_minutes,
+            max_reloads=max_reloads,
+        ))
+    return normalized
+
+
+def delivery_passes_qc(visit: Dict) -> bool:
+    """Deliveries require QC Passed; pickup inclusion remains unchanged."""
+    visit_type = (visit.get("visit_type") or "").strip().lower().replace(" ", "_")
+    if visit_type not in {"drop", "delivery"}:
+        return True
+    qc_status = visit.get("qc_status", visit.get("qcStatus"))
+    return isinstance(qc_status, str) and qc_status.strip().lower() == "passed"
+
+
+def allowed_vehicle_classes_for_node(visit_ids: List[str], visits_by_id: Dict[str, Dict]) -> Optional[set]:
+    """Apply the mixed-fleet size matrix to one already-combined location."""
+    sizes = set()
+    for visit_id in visit_ids:
+        visit = visits_by_id.get(visit_id, {})
+        raw_size = (
+            visit.get("package_size")
+            or visit.get("parcel_size")
+            or visit.get("size")
+            or visit.get("order_size")
+        )
+        if isinstance(raw_size, str):
+            normalized = SIZE_CLASS_ALIASES.get(raw_size.strip().lower())
+            if normalized:
+                sizes.add(normalized)
+    if not sizes:
+        return None
+    if sizes.intersection({"L", "XL", "XXL"}):
+        return {"large_truck"}
+    if "M" in sizes:
+        return {"medium_truck"}
+    if "S" in sizes:
+        return {"bike"}
+    return None
 
 
 def log_memory(label: str, snapshot_start=None):
@@ -321,6 +487,8 @@ def solve_vrp(
     max_route_time: int = 36000,
     mandatory_visit_ids: Optional[set] = None,
     truck_capacity: Optional[float] = None,
+    vehicle_specs: Optional[List[VehicleSpec]] = None,
+    allowed_vehicle_indices_by_node: Optional[Dict[int, List[int]]] = None,
 ) -> Dict:
     """
     Hybrid VRP Solver: CVRP + VRPPD + VRPTW
@@ -355,25 +523,32 @@ def solve_vrp(
     solver_snap = log_memory("Solver START")
     solver_start_time = time.time()
     
-    # Create the routing index manager
-    # When start and end are different, we need to use lists
-    if start_index != end_index:
-        # Different start and end points - use list format
-        starts = [start_index] * num_vehicles  # All vehicles start from same point
-        ends = [end_index] * num_vehicles      # All vehicles end at same point
+    mixed_fleet = vehicle_specs is not None
+    if mixed_fleet:
+        starts = [spec.start["_location_index"] for spec in vehicle_specs]
+        ends = [spec.end["_location_index"] for spec in vehicle_specs]
+        depot_indices = set(starts + ends)
         manager = pywrapcp.RoutingIndexManager(
             len(distance_matrix),
             num_vehicles,
             starts,
-            ends
+            ends,
         )
     else:
-        # Same start and end point (depot) - use simple format
-        manager = pywrapcp.RoutingIndexManager(
-            len(distance_matrix),
-            num_vehicles,
-            start_index
-        )
+        depot_indices = {start_index, end_index}
+        if start_index != end_index:
+            manager = pywrapcp.RoutingIndexManager(
+                len(distance_matrix),
+                num_vehicles,
+                [start_index] * num_vehicles,
+                [end_index] * num_vehicles,
+            )
+        else:
+            manager = pywrapcp.RoutingIndexManager(
+                len(distance_matrix),
+                num_vehicles,
+                start_index,
+            )
     
     # Create Routing Model
     routing = pywrapcp.RoutingModel(manager)
@@ -393,12 +568,16 @@ def solve_vrp(
     
     # Add Distance constraint
     dimension_name = 'Distance'
-    routing.AddDimension(
+    distance_limits = (
+        [int(spec.max_km * 1000) for spec in vehicle_specs]
+        if mixed_fleet else [max_distance_per_vehicle] * num_vehicles
+    )
+    routing.AddDimensionWithVehicleCapacity(
         transit_callback_index,
-        0,  # no slack
-        max_distance_per_vehicle,  # vehicle maximum travel distance
-        True,  # start cumul to zero
-        dimension_name
+        0,
+        distance_limits,
+        True,
+        dimension_name,
     )
     distance_dimension = routing.GetDimensionOrDie(dimension_name)
     
@@ -427,7 +606,11 @@ def solve_vrp(
         vehicle_fixed_cost = max(1, int(max_distance_per_vehicle * 1.2))
     else:
         vehicle_fixed_cost = max(1, int(max_distance_per_vehicle * 3))
-    routing.SetFixedCostOfAllVehicles(vehicle_fixed_cost)
+    if mixed_fleet:
+        for vehicle_id, spec in enumerate(vehicle_specs):
+            routing.SetFixedCostOfVehicle(vehicle_fixed_cost, vehicle_id)
+    else:
+        routing.SetFixedCostOfAllVehicles(vehicle_fixed_cost)
     logger.info(
         f"📦 Vehicle fixed cost: {vehicle_fixed_cost} "
         f"(load_ratio={load_ratio:.2f}, avg_stops/truck={avg_stops_per_truck:.1f})"
@@ -442,7 +625,7 @@ def solve_vrp(
     visits_per_node = {}
     if visit_groups:
         for node_idx in range(len(locations)):
-            if node_idx == start_index or node_idx == end_index:
+            if node_idx in depot_indices:
                 visits_per_node[node_idx] = 0
             elif node_idx < len(visit_groups) and visit_groups[node_idx]:
                 visits_per_node[node_idx] = len(visit_groups[node_idx])
@@ -450,7 +633,7 @@ def solve_vrp(
                 visits_per_node[node_idx] = 1
     else:
         for node_idx in range(len(locations)):
-            if node_idx == start_index or node_idx == end_index:
+            if node_idx in depot_indices:
                 visits_per_node[node_idx] = 0
             else:
                 visits_per_node[node_idx] = 1
@@ -461,7 +644,7 @@ def solve_vrp(
         """Returns 1 for each visit node (combined location = 1 stop)."""
         from_node = manager.IndexToNode(from_index)
         # Start/end nodes = 0 stops; every other node = 1 physical stop
-        if from_node == start_index or from_node == end_index:
+        if from_node in depot_indices:
             return 0
         return 1
     
@@ -469,12 +652,16 @@ def solve_vrp(
     
     # Add dimension for waypoint count (counts physical locations, not individual visits)
     waypoint_dimension_name = 'WaypointCount'
-    routing.AddDimension(
+    waypoint_limits = (
+        [spec.max_stops for spec in vehicle_specs]
+        if mixed_fleet else [max_waypoints] * num_vehicles
+    )
+    routing.AddDimensionWithVehicleCapacity(
         count_callback_index,
-        0,  # no slack
-        max_waypoints,  # maximum physical locations (stops) per vehicle
-        True,  # start cumul to zero
-        waypoint_dimension_name
+        0,
+        waypoint_limits,
+        True,
+        waypoint_dimension_name,
     )
     waypoint_dimension = routing.GetDimensionOrDie(waypoint_dimension_name)
 
@@ -482,8 +669,9 @@ def solve_vrp(
     # Tracks running load using signed demand and enables native feasibility checks.
     # Reload nodes are forced to load=0 using capacity cumul constraints.
     capacity_dimension = None
-    if truck_capacity is not None and float(truck_capacity) > 0:
-        capacity_units = max(1, int(round(float(truck_capacity))))
+    has_capacity_limits = mixed_fleet or (truck_capacity is not None and float(truck_capacity) > 0)
+    if has_capacity_limits:
+        capacity_units = max(1, int(round(float(truck_capacity or 1))))
 
         vol_map: Dict[str, int] = {}
         vtype_map: Dict[str, str] = {}
@@ -506,7 +694,7 @@ def solve_vrp(
 
         node_demand = [0] * len(locations)
         for node in range(len(locations)):
-            if node == start_index or node == end_index:
+            if node in depot_indices:
                 continue
 
             loc = locations[node] if node < len(locations) else {}
@@ -544,7 +732,10 @@ def solve_vrp(
         routing.AddDimensionWithVehicleCapacity(
             capacity_callback_index,
             0,
-            [capacity_units] * num_vehicles,
+            [
+                max(1, int(round(spec.truck_capacity))) if spec.truck_capacity is not None else 10**9
+                for spec in vehicle_specs
+            ] if mixed_fleet else [capacity_units] * num_vehicles,
             True,
             "Capacity"
         )
@@ -572,7 +763,7 @@ def solve_vrp(
     if service_times is None:
         service_times = []
         for i in range(len(locations)):
-            if i == start_index or i == end_index:
+            if i in depot_indices:
                 service_times.append(0)
             else:
                 num_visits = visits_per_node.get(i, 1)
@@ -586,24 +777,42 @@ def solve_vrp(
         svc_time = service_times[from_node] if from_node < len(service_times) else 0
         return travel_time + svc_time
     
-    time_callback_index = routing.RegisterTransitCallback(time_callback)
-    
-    # Add Time dimension — constrains total route duration
+    # Add Time dimension — constrains total route duration. Mixed fleets use
+    # per-vehicle callbacks because service duration can differ by vehicle.
     time_dimension_name = 'Time'
-    routing.AddDimension(
-        time_callback_index,
-        30 * 60,       # allow 30 min slack (waiting at time windows)
-        max_route_time,  # maximum route duration per vehicle (seconds)
-        False,         # Don't force start cumul to zero (allows flexible start)
-        time_dimension_name
-    )
+    if mixed_fleet:
+        time_callback_indices = []
+        for spec in vehicle_specs:
+            def vehicle_time_callback(from_index, to_index, service_multiplier=spec.service_time_minutes / 10):
+                from_node = manager.IndexToNode(from_index)
+                to_node = manager.IndexToNode(to_index)
+                travel_time = duration_matrix[from_node][to_node]
+                svc_time = service_times[from_node] if from_node < len(service_times) else 0
+                return travel_time + int(svc_time * service_multiplier)
+            time_callback_indices.append(routing.RegisterTransitCallback(vehicle_time_callback))
+        routing.AddDimensionWithVehicleTransitAndCapacity(
+            time_callback_indices,
+            30 * 60,
+            [int(spec.shift_duration_hours * 3600) for spec in vehicle_specs],
+            False,
+            time_dimension_name,
+        )
+    else:
+        time_callback_index = routing.RegisterTransitCallback(time_callback)
+        routing.AddDimension(
+            time_callback_index,
+            30 * 60,
+            max_route_time,
+            False,
+            time_dimension_name,
+        )
     time_dimension = routing.GetDimensionOrDie(time_dimension_name)
     
     # Apply time windows if provided (VRPTW)
     has_time_windows = False
     if time_windows:
         for node in range(len(locations)):
-            if node == start_index or node == end_index:
+            if node in depot_indices:
                 continue
             
             if node < len(time_windows) and time_windows[node] is not None:
@@ -625,6 +834,14 @@ def solve_vrp(
     logger.info(f"⏱️  Time dimension: max {max_route_time/3600:.1f}h route, "
                 f"{default_service_time/60:.0f}min/stop service time, "
                 f"time windows: {'YES' if has_time_windows else 'NO'}")
+
+    # Restrict each combined customer node only after combination. This preserves
+    # co-located visits as one physical stop while enforcing the fleet matrix.
+    if allowed_vehicle_indices_by_node:
+        for node, allowed in allowed_vehicle_indices_by_node.items():
+            index = manager.NodeToIndex(node)
+            if index != -1:
+                routing.SetAllowedVehiclesForIndex(allowed, index)
     
     # ─── VRPPD: Build pickup-delivery pairs ───
     # OR-Tools REQUIREMENT: Each node can appear in AT MOST ONE AddPickupAndDelivery pair.
@@ -676,7 +893,7 @@ def solve_vrp(
     if combined_order_info:
         # Step 1: Build order_map  — order_id -> {'pickup': node, 'drop': node}
         for node in range(len(locations)):
-            if node == start_index or node == end_index:
+            if node in depot_indices:
                 continue
             
             if node < len(combined_order_info) and combined_order_info[node]:
@@ -801,7 +1018,7 @@ def solve_vrp(
     
     for node in range(len(locations)):
         # Skip start and end nodes
-        if node == start_index or node == end_index:
+        if node in depot_indices:
             continue
 
         # Reload nodes are optional helper stops; keep drop penalty tiny so solver
@@ -863,7 +1080,7 @@ def solve_vrp(
         
         routing.AddDisjunction([manager.NodeToIndex(node)], node_penalty)
     
-    logger.info(f"✅ Added SLA-prioritized + MANDATORY disjunctions for {len(locations) - 2} visit nodes")
+    logger.info(f"✅ Added SLA-prioritized + MANDATORY disjunctions for {len(locations) - len(depot_indices)} visit nodes")
     logger.info(f"   🔒 {mandatory_count} MANDATORY (returned_from/returned_to), "
                 f"🚨 {breached_count} BREACHED (extreme priority), "
                 f"⚠️  {urgent_count} urgent, 📍 {paired_count} in pairs")
@@ -940,7 +1157,7 @@ def solve_vrp(
         visit_node_meta = []  # (index, priority_squared)
         max_possible_sla_score = 0
         for node in range(len(locations)):
-            if node == start_index or node == end_index:
+            if node in depot_indices:
                 continue
             idx = manager.NodeToIndex(node)
             if idx == -1:
@@ -1014,7 +1231,7 @@ def solve_vrp(
         best_active_vehicles = -1
         best_status_name = "ROUTING_NOT_SOLVED"
         best_profile_name = ""
-        total_visit_nodes = max(0, len(locations) - 2)
+        total_visit_nodes = max(0, len(locations) - len(depot_indices))
 
         for profile in solve_profiles:
             elapsed_budget = time.time() - budget_start
@@ -1123,7 +1340,7 @@ def solve_vrp(
         return extract_solution(
             manager, routing, solution, locations, distance_matrix, duration_matrix,
             start_index, end_index, num_vehicles, max_waypoints,
-            combined_order_info, visit_groups, original_visits
+            combined_order_info, visit_groups, original_visits, vehicle_specs
         )
     else:
         logger.error("No solution found!")
@@ -1205,20 +1422,25 @@ def extract_solution(
     max_waypoints: int = MAX_WAYPOINTS_PER_ROUTE,
     combined_order_info: List[Dict] = None,
     visit_groups: List[List[str]] = None,
-    original_visits: List[Dict] = None
+    original_visits: List[Dict] = None,
+    vehicle_specs: Optional[List[VehicleSpec]] = None,
 ) -> Dict:
     """Extract the solution from OR-Tools solver and enforce max waypoints limit"""
     routes = []
     unassigned_visits = []
     
     # Track which visits were assigned
-    assigned_indices = set([start_index, end_index])
+    depot_indices = {
+        idx for vehicle_id in range(num_vehicles)
+        for idx in (manager.IndexToNode(routing.Start(vehicle_id)), manager.IndexToNode(routing.End(vehicle_id)))
+    }
+    assigned_indices = set(depot_indices)
     
     # Build order map for pickup-drop pair validation from combined_order_info
     order_map = {}
     if combined_order_info:
         for node in range(len(locations)):
-            if node == start_index or node == end_index:
+            if node in depot_indices:
                 continue
             if node < len(combined_order_info) and combined_order_info[node]:
                 info = combined_order_info[node]
@@ -1235,13 +1457,15 @@ def extract_solution(
         index = routing.Start(vehicle_id)
         stops = []
         sequence = 1
-        route_nodes = [start_index]  # Track all nodes in order for distance calculation
+        route_start_index = manager.IndexToNode(index)
+        route_end_index = manager.IndexToNode(routing.End(vehicle_id))
+        route_nodes = [route_start_index]  # Track all nodes in order for distance calculation
         
         while not routing.IsEnd(index):
             node_index = manager.IndexToNode(index)
             
             # Add to stops if it's not start or end
-            if node_index != start_index and node_index != end_index:
+            if node_index not in depot_indices:
                 visit_info = locations[node_index]
 
                 if visit_info.get("node_type") == "warehouse_reload":
@@ -1370,26 +1594,42 @@ def extract_solution(
             estimated_km = round(estimated_road_distance_meters / 1000, 2)
             estimated_hours = round(estimated_duration_seconds / 3600, 2)
             
-            routes.append({
+            route = {
                 "truckId": f"TRUCK_{vehicle_id + 1}",
                 "start": {
-                    "lat": locations[start_index]['lat'],
-                    "lng": locations[start_index]['lng']
+                    "lat": locations[route_start_index]['lat'],
+                    "lng": locations[route_start_index]['lng']
                 },
                 "end": {
-                    "lat": locations[end_index]['lat'],
-                    "lng": locations[end_index]['lng']
+                    "lat": locations[route_end_index]['lat'],
+                    "lng": locations[route_end_index]['lng']
                 },
                 "stops": stops,
                 "estimated_km": estimated_km,
                 "estimated_hours": estimated_hours,
                 "waypoint_count": unique_locations,
                 "total_visits": len(stops)
-            })
+            }
+            if vehicle_specs:
+                spec = vehicle_specs[vehicle_id]
+                route.update({
+                    "truckId": spec.vehicle_id,
+                    "vehicle_id": spec.vehicle_id,
+                    "planner_vehicle_class": spec.planner_vehicle_class,
+                    "effective_constraints": {
+                        "max_km": spec.max_km,
+                        "max_stops": spec.max_stops,
+                        "truck_capacity": spec.truck_capacity,
+                        "shift_duration_hours": spec.shift_duration_hours,
+                        "service_time_minutes": spec.service_time_minutes,
+                        "max_reloads": spec.max_reloads,
+                    },
+                })
+            routes.append(route)
     
     # Find unassigned visits
     for i, location in enumerate(locations):
-        if i not in assigned_indices and 'visitId' in location:
+        if i not in assigned_indices and i not in depot_indices and 'visitId' in location:
             if location.get("node_type") == "warehouse_reload":
                 continue
             reason = "max_km_exceeded"
@@ -2515,23 +2755,29 @@ def optimize_routes():
             tracemalloc.stop()
             return jsonify({"error": "No JSON data provided"}), 400
         
-        required_fields = ["trucks", "max_km", "start", "end", "visits"]
+        try:
+            vehicle_specs = normalize_vehicle_specs(data)
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+        mixed_fleet = vehicle_specs is not None
+
+        required_fields = ["visits"] if mixed_fleet else ["trucks", "max_km", "start", "end", "visits"]
         for field in required_fields:
             if field not in data:
                 return jsonify({"error": f"Missing required field: {field}"}), 400
         
-        num_trucks = data["trucks"]
-        max_km = data["max_km"]
-        max_stops = data.get("max_stops", MAX_WAYPOINTS_PER_ROUTE)  # Default 25
-        shift_duration_hours = data.get("shift_duration_hours", 10)  # Default 10h shift
-        service_time_minutes = data.get("service_time_minutes", 10)  # Default 10min per stop
-        truck_capacity = data.get("truck_capacity")   # Optional: max volume units per truck
+        num_trucks = len(vehicle_specs) if mixed_fleet else data["trucks"]
+        max_km = max(spec.max_km for spec in vehicle_specs) if mixed_fleet else data["max_km"]
+        max_stops = max(spec.max_stops for spec in vehicle_specs) if mixed_fleet else data.get("max_stops", MAX_WAYPOINTS_PER_ROUTE)
+        shift_duration_hours = max(spec.shift_duration_hours for spec in vehicle_specs) if mixed_fleet else data.get("shift_duration_hours", 10)
+        service_time_minutes = max(spec.service_time_minutes for spec in vehicle_specs) if mixed_fleet else data.get("service_time_minutes", 10)
+        truck_capacity = None if mixed_fleet else data.get("truck_capacity")
         enable_warehouse_reload = bool(data.get("enable_warehouse_reload", False))
-        max_reloads_per_truck = int(data.get("max_reloads_per_truck", 2)) if enable_warehouse_reload else 0
+        max_reloads_per_truck = int(data.get("max_reloads_per_truck", 2)) if enable_warehouse_reload and not mixed_fleet else 0
         reload_service_time_minutes = int(data.get("reload_service_time_minutes", 10))
         pickup_dropoff_same_day = bool(data.get("pickup_dropoff_same_day", True))
-        start_point = data["start"]
-        end_point = data["end"]
+        start_point = vehicle_specs[0].start if mixed_fleet else data["start"]
+        end_point = vehicle_specs[0].end if mixed_fleet else data["end"]
         warehouse_location = data.get("warehouse") if isinstance(data.get("warehouse"), dict) else start_point
         visits = data["visits"]
         
@@ -2545,10 +2791,12 @@ def optimize_routes():
         if not isinstance(visits, list) or len(visits) == 0:
             return jsonify({"error": "visits must be a non-empty list"}), 400
         
-        # Validate start and end points
-        for point_name, point in [("start", start_point), ("end", end_point)]:
-            if not isinstance(point, dict) or "lat" not in point or "lng" not in point:
-                return jsonify({"error": f"{point_name} must have 'lat' and 'lng' fields"}), 400
+        # Legacy request points retain their original validation. Mixed-fleet
+        # points were validated during vehicle normalization above.
+        if not mixed_fleet:
+            for point_name, point in [("start", start_point), ("end", end_point)]:
+                if not isinstance(point, dict) or "lat" not in point or "lng" not in point:
+                    return jsonify({"error": f"{point_name} must have 'lat' and 'lng' fields"}), 400
 
         if enable_warehouse_reload:
             if (
@@ -2564,6 +2812,28 @@ def optimize_routes():
             for field in required_visit_fields:
                 if field not in visit:
                     return jsonify({"error": f"Visit {i} missing required field: {field}"}), 400
+
+        # QC is a universal delivery rule. Pickup and all non-delivery inclusion
+        # behavior stays untouched, including existing pair handling downstream.
+        qc_excluded_records = []
+        qc_kept_visits = []
+        for visit in visits:
+            if delivery_passes_qc(visit):
+                qc_kept_visits.append(visit)
+            else:
+                qc_excluded_records.append({
+                    "visitId": visit["visitId"],
+                    "reason": "delivery_qc_not_passed",
+                })
+        if qc_excluded_records:
+            logger.info("QC filter excluded %s delivery visit(s)", len(qc_excluded_records))
+            visits = qc_kept_visits
+        if not visits:
+            return jsonify({
+                "routes": [],
+                "unassigned_visits": qc_excluded_records,
+                "validation_errors": None,
+            }), 200
         
         vol_cap_str = f", vol cap {truck_capacity}/truck" if truck_capacity is not None else ""
         reload_str = (
@@ -3000,11 +3270,48 @@ def optimize_routes():
                 f"🔁 Added {reload_node_count} solver-native warehouse reload node(s) "
                 f"at ({wh_lat}, {wh_lng})"
             )
-        
-        # Build locations list: [start, ...combined_visits, end]
-        locations = [start_point] + combined_visits + [end_point]
-        start_index = 0
-        end_index = len(locations) - 1
+
+        # Mixed fleet reload nodes belong to their configured vehicle depot.
+        # They remain optional stops, but capacity is reset when one is used.
+        if mixed_fleet:
+            for vehicle_index, spec in enumerate(vehicle_specs):
+                for reload_number in range(spec.max_reloads):
+                    combined_visits.append({
+                        "lat": spec.start["lat"],
+                        "lng": spec.start["lng"],
+                        "visitId": f"WAREHOUSE_RELOAD_{spec.vehicle_id}_{reload_number + 1}",
+                        "sla_days": 999,
+                        "node_type": "warehouse_reload",
+                        "allowed_vehicle_indices": [vehicle_index],
+                    })
+                    visit_groups.append([])
+                    combined_order_info.append({"order_ids": [], "visit_types": []})
+
+        # Legacy retains [start, visits, end]. Mixed fleets include each unique
+        # vehicle depot once so the matrix and manager can use per-route depots.
+        if mixed_fleet:
+            depot_locations = []
+            depot_indices_by_coordinate = {}
+
+            def depot_index(point: Dict) -> int:
+                key = (point["lat"], point["lng"])
+                if key not in depot_indices_by_coordinate:
+                    depot_indices_by_coordinate[key] = len(depot_locations)
+                    depot_locations.append({"lat": point["lat"], "lng": point["lng"], "node_type": "depot"})
+                return depot_indices_by_coordinate[key]
+
+            for spec in vehicle_specs:
+                spec.start["_location_index"] = depot_index(spec.start)
+                spec.end["_location_index"] = depot_index(spec.end)
+            locations = depot_locations + combined_visits
+            start_index = vehicle_specs[0].start["_location_index"]
+            end_index = vehicle_specs[0].end["_location_index"]
+            visit_node_offset = len(depot_locations)
+        else:
+            locations = [start_point] + combined_visits + [end_point]
+            start_index = 0
+            end_index = len(locations) - 1
+            visit_node_offset = 1
         
         # Create distance + duration matrices using combined locations
         # Build distance + duration matrices via Google Maps API
@@ -3020,7 +3327,7 @@ def optimize_routes():
         # Independent standard drops should outrank any standard pickup/drop pair.
         # Standard paired visits max out around 25 in current SLA scoring, so default 40.
         INDEPENDENT_STANDARD_DROP_PRIORITY = int(data.get("independent_standard_drop_priority", 40))
-        priorities = [5]  # Start point - neutral priority
+        priorities = [5] * visit_node_offset
         boosted_unpaired_nodes = 0
         boosted_independent_standard_drop_nodes = 0
         for idx, visit in enumerate(combined_visits):
@@ -3091,7 +3398,8 @@ def optimize_routes():
                 boosted_independent_standard_drop_nodes += 1
 
             priorities.append(priority)
-        priorities.append(5)  # End point - neutral priority
+        if not mixed_fleet:
+            priorities.append(5)  # End point - neutral priority
         
         logger.info(f"🎯 SLA Priority distribution: "
                     f"BREACHED={sum(1 for p in priorities if p >= 25)}, "
@@ -3111,16 +3419,22 @@ def optimize_routes():
             )
         
         # Prepare combined_order_info aligned with locations (add None for start/end)
-        aligned_order_info = [None] + combined_order_info + [None]
+        aligned_order_info = (
+            [None] * visit_node_offset + combined_order_info
+            if mixed_fleet else [None] + combined_order_info + [None]
+        )
         
         # Prepare visit_groups aligned with locations
         # [None (start), ...visit groups..., None (end)]
-        aligned_visit_groups = [None] + visit_groups + [None]
+        aligned_visit_groups = (
+            [None] * visit_node_offset + visit_groups
+            if mixed_fleet else [None] + visit_groups + [None]
+        )
         
         # ─── Build time windows from visit data (VRPTW) ───
         # time_window_start/end are in MINUTES from shift start
         # Convert to seconds for the solver
-        aligned_time_windows = [None]  # None for start node
+        aligned_time_windows = [None] * visit_node_offset
         has_any_time_window = False
         for visit in combined_visits:
             if visit.get("node_type") == "warehouse_reload":
@@ -3133,11 +3447,12 @@ def optimize_routes():
                 has_any_time_window = True
             else:
                 aligned_time_windows.append(None)
-        aligned_time_windows.append(None)  # None for end node
+        if not mixed_fleet:
+            aligned_time_windows.append(None)  # None for end node
         
         # Build service times aligned with locations (seconds)
         # A combined node with N visits gets N × service_time (e.g., 5 visits × 10min = 50min)
-        aligned_service_times = [0]  # 0 for start
+        aligned_service_times = [0] * visit_node_offset
         svc_seconds = int(service_time_minutes * 60)
         for idx, _ in enumerate(combined_visits):
             if combined_visits[idx].get("node_type") == "warehouse_reload":
@@ -3146,7 +3461,8 @@ def optimize_routes():
             # visit_groups[idx] contains the list of visit IDs at this combined location
             num_visits_at_node = len(visit_groups[idx]) if idx < len(visit_groups) and visit_groups[idx] else 1
             aligned_service_times.append(svc_seconds * num_visits_at_node)
-        aligned_service_times.append(0)  # 0 for end
+        if not mixed_fleet:
+            aligned_service_times.append(0)  # 0 for end
         
         # Convert max_km to meters (Google Maps gives real road distances)
         max_distance_meters = int(max_km * 1000)
@@ -3157,6 +3473,28 @@ def optimize_routes():
         logger.info(f"📏 Distance: {max_km}km limit → {max_distance_meters/1000:.1f}km solver (Google Maps)")
         logger.info(f"⏰ Time: {shift_duration_hours}h shift, {service_time_minutes}min/stop, "
                      f"time windows: {'YES' if has_any_time_window else 'NO'}")
+
+        allowed_vehicle_indices_by_node = None
+        if mixed_fleet:
+            visits_by_id = {visit["visitId"]: visit for visit in visits}
+            indices_by_class = {}
+            for vehicle_index, spec in enumerate(vehicle_specs):
+                indices_by_class.setdefault(spec.planner_vehicle_class, []).append(vehicle_index)
+            allowed_vehicle_indices_by_node = {}
+            for combined_index, visit_ids in enumerate(visit_groups):
+                visit = combined_visits[combined_index]
+                if visit.get("node_type") == "warehouse_reload":
+                    allowed_vehicle_indices_by_node[visit_node_offset + combined_index] = visit.get(
+                        "allowed_vehicle_indices", []
+                    )
+                    continue
+                allowed_classes = allowed_vehicle_classes_for_node(visit_ids, visits_by_id)
+                if allowed_classes:
+                    allowed_vehicle_indices_by_node[visit_node_offset + combined_index] = [
+                        vehicle_index
+                        for vehicle_class in allowed_classes
+                        for vehicle_index in indices_by_class.get(vehicle_class, [])
+                    ]
         
         # Solve the Hybrid VRP (CVRP + VRPPD + VRPTW)
         result = solve_vrp(
@@ -3177,6 +3515,8 @@ def optimize_routes():
             max_route_time=max_route_time,
             mandatory_visit_ids=mandatory_visit_ids,
             truck_capacity=truck_capacity,
+            vehicle_specs=vehicle_specs,
+            allowed_vehicle_indices_by_node=allowed_vehicle_indices_by_node,
         )
         
         if result is None:
@@ -3309,6 +3649,10 @@ def optimize_routes():
         if forced_unassigned_records:
             result["unassigned_visits"].extend(forced_unassigned_records)
             logger.info(f"Added {len(forced_unassigned_records)} forced-unassigned exchange-rule visits to unassigned list")
+
+        if qc_excluded_records:
+            result["unassigned_visits"].extend(qc_excluded_records)
+            logger.info(f"Added {len(qc_excluded_records)} QC-excluded delivery visit(s) to unassigned list")
 
         # If vehicle_type is 'bike', rename truckId labels to rider_1, rider_2, ...
         vehicle_type = (data.get("vehicle_type") or "").strip().lower() if data.get("vehicle_type") else ""
