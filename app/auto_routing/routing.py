@@ -479,8 +479,8 @@ def solve_vrp(
     waypoint_dimension = routing.GetDimensionOrDie(waypoint_dimension_name)
 
     # ─── CAPACITY DIMENSION (solver-native) ───
-    # Tracks running load using signed demand and enables native feasibility checks.
-    # Reload nodes are forced to load=0 using capacity cumul constraints.
+    # Tracks running load for pickup growth and enables native feasibility checks.
+    # Reload balancing is finalized in post-processing to avoid front-loading artifacts.
     capacity_dimension = None
     if truck_capacity is not None and float(truck_capacity) > 0:
         capacity_units = max(1, int(round(float(truck_capacity))))
@@ -550,14 +550,16 @@ def solve_vrp(
         )
         capacity_dimension = routing.GetDimensionOrDie("Capacity")
 
-        # Force load reset at each reload node.
+        # Do not hard-reset solver load at reload nodes. A hard CumulVar==0 reset
+        # tends to attract reload nodes to the route start when pickups are positive.
+        # Instead, just prevent reload from being the first visited stop.
         reload_nodes = 0
         for node in range(len(locations)):
             loc = locations[node] if node < len(locations) else {}
             if loc.get("node_type") == "warehouse_reload":
                 idx = manager.NodeToIndex(node)
                 if idx != -1:
-                    capacity_dimension.CumulVar(idx).SetValue(0)
+                    waypoint_dimension.CumulVar(idx).SetMin(1)
                     reload_nodes += 1
 
         logger.info(
@@ -2279,18 +2281,27 @@ def enforce_volume_capacity(
             #   • Pickups at/before viol  → reduce load from that point onward
 
             # First try warehouse reload insertion before the violating stop sequence.
+            # Guardrail: never insert as the first action and prefer only after at
+            # least one drop has already happened on the route.
             if (
                 enable_warehouse_reload
                 and reloads_used < max(0, int(max_reloads_per_truck))
                 and warehouse_node_idx is not None
                 and 0 <= eff_viol_idx < len(stops)
+                and eff_viol_idx > 0
+                and not initial_breach
             ):
                 violating_stop = stops[eff_viol_idx]
                 violating_seq = violating_stop["sequence"]
                 violating_vol = vol_map.get(violating_stop.get("visitId", ""), 0)
 
+                has_prior_drop = any(
+                    _is_drop(s.get("visit_type")) and s.get("sequence", 0) < violating_seq
+                    for s in stops
+                )
+
                 # If a single pickup itself exceeds capacity, reload cannot help.
-                if violating_vol <= truck_capacity and _can_insert_reload(route, stops, violating_seq):
+                if has_prior_drop and violating_vol <= truck_capacity and _can_insert_reload(route, stops, violating_seq):
                     reload_id = f"WAREHOUSE_RELOAD_{route.get('truckId', 'TRUCK')}_{reloads_used + 1}"
                     reload_stop = {
                         "visitId": reload_id,
